@@ -24,8 +24,6 @@ Prebuilt binaries are attached to each [GitHub Release](https://github.com/twitc
 curl -LO https://github.com/twitchax/beachhead/releases/latest/download/beachhead_x86_64-unknown-linux-gnu.zip
 # macOS (Apple silicon)
 curl -LO https://github.com/twitchax/beachhead/releases/latest/download/beachhead_aarch64-apple-darwin.zip
-# Windows
-curl -LO https://github.com/twitchax/beachhead/releases/latest/download/beachhead_x86_64-pc-windows-gnu.zip
 ```
 
 ```bash
