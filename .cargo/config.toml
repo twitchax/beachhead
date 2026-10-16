@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask <task>` runs the repo's own tooling, written in Rust instead of shell or Python.
+xtask = "run --package xtask --"

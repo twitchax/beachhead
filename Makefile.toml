@@ -1,0 +1,123 @@
+# beachhead: cargo-make tasks. cargo-make is the one entry point for dev commands, and CI runs
+# the same tasks, so "green locally" and "green in CI" mean the same thing.
+#
+#   cargo make ci        fmt-check + clippy (-D warnings) + nextest: the gate
+#   cargo make uat       ci + the #[ignore]d slow suites
+#   cargo make codecov   coverage.lcov via llvm-cov
+#   cargo xtask <task>   repo tooling (see xtask/)
+
+[config]
+# Run every task once at the root instead of once per workspace member.
+default_to_workspace = false
+
+# ── Tool installation ────────────────────────────────────────────────────────
+# Large tools come prebuilt through `cargo binstall`, never built from source. Each install-* task
+# runs only when its binary is missing (no network on every `cargo make test`); `tools-latest` moves
+# them all to the newest release on purpose. `--force` when they do run: CI's rust-cache can restore
+# binstall's install manifest without the binary, after which a plain install no-ops ("already
+# installed") and the command fails.
+
+[tasks.install-cargo-binstall]
+# In CI the cargo-bins/cargo-binstall action provides it; locally, install it once by hand.
+script = "command -v cargo-binstall >/dev/null || echo 'install cargo-binstall: https://github.com/cargo-bins/cargo-binstall'"
+
+[tasks.install-nextest]
+condition_script = ["! command -v cargo-nextest >/dev/null 2>&1"]
+dependencies = ["install-cargo-binstall"]
+command = "cargo"
+args = ["binstall", "cargo-nextest", "--no-confirm", "--locked", "--force"]
+
+[tasks.install-llvm-cov]
+condition_script = ["! command -v cargo-llvm-cov >/dev/null 2>&1"]
+dependencies = ["install-cargo-binstall"]
+command = "cargo"
+args = ["binstall", "cargo-llvm-cov", "--no-confirm", "--locked", "--force"]
+
+[tasks.install-cargo-edit]
+condition_script = ["! command -v cargo-upgrade >/dev/null 2>&1"]
+dependencies = ["install-cargo-binstall"]
+command = "cargo"
+args = ["binstall", "cargo-edit", "--no-confirm", "--locked", "--force"]
+
+[tasks.tools]
+dependencies = ["install-nextest", "install-llvm-cov"]
+
+[tasks.tools-latest]
+# Every tool to its newest release, unconditionally. Run once at bootstrap and whenever a tool is
+# stale; an old cargo-leptos, for one, can't build the current Leptos.
+dependencies = ["install-cargo-binstall"]
+command = "cargo"
+args = ["binstall", "--no-confirm", "--force", "cargo-make", "cargo-nextest", "cargo-llvm-cov", "cargo-edit"]
+
+# ── Format and lint ──────────────────────────────────────────────────────────
+
+[tasks.fmt]
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.fmt-check]
+command = "cargo"
+args = ["fmt", "--all", "--check"]
+
+[tasks.clippy]
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
+
+# ── Test ─────────────────────────────────────────────────────────────────────
+
+[tasks.test]
+dependencies = ["install-nextest"]
+command = "cargo"
+args = ["nextest", "run", "--workspace"]
+
+[tasks.test-ignored]
+# Slow or infra-bound suites are `#[ignore = "reason"]`; this runs exactly those.
+dependencies = ["install-nextest"]
+command = "cargo"
+args = ["nextest", "run", "--workspace", "--run-ignored", "ignored-only", "--no-tests", "pass"]
+
+[tasks.codecov]
+# `clear = true` replaces cargo-make's built-in `codecov` task (a legacy uploader script).
+clear = true
+dependencies = ["tools"]
+command = "cargo"
+args = ["llvm-cov", "nextest", "--workspace", "--exclude", "xtask", "--lcov", "--output-path", "coverage.lcov"]
+
+# ── Gates ────────────────────────────────────────────────────────────────────
+
+[tasks.ci]
+# The gate, run verbatim by CI.
+dependencies = ["fmt-check", "clippy", "test"]
+
+[tasks.uat]
+# The acceptance gate PRD UATs point at: ci plus everything too slow for every push.
+dependencies = ["ci", "test-ignored"]
+
+# ── Dependencies ─────────────────────────────────────────────────────────────
+
+[tasks.deps-latest]
+# Every dependency to its newest release, then re-lock. `cargo upgrade` keeps each requirement's
+# precision, so the house style ("1", "0.8") survives; `--incompatible allow` takes new majors too,
+# so run `cargo make ci` afterwards and read the changelogs.
+dependencies = ["install-cargo-edit"]
+script = '''
+set -eu
+cargo upgrade --incompatible allow
+cargo update
+echo "now run: cargo make ci"
+'''
+
+# ── Build and run ────────────────────────────────────────────────────────────
+
+[tasks.build-release]
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.build-dev-release]
+# Release-like codegen without LTO: for perf checks that don't need the full release link.
+command = "cargo"
+args = ["build", "--profile", "dev-release"]
+
+[tasks.run]
+command = "cargo"
+args = ["run", "--", "${@}"]

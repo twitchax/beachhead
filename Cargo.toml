@@ -1,0 +1,87 @@
+# A workspace root from day one, so lints live once in [workspace.lints] and adding an `xtask` or a
+# second crate is a one-line change.
+[workspace]
+members = [".", "xtask"]
+# Plain `cargo build` / `cargo test` stay on the main crate; `--workspace` reaches the rest.
+default-members = ["."]
+resolver = "3"
+
+[package]
+name = "beachhead"
+version = "0.1.0"
+edition = "2024"
+authors = ["Aaron Roney <twitchax@gmail.com>"]
+description = "A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it."
+license = "MIT"
+repository = "https://github.com/twitchax/beachhead"
+readme = "README.md"
+keywords = []
+categories = []
+
+[[bin]]
+name = "beachhead"
+path = "src/bin.rs"
+# The binary needs the `cli` feature; library users who only want the API skip clap entirely.
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:tracing-subscriber"]
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+
+# cli
+clap = { version = "4", features = ["derive", "env"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# Lints live here, once, and every crate opts in with `[lints] workspace = true` (conclave's
+# mechanism; it replaces crate-root `#![deny]` attributes, which drifted between lib.rs and main.rs
+# and skipped the xtask crate in razel). Groups sit at priority -1 so a specific lint can override
+# them. Gate: `cargo make clippy` (`-D warnings`).
+[workspace.lints.rust]
+unused = { level = "deny", priority = -1 }
+# `cargo llvm-cov` on nightly sets `coverage_nightly`; declare it so check-cfg stays quiet.
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(coverage_nightly)"] }
+
+[workspace.lints.clippy]
+# `all` covers conclave's `correctness` + `complexity` (plus `style`, `suspicious`, `perf`).
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Library and binary code returns errors; only tests may unwrap or expect (each test module opens
+# with `#![allow(clippy::unwrap_used, clippy::expect_used)]`). Never allow `too_many_lines`,
+# `too_many_arguments` or `needless_pass_by_value`: split the function, introduce a struct, or
+# take a reference.
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+# Ship size and speed over link time: one codegen unit and fat LTO, symbols stripped.
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Release-like codegen without the expensive LTO / single-CGU link, for quick perf checks.
+[profile.dev-release]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16
+debug = 1
+strip = false
+
+# Release optimizations with full debug info and no LTO, so profilers see legible symbols.
+[profile.profiling]
+inherits = "release"
+debug = 2
+lto = false
+strip = false

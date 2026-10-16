@@ -1,0 +1,73 @@
+name: Release
+
+# A `v*` tag (from `cargo release`, or by hand) builds one binary per platform and publishes them on
+# a GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Publish whatever platforms succeed instead of cancelling the matrix on one failure.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            exe: ""
+          # Windows is cross-built from Linux with mingw. Never combine `cross` with an apt mingw
+          # step: it hangs on the dpkg lock (ratrod).
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            exe: ".exe"
+          - target: aarch64-apple-darwin
+            os: macos-15
+            exe: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
+      - name: Install mingw
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Zip the binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cd "target/${{ matrix.target }}/release"
+          zip "$GITHUB_WORKSPACE/dist/beachhead_${{ matrix.target }}.zip" "beachhead${{ matrix.exe }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beachhead_${{ matrix.target }}
+          path: dist/*.zip
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/*.zip --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes

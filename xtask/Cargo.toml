@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+# Repo tooling only: never published, kept out of default-members and the coverage denominator.
+publish = false
+
+[dependencies]
+anyhow = "1"
+
+[lints]
+workspace = true

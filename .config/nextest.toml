@@ -1,0 +1,18 @@
+# Nextest configuration. Every override says why it exists (razel's habit): a retry or a serial
+# group without a recorded reason is how a flake becomes permanent.
+
+[profile.default]
+# A test still running after four slow periods is hung, not slow: kill it so CI fails loudly.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[test-groups]
+# Tests that spawn the real binary or bind loopback ports oversubscribe a small CI runner when they
+# land together. Serialize them; they still overlap ordinary unit tests.
+serial-e2e = { max-threads = 1 }
+
+# `e2e_*` tests spawn the built binary. Process startup on a loaded runner is the one legitimately
+# timing-sensitive thing here, so these (and only these) get a retry.
+[[profile.default.overrides]]
+filter = 'test(/^e2e_/)'
+test-group = 'serial-e2e'
+retries = 2

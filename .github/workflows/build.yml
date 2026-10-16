@@ -1,0 +1,78 @@
+name: Build and Test
+
+# Push builds main only, so a branch with an open PR doesn't run everything twice (the
+# pull_request event covers it). A newer push cancels the superseded run.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-binstall queries the GitHub API for release artifacts; the token lifts the anonymous
+  # rate limit that otherwise fails installs on busy runners.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  ci:
+    # Literally the local gate: `cargo make ci` (fmt-check, clippy -D warnings, nextest).
+    name: CI gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # No `toolchain:` input: the action reads rust-toolchain.toml, the single source of truth.
+      # `cache: false` because rust-cache below is configured explicitly; empty `rustflags` because
+      # lints are enforced by `cargo make clippy`, and a global -D warnings would also churn the
+      # dependency cache.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
+          # Tools come from binstall below; caching ~/.cargo/bin restored binstall's manifest
+          # without the binaries and broke `cargo nextest` (rusty_socks, 2026-06).
+          cache-bin: "false"
+      # `--force`: see the comment on the install-* tasks in Makefile.toml.
+      - run: cargo binstall cargo-make cargo-nextest --no-confirm --force
+      - run: cargo make ci
+
+  codecov:
+    name: Code coverage
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
+          cache-bin: "false"
+      - run: cargo binstall cargo-make cargo-nextest cargo-llvm-cov --no-confirm --force
+      - run: cargo make codecov
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.lcov
+          # Forks have no token; a missing upload shouldn't fail their PR.
+          fail_ci_if_error: false
+
+  audit:
+    # RustSec advisories against Cargo.lock; needs no config.
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall cargo-audit --no-confirm --force
+      - run: cargo audit

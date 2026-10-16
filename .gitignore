@@ -1,0 +1,3 @@
+/target
+# Coverage output from `cargo make codecov`.
+coverage.lcov

@@ -1,0 +1,8 @@
+# House style, byte-identical across kord, ratrod and conclave: wide lines, compact struct literals.
+max_width = 200
+struct_lit_width = 40
+# Unstable options: honored on the pinned nightly. Stable rustfmt warns about each and ignores it,
+# which is why the stable template leaves them out.
+reorder_impl_items = true
+format_macro_bodies = false
+format_code_in_doc_comments = true
