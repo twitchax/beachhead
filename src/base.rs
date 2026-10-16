@@ -1,8 +1,4 @@
-//! The small vocabulary every module shares: the `anyhow` error aliases.
+//! The small vocabulary every module shares: the `anyhow` error aliases, defined once in
+//! `beachhead-mux` so the client and the relay agree.
 
-/// The error type for application glue.
-pub type Err = anyhow::Error;
-/// A result carrying [`Err`].
-pub type Res<T> = anyhow::Result<T, Err>;
-/// A result with nothing to return.
-pub type Void = Res<()>;
+pub use beachhead_mux::base::{Err, Res, Void};

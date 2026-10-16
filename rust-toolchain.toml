@@ -7,3 +7,5 @@
 # `cargo make ci`.
 channel = "nightly-2026-10-16"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]
+# The relay ships as a static musl binary for both remote arches (`cargo xtask relay`).
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

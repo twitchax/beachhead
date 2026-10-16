@@ -1,0 +1,15 @@
+[package]
+name = "beachhead-relay"
+description = "beachhead's remote half: a small static binary pushed over SSH that dials TCP on the client's behalf."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No clap and no tracing-subscriber: every dependency here crosses the SSH session on a cache miss.
+[dependencies]
+beachhead-mux.workspace = true
+
+[lints]
+workspace = true

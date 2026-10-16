@@ -1,19 +1,34 @@
 # A workspace root from day one, so lints live once in [workspace.lints] and adding an `xtask` or a
 # second crate is a one-line change.
 [workspace]
-members = [".", "xtask"]
-# Plain `cargo build` / `cargo test` stay on the main crate; `--workspace` reaches the rest.
-default-members = ["."]
+members = [".", "crates/beachhead-mux", "crates/beachhead-relay", "xtask"]
+# Plain `cargo build` / `cargo test` cover the product crates; `--workspace` adds the tooling.
+default-members = [".", "crates/beachhead-mux", "crates/beachhead-relay"]
 resolver = "3"
 
-[package]
-name = "beachhead"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 authors = ["Aaron Roney <twitchax@gmail.com>"]
-description = "A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it."
 license = "MIT"
 repository = "https://github.com/twitchax/beachhead"
+
+[workspace.dependencies]
+anyhow = "1"
+bytes = "1"
+# Each crate opts into exactly the tokio features it needs: the relay's list is its size budget.
+tokio = { version = "1", default-features = false }
+tracing = "0.1"
+beachhead-mux = { path = "crates/beachhead-mux", version = "0.1.0" }
+
+[package]
+name = "beachhead"
+description = "A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 readme = "README.md"
 keywords = []
 categories = []
@@ -29,8 +44,9 @@ default = ["cli"]
 cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
-anyhow = "1"
-tracing = "0.1"
+anyhow.workspace = true
+beachhead-mux.workspace = true
+tracing.workspace = true
 
 # cli
 clap = { version = "4", features = ["derive", "env"], optional = true }
@@ -78,6 +94,17 @@ lto = false
 codegen-units = 16
 debug = 1
 strip = false
+
+# The remote relay crosses the SSH session on every cache miss, so size beats speed. A custom
+# profile because per-package overrides can't set `lto` or `panic`: `cargo xtask relay` builds with
+# `--profile relay`.
+[profile.relay]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
 
 # Release optimizations with full debug info and no LTO, so profilers see legible symbols.
 [profile.profiling]

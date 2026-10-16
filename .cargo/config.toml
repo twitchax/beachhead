@@ -1,3 +1,11 @@
 [alias]
 # `cargo xtask <task>` runs the repo's own tooling, written in Rust instead of shell or Python.
 xtask = "run --package xtask --"
+
+# The relay links with the toolchain's own lld: no musl-gcc or cross linker on the build host. This
+# holds only while the relay has no C dependencies.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

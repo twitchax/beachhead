@@ -8,9 +8,20 @@ defer to `~/CLAUDE.md`.**
 
 ## Architecture
 
-One package: a library (`beachhead`) and a thin binary (`beachhead`, `src/bin.rs`) behind the
-default `cli` feature. The binary parses arguments and calls the library; everything testable
-lives in the library. `base` holds the error aliases; `tests` is the shared fixture factory.
+A workspace of three product crates plus `xtask`. The design and its reasons live in
+`.prds/PRD-0002.md` (Technical Approach).
+
+- `.` (`beachhead`): the client library and a thin binary (`src/bin.rs`) behind the default `cli`
+  feature. The binary parses arguments and calls the library; everything testable lives in the
+  library. `tests` is the shared fixture factory.
+- `crates/beachhead-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
+  error aliases every crate re-exports.
+- `crates/beachhead-relay`: the remote binary, pushed over SSH as a static musl build. Every
+  dependency crosses the wire on a cache miss, so it stays off clap, tracing-subscriber and anything
+  with C code (`rust-lld` links it). Build it with `cargo xtask relay` (`--profile relay`).
+
+The mux invariant to protect: **the frame reader never blocks**. It hands frames to per-stream
+channels bounded by credit, so the ssh pipe always drains.
 
 ## Commands
 

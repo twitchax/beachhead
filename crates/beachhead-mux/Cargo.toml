@@ -1,0 +1,22 @@
+[package]
+name = "beachhead-mux"
+description = "beachhead's wire protocol and stream multiplexer, shared by the client and the relay."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+# No `rt`: callers spawn the driver and the pumps, so the mux itself never needs a runtime handle.
+tokio = { workspace = true, features = ["sync", "io-util", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions = "1"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "io-util", "macros", "time", "test-util"] }
+
+[lints]
+workspace = true
