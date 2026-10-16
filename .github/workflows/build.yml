@@ -41,6 +41,9 @@ jobs:
           cache-bin: "false"
       # `--force`: see the comment on the install-* tasks in Makefile.toml.
       - run: cargo binstall cargo-make cargo-nextest --no-confirm --force
+      # The login-shell e2e tests skip a missing shell on a dev box but fail under CI.
+      - name: Install login shells
+        run: sudo apt-get update && sudo apt-get install -y zsh fish tcsh busybox
       - run: cargo make ci
 
   codecov:
@@ -59,6 +62,8 @@ jobs:
           cache-all-crates: "true"
           cache-bin: "false"
       - run: cargo binstall cargo-make cargo-nextest cargo-llvm-cov --no-confirm --force
+      - name: Install login shells
+        run: sudo apt-get update && sudo apt-get install -y zsh fish tcsh busybox
       - run: cargo make codecov
       - uses: codecov/codecov-action@v5
         with:
@@ -66,6 +71,46 @@ jobs:
           files: coverage.lcov
           # Forks have no token; a missing upload shouldn't fail their PR.
           fail_ci_if_error: false
+
+  relay:
+    # Each relay builds and runs on its own arch: the aarch64 job is the first place that binary
+    # executes. Size and sha256 land in the job summary; the binary is an artifact.
+    name: Relay ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: relay-${{ matrix.arch }}
+      - run: cargo xtask relay --arch ${{ matrix.arch }}
+      - name: Probe the relay on its own arch
+        run: target/relay/beachhead-relay-${{ matrix.arch }} --probe
+      - name: Summarize
+        run: |
+          f=target/relay/beachhead-relay-${{ matrix.arch }}
+          {
+            echo "### ${{ matrix.arch }} relay"
+            echo
+            echo "| bytes | sha256 |"
+            echo "|---|---|"
+            echo "| $(wc -c < "$f") | $(sha256sum "$f" | cut -d' ' -f1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beachhead-relay-${{ matrix.arch }}
+          path: target/relay/beachhead-relay-${{ matrix.arch }}
 
   audit:
     # RustSec advisories against Cargo.lock; needs no config.

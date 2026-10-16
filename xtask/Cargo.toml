@@ -6,7 +6,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
-anyhow = "1"
+anyhow.workspace = true
+# The Arch table and relay hashing, shared with the client rather than copied.
+beachhead.workspace = true
 
 [lints]
 workspace = true

@@ -19,6 +19,7 @@ bytes = "1"
 # Each crate opts into exactly the tokio features it needs: the relay's list is its size budget.
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
+beachhead = { path = ".", version = "0.1.0", default-features = false }
 beachhead-mux = { path = "crates/beachhead-mux", version = "0.1.0" }
 
 [package]
