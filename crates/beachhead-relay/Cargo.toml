@@ -9,7 +9,14 @@ repository.workspace = true
 
 # No clap and no tracing-subscriber: every dependency here crosses the SSH session on a cache miss.
 [dependencies]
+anyhow.workspace = true
 beachhead-mux.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-std", "io-util", "sync"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-std", "io-util", "sync", "macros", "process", "time"] }
 
 [lints]
 workspace = true
