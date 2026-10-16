@@ -72,10 +72,14 @@ impl Config {
 }
 
 impl Default for Config {
-    /// 256 KiB windows and 32 KiB chunks: memory stays at window × streams, and a chunk is small
-    /// enough to interleave streams fairly.
+    /// 1 MiB windows and 32 KiB chunks. A stream's throughput tops out near window ÷ round trip,
+    /// and the round trip crosses ssh, sshd and both ends' schedulers: on loopback, 256 KiB held a
+    /// single stream to about half of `ssh -L` and 1 MiB came within 5% (`cargo xtask bench`). It
+    /// also covers a ~100 ms mobile link at 80 Mbit/s, and sits under OpenSSH's own 2 MiB channel
+    /// window. Memory stays bounded at window × streams; a chunk is small enough to interleave
+    /// streams fairly.
     fn default() -> Self {
-        Self { window: 256 * 1024, chunk: 32 * 1024 }
+        Self { window: 1024 * 1024, chunk: 32 * 1024 }
     }
 }
 

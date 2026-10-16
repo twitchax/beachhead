@@ -30,6 +30,9 @@ cargo make ci        # fmt-check + clippy (-D warnings) + nextest: the gate, run
 cargo make test      # nextest
 cargo make uat       # ci + the #[ignore]d slow suites: what PRD UATs point at
 cargo make codecov   # coverage.lcov
+cargo xtask relay    # static musl relays + SHA256SUMS into target/relay
+cargo xtask dist     # release client with target/relay embedded, hashes checked
+cargo xtask bench    # beachhead -L vs ssh -L through a throwaway sshd (not part of ci)
 ```
 
 ## Conventions

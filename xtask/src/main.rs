@@ -1,6 +1,8 @@
 //! Repo tooling, run as `cargo xtask <task>` (the alias lives in `.cargo/config.toml`). Tasks are
 //! Rust rather than shell or Python, so they get the same lints and tests as the product.
 
+mod bench;
+
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
@@ -16,7 +18,10 @@ tasks:
   relay [--arch NAME]...   build static musl relays into target/relay and write SHA256SUMS
                            (every arch unless --arch narrows it)
   dist [--target TRIPLE]   build the release client with target/relay embedded into target/dist;
-                           without --target, also check its `relays` output against SHA256SUMS";
+                           without --target, also check its `relays` output against SHA256SUMS
+  bench [--mib N] [--runs N]
+                           relay + dist, then compare `beachhead forward -L` with `ssh -L` through
+                           a throwaway non-root sshd (default 512 MiB per transfer, best of 3)";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +29,13 @@ fn main() -> Result<()> {
     match task {
         "relay" => relay(&arches(rest)?),
         "dist" => dist(target(rest)?),
+        "bench" => {
+            let options = bench_options(rest)?;
+            let host = Arch::from_name(std::env::consts::ARCH).context("no relay arch for this host")?;
+            relay(&[host])?;
+            dist(None)?;
+            bench::run(&target_dir().join("dist").join("beachhead"), &options)
+        }
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
@@ -128,6 +140,20 @@ fn arches(args: &[String]) -> Result<Vec<Arch>> {
         }
     }
     Ok(if arches.is_empty() { Arch::ALL.to_vec() } else { arches })
+}
+
+fn bench_options(args: &[String]) -> Result<bench::Options> {
+    let mut options = bench::Options { mib: 512, runs: 3 };
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = || -> Result<usize> { args.next().with_context(|| format!("{arg} needs a value"))?.parse().with_context(|| format!("{arg} needs a number")) };
+        match arg.as_str() {
+            "--mib" => options.mib = value()?.max(8),
+            "--runs" => options.runs = value()?.max(1),
+            other => bail!("unexpected argument `{other}`\n\n{USAGE}"),
+        }
+    }
+    Ok(options)
 }
 
 fn target(args: &[String]) -> Result<Option<&str>> {
