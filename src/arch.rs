@@ -1,4 +1,4 @@
-//! The remote architectures beachhead ships a relay for: the one table the bootstrap script, the
+//! The remote architectures sshunnel ships a relay for: the one table the bootstrap script, the
 //! relay loader and `cargo xtask relay` all read.
 
 /// A remote CPU architecture with a static musl relay.
@@ -43,8 +43,8 @@ impl Arch {
     #[must_use]
     pub fn file_name(self) -> &'static str {
         match self {
-            Self::X86_64 => "beachhead-relay-x86_64",
-            Self::Aarch64 => "beachhead-relay-aarch64",
+            Self::X86_64 => "sshunnel-relay-x86_64",
+            Self::Aarch64 => "sshunnel-relay-aarch64",
         }
     }
 

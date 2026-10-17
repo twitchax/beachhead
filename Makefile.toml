@@ -1,4 +1,4 @@
-# beachhead: cargo-make tasks. cargo-make is the one entry point for dev commands, and CI runs
+# sshunnel: cargo-make tasks. cargo-make is the one entry point for dev commands, and CI runs
 # the same tasks, so "green locally" and "green in CI" mean the same thing.
 #
 #   cargo make ci        fmt-check + clippy (-D warnings) + nextest: the gate

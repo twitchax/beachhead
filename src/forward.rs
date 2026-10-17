@@ -4,7 +4,7 @@
 use std::{str::FromStr, sync::Arc};
 
 use anyhow::{Context as _, anyhow, bail};
-use beachhead_mux::{
+use sshunnel_mux::{
     Mux,
     base::{Err, Res, Void},
     pump,

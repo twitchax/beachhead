@@ -1,9 +1,9 @@
-# beachhead: project instructions
+# sshunnel: project instructions
 
 A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 
 The global conventions in `~/CLAUDE.md` and the `bootstrap-rust-project` skill's `conventions.md`
-apply in full. This file records only what is specific to beachhead; **where it is silent,
+apply in full. This file records only what is specific to sshunnel; **where it is silent,
 defer to `~/CLAUDE.md`.**
 
 ## Architecture
@@ -11,12 +11,12 @@ defer to `~/CLAUDE.md`.**
 A workspace of three product crates plus `xtask`. The design and its reasons live in
 `.prds/PRD-0002.md` (Technical Approach).
 
-- `.` (`beachhead`): the client library and a thin binary (`src/bin.rs`) behind the default `cli`
+- `.` (`sshunnel`): the client library and a thin binary (`src/bin.rs`) behind the default `cli`
   feature. The binary parses arguments and calls the library; everything testable lives in the
   library. `tests` is the shared fixture factory.
-- `crates/beachhead-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
+- `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.
-- `crates/beachhead-relay`: the remote binary, pushed over SSH as a static musl build. Every
+- `crates/sshunnel-relay`: the remote binary, pushed over SSH as a static musl build. Every
   dependency crosses the wire on a cache miss, so it stays off clap, tracing-subscriber and anything
   with C code (`rust-lld` links it). Build it with `cargo xtask relay` (`--profile relay`).
 
@@ -32,7 +32,7 @@ cargo make uat       # ci + the #[ignore]d slow suites: what PRD UATs point at
 cargo make codecov   # coverage.lcov
 cargo xtask relay    # static musl relays + SHA256SUMS into target/relay
 cargo xtask dist     # release client with target/relay embedded, hashes checked
-cargo xtask bench    # beachhead -L vs ssh -L through a throwaway sshd (not part of ci)
+cargo xtask bench    # sshunnel -L vs ssh -L through a throwaway sshd (not part of ci)
 ```
 
 ## Conventions

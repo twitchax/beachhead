@@ -32,11 +32,11 @@ jobs:
           cache: false
           rustflags: ""
       - run: cargo xtask relay --arch ${{ matrix.arch }}
-      - run: target/relay/beachhead-relay-${{ matrix.arch }} --probe
+      - run: target/relay/sshunnel-relay-${{ matrix.arch }} --probe
       - uses: actions/upload-artifact@v4
         with:
-          name: beachhead-relay-${{ matrix.arch }}
-          path: target/relay/beachhead-relay-${{ matrix.arch }}
+          name: sshunnel-relay-${{ matrix.arch }}
+          path: target/relay/sshunnel-relay-${{ matrix.arch }}
 
   build:
     name: Build ${{ matrix.target }}
@@ -64,7 +64,7 @@ jobs:
           key: ${{ matrix.target }}
       - uses: actions/download-artifact@v4
         with:
-          pattern: beachhead-relay-*
+          pattern: sshunnel-relay-*
           path: target/relay
           merge-multiple: true
       # Native targets only, so `dist` can run the client and check its embedded relays.
@@ -74,10 +74,10 @@ jobs:
         run: |
           mkdir -p dist
           cd target/dist
-          zip "$GITHUB_WORKSPACE/dist/beachhead_${{ matrix.target }}.zip" beachhead
+          zip "$GITHUB_WORKSPACE/dist/sshunnel_${{ matrix.target }}.zip" sshunnel
       - uses: actions/upload-artifact@v4
         with:
-          name: beachhead_${{ matrix.target }}
+          name: sshunnel_${{ matrix.target }}
           path: dist/*.zip
 
   publish:
@@ -90,8 +90,8 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Hash the relays
-        run: cd dist && sha256sum beachhead-relay-* > SHA256SUMS
+        run: cd dist && sha256sum sshunnel-relay-* > SHA256SUMS
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/*.zip dist/beachhead-relay-* dist/SHA256SUMS --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" dist/*.zip dist/sshunnel-relay-* dist/SHA256SUMS --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes

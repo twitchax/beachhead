@@ -96,10 +96,10 @@ jobs:
           key: relay-${{ matrix.arch }}
       - run: cargo xtask relay --arch ${{ matrix.arch }}
       - name: Probe the relay on its own arch
-        run: target/relay/beachhead-relay-${{ matrix.arch }} --probe
+        run: target/relay/sshunnel-relay-${{ matrix.arch }} --probe
       - name: Summarize
         run: |
-          f=target/relay/beachhead-relay-${{ matrix.arch }}
+          f=target/relay/sshunnel-relay-${{ matrix.arch }}
           {
             echo "### ${{ matrix.arch }} relay"
             echo
@@ -109,8 +109,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: beachhead-relay-${{ matrix.arch }}
-          path: target/relay/beachhead-relay-${{ matrix.arch }}
+          name: sshunnel-relay-${{ matrix.arch }}
+          path: target/relay/sshunnel-relay-${{ matrix.arch }}
 
   audit:
     # RustSec advisories against Cargo.lock; needs no config.

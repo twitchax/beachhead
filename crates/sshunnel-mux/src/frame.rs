@@ -16,7 +16,7 @@ pub const MAX_HOST: usize = 255;
 /// `OpenErr` and `Rst` reasons are cut to this many bytes (on a char boundary) when encoded.
 pub const MAX_REASON: usize = 1024;
 /// The first bytes of every `Hello`.
-pub const MAGIC: [u8; 4] = *b"BHED";
+pub const MAGIC: [u8; 4] = *b"SSHN";
 /// The protocol version both ends must agree on.
 pub const VERSION: u16 = 1;
 
@@ -324,7 +324,7 @@ mod unit {
         assert_eq!(&window[..], &[0, 0, 0, 7, 5, 0, 0, 0, 4, 1, 2, 3, 4][..]);
 
         let hello = encoded(&Frame::Hello { version: 1 });
-        assert_eq!(&hello[..], &[0, 0, 0, 0, 0, 0, 0, 0, 6, b'B', b'H', b'E', b'D', 0, 1][..]);
+        assert_eq!(&hello[..], &[0, 0, 0, 0, 0, 0, 0, 0, 6, b'S', b'S', b'H', b'N', 0, 1][..]);
 
         let open = encoded(&Frame::Open {
             stream: StreamId(1),
@@ -390,7 +390,7 @@ mod unit {
     #[test]
     fn hello_must_ride_the_connection_id_and_streams_must_not() {
         let mut hello = header(5, 0, 6);
-        hello.extend_from_slice(b"BHED\x00\x01");
+        hello.extend_from_slice(b"SSHN\x00\x01");
         assert!(Frame::decode(&mut BytesMut::from(&hello[..])).is_err());
 
         let fin_on_zero = header(0, 6, 0);

@@ -6,14 +6,14 @@
 
 use std::{path::Path, time::Duration};
 
-use beachhead::{
+use bytes::Bytes;
+use pretty_assertions::assert_eq;
+use sshunnel::{
     arch::Arch,
     relays::{Relay, Relays, Source},
     session::{Bootstrap, Session},
     tests::{FakeRemote, echo_server, host_arch, noexec_relay_dir, pattern, relay_dir},
 };
-use bytes::Bytes;
-use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _, duplex, split},
@@ -25,7 +25,7 @@ async fn assert_carries_tcp(session: &Session, len: usize) {
     let echo = echo_server().await.unwrap();
     let stream = session.mux().open(&echo.ip().to_string(), echo.port()).await.unwrap();
     let (near, far) = duplex(64 * 1024);
-    tokio::spawn(beachhead_mux::pump(stream, near));
+    tokio::spawn(sshunnel_mux::pump(stream, near));
     let data = pattern(len as u64, len);
     let (mut r, mut w) = split(far);
     let sent = data.clone();
@@ -60,7 +60,7 @@ async fn e2e_first_run_pushes_second_run_hits_cache() {
     let root = TempDir::new().unwrap();
     let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
     let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
-    let cache = remote.home().join(".cache/beachhead");
+    let cache = remote.home().join(".cache/sshunnel");
 
     let first = connect(&remote, &relays).await;
     assert_eq!(first.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) });
@@ -92,11 +92,11 @@ async fn e2e_a_cached_relay_with_the_wrong_bytes_is_replaced() {
     let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
     let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
     let relay = relays.get(host_arch().unwrap()).unwrap();
-    let cache = remote.home().join(".cache/beachhead");
+    let cache = remote.home().join(".cache/sshunnel");
     std::fs::create_dir_all(&cache).unwrap();
     // Same name and size, different bytes: only the sha256 check can tell.
     let planted = cache.join(format!("relay-{}", relay.sha256()));
-    let mut fake = std::fs::read(beachhead::tests::relay_binary().unwrap()).unwrap();
+    let mut fake = std::fs::read(sshunnel::tests::relay_binary().unwrap()).unwrap();
     fake[0] ^= 0xFF;
     std::fs::write(&planted, &fake).unwrap();
     std::os::unix::fs::PermissionsExt::set_mode(&mut std::fs::metadata(&planted).unwrap().permissions(), 0o755);
@@ -112,16 +112,16 @@ async fn e2e_noexec_cache_dir_falls_through_to_the_next_candidate() {
     let run = root.path().join("run");
     std::fs::create_dir_all(&run).unwrap();
     let remote = FakeRemote::new(root.path(), "sh", &[("XDG_RUNTIME_DIR", &dir_of(&run))]).unwrap();
-    let relays = Relays::from_dir(&noexec_relay_dir(root.path(), "*/.cache/beachhead/*").unwrap()).unwrap();
+    let relays = Relays::from_dir(&noexec_relay_dir(root.path(), "*/.cache/sshunnel/*").unwrap()).unwrap();
 
     let first = connect(&remote, &relays).await;
-    assert_eq!(first.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&run.join("beachhead")) });
+    assert_eq!(first.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&run.join("sshunnel")) });
     assert_carries_tcp(&first, 100_000).await;
-    assert_eq!(strays(&remote.home().join(".cache/beachhead")), Vec::<String>::new(), "the staged copy is cleaned up");
+    assert_eq!(strays(&remote.home().join(".cache/sshunnel")), Vec::<String>::new(), "the staged copy is cleaned up");
     drop(first);
 
     let second = connect(&remote, &relays).await;
-    assert_eq!(second.bootstrap(), &Bootstrap::Cached { dir: dir_of(&run.join("beachhead")) });
+    assert_eq!(second.bootstrap(), &Bootstrap::Cached { dir: dir_of(&run.join("sshunnel")) });
 }
 
 #[tokio::test]
@@ -136,7 +136,7 @@ async fn e2e_noexec_unwritable_cache_dir_falls_through_to_the_next_candidate() {
     let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
 
     let session = connect(&remote, &relays).await;
-    assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&run.join("beachhead")) });
+    assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&run.join("sshunnel")) });
     assert_carries_tcp(&session, 100_000).await;
 }
 
@@ -147,15 +147,15 @@ async fn e2e_noexec_everywhere_falls_back_to_memfd() {
     }
     let root = TempDir::new().unwrap();
     let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
-    // Every candidate (the cache, TMPDIR and /dev/shm) ends in a beachhead* dir; a memfd runs as
-    // /dev/fd/N, which doesn't match. /dev/shm/beachhead-<uid> is the one dir outside the TempDir
+    // Every candidate (the cache, TMPDIR and /dev/shm) ends in a sshunnel* dir; a memfd runs as
+    // /dev/fd/N, which doesn't match. /dev/shm/sshunnel-<uid> is the one dir outside the TempDir
     // this touches, and only its staged copy, which the bootstrap removes.
-    let relays = Relays::from_dir(&noexec_relay_dir(root.path(), "*/beachhead*/relay-*|*/beachhead*/.relay-*").unwrap()).unwrap();
+    let relays = Relays::from_dir(&noexec_relay_dir(root.path(), "*/sshunnel*/relay-*|*/sshunnel*/.relay-*").unwrap()).unwrap();
 
     let session = connect(&remote, &relays).await;
     assert_eq!(session.bootstrap(), &Bootstrap::Memfd);
     assert_carries_tcp(&session, 100_000).await;
-    for dir in [remote.home().join(".cache/beachhead"), root.path().join("tmp").join(format!("beachhead-{}", uid()))] {
+    for dir in [remote.home().join(".cache/sshunnel"), root.path().join("tmp").join(format!("sshunnel-{}", uid()))] {
         assert!(!dir.join(format!("relay-{}", session.relay().sha256())).exists(), "a memfd run caches nothing in {}", dir.display());
         assert_eq!(strays(&dir), Vec::<String>::new(), "staged copies are cleaned up in {}", dir.display());
     }
@@ -189,7 +189,7 @@ async fn e2e_a_build_without_this_arch_reports_the_remote_error() {
 #[tokio::test]
 async fn e2e_ssh_failing_to_connect_is_reported_with_its_status() {
     let relays = Relays::new(vec![Relay::new(host_arch().unwrap(), Bytes::from_static(b"x"))], Source::Embedded).unwrap();
-    let ssh = beachhead::session::SshCommand::parse("sh -c 'exit 255'").unwrap();
+    let ssh = sshunnel::session::SshCommand::parse("sh -c 'exit 255'").unwrap();
     let err = Session::connect(&ssh, "fake-host", &relays).await.err().expect("ssh fails");
     let err = format!("{err:#}");
     assert!(err.contains("ssh exited before the relay started") && err.contains("255"), "{err}");

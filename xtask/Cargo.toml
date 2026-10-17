@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 # The Arch table and relay hashing, shared with the client rather than copied.
-beachhead.workspace = true
+sshunnel.workspace = true
 
 [lints]
 workspace = true

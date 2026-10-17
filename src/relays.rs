@@ -1,4 +1,4 @@
-//! The relay binaries this client can push, with their sha256: what `beachhead relays` prints and
+//! The relay binaries this client can push, with their sha256: what `sshunnel relays` prints and
 //! what the bootstrap script checks before it executes anything.
 
 use std::{fmt::Write as _, path::Path};
@@ -99,7 +99,7 @@ impl Relays {
         Ok(Self { relays, source })
     }
 
-    /// Reads `beachhead-relay-<arch>` for each arch from `dir`; a missing file means no relay for
+    /// Reads `sshunnel-relay-<arch>` for each arch from `dir`; a missing file means no relay for
     /// that arch.
     ///
     /// # Errors
@@ -130,7 +130,7 @@ impl Relays {
             .filter_map(|(name, bytes)| Arch::ALL.into_iter().find(|arch| arch.file_name() == *name).map(|arch| Relay::new(arch, Bytes::from_static(bytes))))
             .collect::<Vec<_>>();
         if relays.is_empty() {
-            bail!("this beachhead build embeds no relays: pass --relay-dir (`cargo xtask relay` builds them into target/relay)");
+            bail!("this sshunnel build embeds no relays: pass --relay-dir (`cargo xtask relay` builds them into target/relay)");
         }
         Self::new(relays, Source::Embedded)
     }
@@ -199,7 +199,7 @@ mod unit {
     #[test]
     fn a_dir_with_one_arch_loads_just_that_one() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("beachhead-relay-aarch64"), b"arm").unwrap();
+        std::fs::write(dir.path().join("sshunnel-relay-aarch64"), b"arm").unwrap();
         let relays = Relays::from_dir(dir.path()).unwrap();
         assert!(relays.get(Arch::X86_64).is_none());
         let arm = relays.get(Arch::Aarch64).unwrap();
@@ -216,13 +216,13 @@ mod unit {
     #[test]
     fn an_empty_relay_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("beachhead-relay-x86_64"), b"").unwrap();
+        std::fs::write(dir.path().join("sshunnel-relay-x86_64"), b"").unwrap();
         assert!(Relays::from_dir(dir.path()).unwrap_err().to_string().contains("empty"));
     }
 
     #[test]
     fn a_build_without_embedded_relays_says_how_to_get_them() {
-        // Test builds never set BEACHHEAD_EMBED_RELAY_DIR.
+        // Test builds never set SSHUNNEL_EMBED_RELAY_DIR.
         assert!(Relays::embedded().unwrap_err().to_string().contains("--relay-dir"));
     }
 

@@ -1,12 +1,12 @@
-# beachhead
+# sshunnel
 
-[![Build and Test](https://github.com/twitchax/beachhead/actions/workflows/build.yml/badge.svg)](https://github.com/twitchax/beachhead/actions/workflows/build.yml)
-[![codecov](https://codecov.io/gh/twitchax/beachhead/branch/main/graph/badge.svg)](https://codecov.io/gh/twitchax/beachhead)
+[![Build and Test](https://github.com/twitchax/sshunnel/actions/workflows/build.yml/badge.svg)](https://github.com/twitchax/sshunnel/actions/workflows/build.yml)
+[![codecov](https://codecov.io/gh/twitchax/sshunnel/branch/main/graph/badge.svg)](https://codecov.io/gh/twitchax/sshunnel)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 
-> **Status: milestone 1.** beachhead forwards TCP ports (the way `ssh -L` does) through a relay it
+> **Status: milestone 1.** sshunnel forwards TCP ports (the way `ssh -L` does) through a relay it
 > installs on the remote by itself. Routing a whole subnet over a TUN device comes next, then DNS
 > interception.
 
@@ -16,18 +16,18 @@ I want hosts on a remote LAN to work from anywhere the way they do at home, by n
 over the SSH login I already have. [sshuttle](https://github.com/sshuttle/sshuttle) has that
 shape, but it pipes Python to the remote, which leaves it beholden to whatever interpreter (if any)
 the server happens to have. `ssh -D` plus [tun2proxy](https://github.com/tun2proxy/tun2proxy)
-also exists, so beachhead is worth building only if it beats that combination on UDP, ICMP, DNS
+also exists, so sshunnel is worth building only if it beats that combination on UDP, ICMP, DNS
 interception and subnet routing. Milestone 1 builds the push-exec-cache loop and the multiplexed
 transport those features need, and measures their overhead against `ssh -L`.
 
 ## How it works
 
-beachhead runs your system `ssh` (so the aliases, `ProxyCommand`, `Match` blocks and keepalives in
+sshunnel runs your system `ssh` (so the aliases, `ProxyCommand`, `Match` blocks and keepalives in
 `~/.ssh/config` keep working) with a one-line POSIX `sh` script as the remote command. The script:
 
 1. Picks the relay for `uname -m`. There is one for x86_64 and one for aarch64, each a static musl
    binary of roughly 600 KB, so the remote's glibc version never enters into it.
-2. Looks for `relay-<sha256>` in `~/.cache/beachhead`, then `$XDG_RUNTIME_DIR`, `/dev/shm` and
+2. Looks for `relay-<sha256>` in `~/.cache/sshunnel`, then `$XDG_RUNTIME_DIR`, `/dev/shm` and
    `$TMPDIR`, and runs it if its size and sha256 match and a `--probe` proves the mount still
    allows exec.
 3. Otherwise asks for it. The client streams the relay down the same session, and the script
@@ -44,40 +44,40 @@ frame reader *never* blocks, so a stalled connection parks its own sender withou
 pipe or its neighbors. Memory stays bounded at window × streams.
 
 Release builds embed the relays and will ship their `SHA256SUMS` beside the binaries, and
-`beachhead relays` prints the arch, sha256 and size of **exactly what the client will execute on a
+`sshunnel relays` prints the arch, sha256 and size of **exactly what the client will execute on a
 remote**:
 
 ```text
-$ beachhead relays
+$ sshunnel relays
 relays (embedded):
-  x86_64   sha256 8031e97830383a852257b3a6f22290cdb10414fd80582ff9a7736f0fe68b4095  605520 bytes
-  aarch64  sha256 39bab84cbb99f51efef12f061088722cf215a2c97b2fa8c7826ca62501e82470  546680 bytes
+  x86_64   sha256 79a29174ccf5b2b4d6470f69d8d262c751beb27aa029fc6799cbb9869225a164  605520 bytes
+  aarch64  sha256 97912e76ec29918c6d693745752b8676ad8d777be536172038d1edc652aaccf0  546680 bytes
 ```
 
 ## Usage
 
 ```text
-$ beachhead forward -L 8080:server.lan:80 server
-beachhead: relay x86_64 8031e9783038 pushed to /home/me/.cache/beachhead
-beachhead: forwarding 127.0.0.1:8080 -> server.lan:80
+$ sshunnel forward -L 8080:server.lan:80 server
+sshunnel: relay x86_64 79a29174ccf5 pushed to /home/me/.cache/sshunnel
+sshunnel: forwarding 127.0.0.1:8080 -> server.lan:80
 ```
 
 The relay resolves and dials `server.lan` on the remote, so names that only exist inside that
 network work. `-L` repeats, and every connection rides the one SSH session.
 
 ```text
-$ beachhead forward --help
+$ sshunnel forward --help
 Forward local TCP ports through a relay on DESTINATION, like `ssh -L`
 
-Usage: beachhead forward [OPTIONS] --local <SPEC> <DESTINATION>
+Usage: sshunnel forward [OPTIONS] --local <SPEC> <DESTINATION>
 
 Arguments:
   <DESTINATION>  Where to run the relay, exactly as you'd pass it to ssh (config aliases work)
 
 Options:
   -L, --local <SPEC>       `[bind_address:]port:host:hostport`. The relay resolves and dials host; port 0 picks a free local port
-      --ssh-cmd <COMMAND>  The ssh program and its leading arguments, split like a shell would [env: BEACHHEAD_SSH=] [default: ssh]
-      --relay-dir <DIR>    Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay) [env: BEACHHEAD_RELAY_DIR=]
+      --ssh-cmd <COMMAND>  The ssh program and its leading arguments, split like a shell would [env: SSHUNNEL_SSH=] [default: ssh]
+      --relay-dir <DIR>    Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay) [env: SSHUNNEL_RELAY_DIR=]
   -h, --help               Print help
 ```
 
@@ -89,7 +89,7 @@ best of three, x86_64 Linux, OpenSSH 10.2):
 | | upload | download | download, 8 streams |
 |---|---|---|---|
 | `ssh -L` | 497 MiB/s | 533 MiB/s | 556 MiB/s |
-| `beachhead forward -L` | 484 MiB/s | 449 MiB/s | 490 MiB/s |
+| `sshunnel forward -L` | 484 MiB/s | 449 MiB/s | 490 MiB/s |
 
 Bootstrap to ready takes 146 ms when the relay has to be pushed and 111 ms from cache, and ssh's own
 connection setup is most of either figure. These are loopback numbers, so they measure overhead
@@ -113,7 +113,7 @@ There is no release yet. To build a client with both relays embedded:
 
 ```bash
 cargo xtask relay   # static musl relays and SHA256SUMS into target/relay
-cargo xtask dist    # target/dist/beachhead, with those relays inside
+cargo xtask dist    # target/dist/sshunnel, with those relays inside
 ```
 
 The relays link with the toolchain's own `rust-lld`, so the musl targets that `rust-toolchain.toml`
@@ -126,7 +126,7 @@ relays, which then needs `--relay-dir target/relay`.
 cargo make ci        # fmt-check + clippy (-D warnings) + nextest: the gate CI runs
 cargo make uat       # ci + the #[ignore]d slow suites
 cargo make codecov   # coverage.lcov
-cargo xtask bench    # beachhead -L against ssh -L through a throwaway sshd
+cargo xtask bench    # sshunnel -L against ssh -L through a throwaway sshd
 ```
 
 The e2e tests play the remote with a fake `ssh` that runs the bootstrap locally through `sh`, dash,

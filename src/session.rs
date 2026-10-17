@@ -4,13 +4,13 @@
 use std::process::Stdio;
 
 use anyhow::{Context as _, anyhow, bail};
-use beachhead_mux::{
+use bytes::BytesMut;
+use sshunnel_mux::{
     Config, Mux, Role,
     base::{Res, Void},
     hello::{recv_hello, send_hello},
     start,
 };
-use bytes::BytesMut;
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},

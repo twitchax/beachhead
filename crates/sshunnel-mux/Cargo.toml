@@ -1,6 +1,6 @@
 [package]
-name = "beachhead-mux"
-description = "beachhead's wire protocol and stream multiplexer, shared by the client and the relay."
+name = "sshunnel-mux"
+description = "sshunnel's wire protocol and stream multiplexer, shared by the client and the relay."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

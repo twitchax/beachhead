@@ -6,13 +6,13 @@
 
 use std::{process::Stdio, time::Duration};
 
-use beachhead_mux::{
+use bytes::BytesMut;
+use pretty_assertions::assert_eq;
+use sshunnel_mux::{
     Config, Mux, Role,
     hello::{recv_hello, send_hello},
     pump, start,
 };
-use bytes::BytesMut;
-use pretty_assertions::assert_eq;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _, duplex, split},
     net::TcpListener,
@@ -21,7 +21,7 @@ use tokio::{
 };
 
 fn relay() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_beachhead-relay"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sshunnel-relay"));
     cmd.kill_on_drop(true);
     cmd
 }
@@ -61,7 +61,7 @@ async fn e2e_probe_prints_the_version_and_exits_zero() {
     let out = relay().arg("--probe").output().await.unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.starts_with(concat!("beachhead-relay ", env!("CARGO_PKG_VERSION"))), "{stdout}");
+    assert!(stdout.starts_with(concat!("sshunnel-relay ", env!("CARGO_PKG_VERSION"))), "{stdout}");
 }
 
 #[tokio::test]

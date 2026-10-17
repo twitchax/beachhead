@@ -1,20 +1,20 @@
-//! beachhead's remote half, pushed over SSH and exec'd by the bootstrap script. Argument handling
+//! sshunnel's remote half, pushed over SSH and exec'd by the bootstrap script. Argument handling
 //! is by hand: clap would cost more bytes than the relay's whole interface.
 
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: beachhead-relay --stdio | --probe";
+const USAGE: &str = "usage: sshunnel-relay --stdio | --probe";
 
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("--probe") => {
-            println!("{}", beachhead_relay::probe());
+            println!("{}", sshunnel_relay::probe());
             ExitCode::SUCCESS
         }
-        Some("--stdio") => match beachhead_relay::run_stdio() {
+        Some("--stdio") => match sshunnel_relay::run_stdio() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("beachhead-relay: {e:#}");
+                eprintln!("sshunnel-relay: {e:#}");
                 ExitCode::FAILURE
             }
         },

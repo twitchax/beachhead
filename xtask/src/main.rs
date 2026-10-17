@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use beachhead::{arch::Arch, relays::Relays};
+use sshunnel::{arch::Arch, relays::Relays};
 
 const USAGE: &str = "usage: cargo xtask <task>
 
@@ -20,7 +20,7 @@ tasks:
   dist [--target TRIPLE]   build the release client with target/relay embedded into target/dist;
                            without --target, also check its `relays` output against SHA256SUMS
   bench [--mib N] [--runs N]
-                           relay + dist, then compare `beachhead forward -L` with `ssh -L` through
+                           relay + dist, then compare `sshunnel forward -L` with `ssh -L` through
                            a throwaway non-root sshd (default 512 MiB per transfer, best of 3)";
 
 fn main() -> Result<()> {
@@ -34,7 +34,7 @@ fn main() -> Result<()> {
             let host = Arch::from_name(std::env::consts::ARCH).context("no relay arch for this host")?;
             relay(&[host])?;
             dist(None)?;
-            bench::run(&target_dir().join("dist").join("beachhead"), &options)
+            bench::run(&target_dir().join("dist").join("sshunnel"), &options)
         }
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
@@ -49,8 +49,8 @@ fn relay(arches: &[Arch]) -> Result<()> {
     let out = target_dir().join("relay");
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
     for &arch in arches {
-        cargo().args(["build", "-p", "beachhead-relay", "--profile", "relay", "--target", arch.triple()]).status_ok()?;
-        let built = target_dir().join(arch.triple()).join("relay").join("beachhead-relay");
+        cargo().args(["build", "-p", "sshunnel-relay", "--profile", "relay", "--target", arch.triple()]).status_ok()?;
+        let built = target_dir().join(arch.triple()).join("relay").join("sshunnel-relay");
         let bytes = std::fs::read(&built).with_context(|| format!("reading {}", built.display()))?;
         if !is_static_elf(&bytes).with_context(|| format!("inspecting {}", built.display()))? {
             bail!("{} needs a dynamic loader; the relay must be static", built.display());
@@ -75,7 +75,7 @@ fn dist(target: Option<&str>) -> Result<()> {
     let relay_dir = target_dir().join("relay");
     let relays = Relays::from_dir(&relay_dir).context("no relays to embed: run `cargo xtask relay` first")?;
     let mut build = cargo();
-    build.args(["build", "--release", "-p", "beachhead"]).env("BEACHHEAD_EMBED_RELAY_DIR", &relay_dir);
+    build.args(["build", "--release", "-p", "sshunnel"]).env("SSHUNNEL_EMBED_RELAY_DIR", &relay_dir);
     if let Some(target) = target {
         build.args(["--target", target]);
     }
@@ -84,8 +84,8 @@ fn dist(target: Option<&str>) -> Result<()> {
     let release = target.map_or_else(|| target_dir().join("release"), |t| target_dir().join(t).join("release"));
     let dist = target_dir().join("dist");
     std::fs::create_dir_all(&dist).with_context(|| format!("creating {}", dist.display()))?;
-    let client = dist.join("beachhead");
-    std::fs::copy(release.join("beachhead"), &client).context("copying the client into target/dist")?;
+    let client = dist.join("sshunnel");
+    std::fs::copy(release.join("sshunnel"), &client).context("copying the client into target/dist")?;
 
     if target.is_none() {
         let out = Command::new(&client).arg("relays").output().context("running the client's `relays`")?;

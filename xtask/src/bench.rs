@@ -1,4 +1,4 @@
-//! `cargo xtask bench`: throughput of `beachhead forward -L` against `ssh -L` through the same
+//! `cargo xtask bench`: throughput of `sshunnel forward -L` against `ssh -L` through the same
 //! throwaway sshd. It runs as this user on a free loopback port with temp host and client keys and
 //! `-F /dev/null`, so nothing reads or writes `~/.ssh`, and the relay cache lands in the temp dir
 //! (`AcceptEnv XDG_CACHE_HOME`).
@@ -24,7 +24,7 @@ pub struct Options {
 }
 
 pub fn run(client: &Path, options: &Options) -> Result<()> {
-    let dir = std::env::temp_dir().join(format!("beachhead-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("sshunnel-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let result = bench(client, &dir, options);
     let _ = std::fs::remove_dir_all(&dir);
@@ -43,10 +43,10 @@ fn bench(client: &Path, dir: &Path, options: &Options) -> Result<()> {
     table.push(("ssh -L", measure(ssh_forward.ports, bytes, options.runs)?));
     drop(ssh_forward);
 
-    let (pushed, push_time) = Forwarder::beachhead(client, &sshd, &targets)?;
+    let (pushed, push_time) = Forwarder::sshunnel(client, &sshd, &targets)?;
     drop(pushed);
-    let (cached, cache_time) = Forwarder::beachhead(client, &sshd, &targets)?;
-    table.push(("beachhead -L", measure(cached.ports, bytes, options.runs)?));
+    let (cached, cache_time) = Forwarder::sshunnel(client, &sshd, &targets)?;
+    table.push(("sshunnel -L", measure(cached.ports, bytes, options.runs)?));
     drop(cached);
 
     println!("\n{} MiB per transfer, best of {} runs, through sshd on loopback:\n", options.mib, options.runs);
@@ -55,7 +55,7 @@ fn bench(client: &Path, dir: &Path, options: &Options) -> Result<()> {
         println!("{name:<14} {:>9.0} MiB/s {:>9.0} MiB/s {:>17.0} MiB/s", rates[0], rates[1], rates[2]);
     }
     println!(
-        "\nbeachhead bootstrap to ready: {} ms pushing the relay, {} ms from cache",
+        "\nsshunnel bootstrap to ready: {} ms pushing the relay, {} ms from cache",
         push_time.as_millis(),
         cache_time.as_millis()
     );
@@ -278,8 +278,8 @@ impl Forwarder {
         Ok(Self { ports, _child: child })
     }
 
-    /// Starts `beachhead forward` and returns once it reports both forwards, with how long that took.
-    fn beachhead(client: &Path, sshd: &Sshd, targets: &[String; 2]) -> Result<(Self, Duration)> {
+    /// Starts `sshunnel forward` and returns once it reports both forwards, with how long that took.
+    fn sshunnel(client: &Path, sshd: &Sshd, targets: &[String; 2]) -> Result<(Self, Duration)> {
         let ports = [free_port()?, free_port()?];
         let ssh_cmd = std::iter::once("ssh".to_owned()).chain(sshd.ssh_args()).collect::<Vec<_>>().join(" ");
         let mut cmd = Command::new(client);
@@ -288,8 +288,8 @@ impl Forwarder {
             cmd.arg("-L").arg(format!("{port}:{target}"));
         }
         let start = Instant::now();
-        let mut child = cmd.arg("127.0.0.1").stderr(Stdio::piped()).spawn().context("starting beachhead forward")?;
-        let stderr = child.stderr.take().context("beachhead has no stderr pipe")?;
+        let mut child = cmd.arg("127.0.0.1").stderr(Stdio::piped()).spawn().context("starting sshunnel forward")?;
+        let stderr = child.stderr.take().context("sshunnel has no stderr pipe")?;
         let child = Guard(child);
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -297,7 +297,7 @@ impl Forwarder {
             let mut forwarding = 0;
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 eprintln!("  {line}");
-                if line.starts_with("beachhead: forwarding") {
+                if line.starts_with("sshunnel: forwarding") {
                     forwarding += 1;
                     if forwarding == 2 {
                         let _ = ready_tx.send(());
@@ -305,7 +305,7 @@ impl Forwarder {
                 }
             }
         });
-        ready_rx.recv_timeout(Duration::from_secs(60)).context("beachhead didn't report its forwards within 60s")?;
+        ready_rx.recv_timeout(Duration::from_secs(60)).context("sshunnel didn't report its forwards within 60s")?;
         Ok((Self { ports, _child: child }, start.elapsed()))
     }
 }

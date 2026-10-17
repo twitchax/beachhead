@@ -1,22 +1,22 @@
-//! beachhead's remote half: speak the mux over stdio and dial TCP for each stream the client opens.
+//! sshunnel's remote half: speak the mux over stdio and dial TCP for each stream the client opens.
 //!
 //! stdout carries frames and nothing else; anything human-readable goes to stderr, which ssh hands
 //! back to the client's terminal.
 
 use anyhow::Context as _;
-use beachhead_mux::{
+use bytes::BytesMut;
+use sshunnel_mux::{
     Config, Incoming, OpenRequest, Role,
     base::Void,
     hello::{recv_hello, send_hello},
     pump, start,
 };
-use bytes::BytesMut;
 use tokio::net::TcpStream;
 
 /// What `--probe` prints: proof the binary executes here, which a `noexec` mount would deny.
 #[must_use]
 pub fn probe() -> String {
-    format!("beachhead-relay {} protocol {}", env!("CARGO_PKG_VERSION"), beachhead_mux::frame::VERSION)
+    format!("sshunnel-relay {} protocol {}", env!("CARGO_PKG_VERSION"), sshunnel_mux::frame::VERSION)
 }
 
 /// Serves the client over stdin and stdout until the client hangs up.

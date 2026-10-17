@@ -13,13 +13,13 @@ use std::{
     time::Duration,
 };
 
-use beachhead_mux::{
+use bytes::BytesMut;
+use pretty_assertions::assert_eq;
+use sshunnel_mux::{
     Config, Incoming, Mux, Role,
     frame::{Frame, StreamId},
     pump, start,
 };
-use bytes::BytesMut;
-use pretty_assertions::assert_eq;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex, split},
     task::JoinHandle,
@@ -113,7 +113,7 @@ async fn serve(mut incoming: Incoming) {
 }
 
 /// Opens `host` through `mux` and returns the test's end of the client-side socket.
-async fn open(mux: &Mux, host: &str) -> (DuplexStream, JoinHandle<anyhow::Result<beachhead_mux::Traffic>>) {
+async fn open(mux: &Mux, host: &str) -> (DuplexStream, JoinHandle<anyhow::Result<sshunnel_mux::Traffic>>) {
     let stream = mux.open(host, 7).await.unwrap();
     let (near, far) = duplex(SOCK_CAP);
     (far, tokio::spawn(pump(stream, near)))

@@ -1,9 +1,9 @@
 # A workspace root from day one, so lints live once in [workspace.lints] and adding an `xtask` or a
 # second crate is a one-line change.
 [workspace]
-members = [".", "crates/beachhead-mux", "crates/beachhead-relay", "xtask"]
+members = [".", "crates/sshunnel-mux", "crates/sshunnel-relay", "xtask"]
 # Plain `cargo build` / `cargo test` cover the product crates; `--workspace` adds the tooling.
-default-members = [".", "crates/beachhead-mux", "crates/beachhead-relay"]
+default-members = [".", "crates/sshunnel-mux", "crates/sshunnel-relay"]
 resolver = "3"
 
 [workspace.package]
@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Aaron Roney <twitchax@gmail.com>"]
 license = "MIT"
-repository = "https://github.com/twitchax/beachhead"
+repository = "https://github.com/twitchax/sshunnel"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -19,11 +19,11 @@ bytes = "1"
 # Each crate opts into exactly the tokio features it needs: the relay's list is its size budget.
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
-beachhead = { path = ".", version = "0.1.0", default-features = false }
-beachhead-mux = { path = "crates/beachhead-mux", version = "0.1.0" }
+sshunnel = { path = ".", version = "0.1.0", default-features = false }
+sshunnel-mux = { path = "crates/sshunnel-mux", version = "0.1.0" }
 
 [package]
-name = "beachhead"
+name = "sshunnel"
 description = "A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it."
 version.workspace = true
 edition.workspace = true
@@ -35,7 +35,7 @@ keywords = []
 categories = []
 
 [[bin]]
-name = "beachhead"
+name = "sshunnel"
 path = "src/bin.rs"
 # The binary needs the `cli` feature; library users who only want the API skip clap entirely.
 required-features = ["cli"]
@@ -46,7 +46,7 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
 anyhow.workspace = true
-beachhead-mux.workspace = true
+sshunnel-mux.workspace = true
 bytes.workspace = true
 sha2 = "0.11"
 shlex = "2"

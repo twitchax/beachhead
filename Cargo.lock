@@ -68,45 +68,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "beachhead"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "beachhead-mux",
- "bytes",
- "clap",
- "pretty_assertions",
- "sha2",
- "shlex",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "beachhead-mux"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "pretty_assertions",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "beachhead-relay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "beachhead-mux",
- "bytes",
- "pretty_assertions",
- "tokio",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -462,6 +423,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "sshunnel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "pretty_assertions",
+ "sha2",
+ "shlex",
+ "sshunnel-mux",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sshunnel-mux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "pretty_assertions",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sshunnel-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "pretty_assertions",
+ "sshunnel-mux",
+ "tokio",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -649,7 +649,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "beachhead",
+ "sshunnel",
 ]
 
 [[package]]

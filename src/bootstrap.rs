@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail};
 use crate::{arch::Arch, base::Res, relays::Relays};
 
 /// Every status line starts with this; anything else on stdout (an rc file's echo) is noise.
-pub const PREFIX: &str = "@@beachhead:";
+pub const PREFIX: &str = "@@sshunnel:";
 
 /// The script, one statement per line so it can be read and annotated. Comment lines are dropped
 /// and the rest joined with spaces, so every line ends where a space may follow: after `;`, `do`,
@@ -22,11 +22,11 @@ const TEMPLATE: &str = r#"
 # End any partial line an rc file left on stdout, so every status line starts a line of its own.
 echo;
 # Pick this arch's relay: S is its sha256, N its size.
-P=@@beachhead:;
+P=@@sshunnel:;
 case $(uname -m) in @ARMS@ *) echo "${P}ERR unsupported arch $(uname -m)"; exit 1;; esac;
 u=$(id -u);
 # Candidate dirs, best first. The ${X:+"..."} form adds the runtime dir only when it is set.
-set -- "${XDG_CACHE_HOME:-$HOME/.cache}/beachhead" ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR/beachhead"} "/dev/shm/beachhead-$u" "${TMPDIR:-/tmp}/beachhead-$u";
+set -- "${XDG_CACHE_HOME:-$HOME/.cache}/sshunnel" ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR/sshunnel"} "/dev/shm/sshunnel-$u" "${TMPDIR:-/tmp}/sshunnel-$u";
 # Usable means a real directory this user owns: in a shared tmpfs, another user could plant one.
 safe() { [ -L "$1" ] && return 1; mkdir -p "$1" 2>/dev/null; chmod 700 "$1" 2>/dev/null && [ -O "$1" ]; };
 # The right size, then the right sha256 when sha256sum exists.
@@ -43,7 +43,7 @@ chmod 700 "$t";
 for d do safe "$d" || continue; s=$d/.relay-$S.$$; [ "$s" = "$t" ] || cp "$t" "$s" 2>/dev/null || continue; chmod 700 "$s"; if "$s" --probe >/dev/null 2>&1; then [ "$s" = "$t" ] || rm -f "$t"; mv -f "$s" "$d/relay-$S" && s=$d/relay-$S; echo "${P}READY $S $d"; exec "$s" --stdio; fi; [ "$s" = "$t" ] || rm -f "$s"; done;
 # Every mount is noexec: run from an anonymous memfd instead, uncached. Flags 0 (no MFD_CLOEXEC)
 # so a relay that is a #! script runs too; the fd the relay inherits is harmless.
-command -v python3 >/dev/null 2>&1 && { echo "${P}READY $S memfd"; exec python3 -c "import os,sys;s=os.open(sys.argv[1],os.O_RDONLY);m=os.memfd_create(sys.argv[2],0);os.sendfile(m,s,0,os.fstat(s).st_size);os.unlink(sys.argv[1]);os.execve(m,sys.argv[2:],os.environ)" "$t" beachhead-relay --stdio; };
+command -v python3 >/dev/null 2>&1 && { echo "${P}READY $S memfd"; exec python3 -c "import os,sys;s=os.open(sys.argv[1],os.O_RDONLY);m=os.memfd_create(sys.argv[2],0);os.sendfile(m,s,0,os.fstat(s).st_size);os.unlink(sys.argv[1]);os.execve(m,sys.argv[2:],os.environ)" "$t" sshunnel-relay --stdio; };
 rm -f "$t"; echo "${P}ERR every directory is noexec and python3 is missing for the memfd fallback"; exit 1
 "#;
 
@@ -56,7 +56,7 @@ pub fn script(relays: &Relays) -> String {
         // Writing to a String can't fail.
         let _ = match relays.get(arch) {
             Some(relay) => write!(arms, "{pattern}) S={}; N={};;", relay.sha256(), relay.len()),
-            None => write!(arms, r#"{pattern}) echo "${{P}}ERR no {arch} relay in this beachhead build"; exit 1;;"#),
+            None => write!(arms, r#"{pattern}) echo "${{P}}ERR no {arch} relay in this sshunnel build"; exit 1;;"#),
         };
         arms.push(' ');
     }
@@ -160,30 +160,30 @@ mod unit {
     #[test]
     fn lines_without_the_prefix_are_noise() {
         assert!(parse_line(b"Welcome to the server!\n").is_none());
-        assert!(parse_line(b" @@beachhead:READY x y\n").is_none());
+        assert!(parse_line(b" @@sshunnel:READY x y\n").is_none());
     }
 
     #[test]
     fn status_lines_parse() {
-        assert_eq!(parse_line(b"@@beachhead:SEND abc 123\n").unwrap().unwrap(), Line::Send { sha256: "abc", len: 123 });
+        assert_eq!(parse_line(b"@@sshunnel:SEND abc 123\n").unwrap().unwrap(), Line::Send { sha256: "abc", len: 123 });
         assert_eq!(
-            parse_line(b"@@beachhead:READY abc /home/a b/.cache/beachhead\r\n").unwrap().unwrap(),
+            parse_line(b"@@sshunnel:READY abc /home/a b/.cache/sshunnel\r\n").unwrap().unwrap(),
             Line::Ready {
                 sha256: "abc",
-                dir: "/home/a b/.cache/beachhead"
+                dir: "/home/a b/.cache/sshunnel"
             }
         );
-        assert_eq!(parse_line(b"@@beachhead:ERR no writable cache directory\n").unwrap().unwrap(), Line::Err("no writable cache directory"));
+        assert_eq!(parse_line(b"@@sshunnel:ERR no writable cache directory\n").unwrap().unwrap(), Line::Err("no writable cache directory"));
     }
 
     #[test]
     fn malformed_status_lines_are_errors() {
         for raw in [
-            &b"@@beachhead:SEND abc\n"[..],
-            b"@@beachhead:SEND abc lots\n",
-            b"@@beachhead:READY abc\n",
-            b"@@beachhead:HELLO\n",
-            b"@@beachhead:\xff\n",
+            &b"@@sshunnel:SEND abc\n"[..],
+            b"@@sshunnel:SEND abc lots\n",
+            b"@@sshunnel:READY abc\n",
+            b"@@sshunnel:HELLO\n",
+            b"@@sshunnel:\xff\n",
         ] {
             assert!(parse_line(raw).unwrap().is_err(), "{}", String::from_utf8_lossy(raw));
         }

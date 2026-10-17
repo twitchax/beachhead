@@ -1,11 +1,11 @@
-//! Embeds prebuilt relays into the client when `BEACHHEAD_EMBED_RELAY_DIR` names a directory of
+//! Embeds prebuilt relays into the client when `SSHUNNEL_EMBED_RELAY_DIR` names a directory of
 //! them (`cargo xtask relay` writes one to `target/relay`). Without it the build embeds none, and
-//! the client needs `--relay-dir`. The generated `embedded.rs` lists every `beachhead-relay-*` file
+//! the client needs `--relay-dir`. The generated `embedded.rs` lists every `sshunnel-relay-*` file
 //! by name; the library maps names to arches, so this script needs no copy of that table.
 
 use std::{env, error::Error, fmt::Write as _, fs, path::PathBuf};
 
-const DIR_VAR: &str = "BEACHHEAD_EMBED_RELAY_DIR";
+const DIR_VAR: &str = "SSHUNNEL_EMBED_RELAY_DIR";
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-env-changed={DIR_VAR}");
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("cargo::rerun-if-changed={}", dir.display());
         let mut names: Vec<String> = fs::read_dir(&dir)?
             .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter(|name| name.starts_with("beachhead-relay-"))
+            .filter(|name| name.starts_with("sshunnel-relay-"))
             .collect();
         names.sort();
         for name in names {

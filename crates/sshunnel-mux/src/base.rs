@@ -1,4 +1,4 @@
-//! The small vocabulary every beachhead crate shares: the `anyhow` error aliases. They live in the
+//! The small vocabulary every sshunnel crate shares: the `anyhow` error aliases. They live in the
 //! lowest crate so the client and the relay re-export one definition.
 
 /// The error type for application glue.

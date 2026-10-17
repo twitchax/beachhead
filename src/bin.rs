@@ -1,5 +1,5 @@
-//! The `beachhead` binary: parse arguments, set up tracing, call the library. Everything worth
-//! testing lives in `beachhead`; this file stays thin.
+//! The `sshunnel` binary: parse arguments, set up tracing, call the library. Everything worth
+//! testing lives in `sshunnel`; this file stays thin.
 
 // `cargo llvm-cov` on nightly sets `coverage_nightly`; elsewhere this is inert, so the source builds
 // on stable. Enable the feature only in a crate root that uses `#[coverage(off)]`: an unused
@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
-use beachhead::{
+use sshunnel::{
     base::Void,
     forward::{self, Forward},
     relays::Relays,
@@ -37,7 +37,7 @@ enum Command {
         #[arg(short = 'L', long = "local", value_name = "SPEC", required = true)]
         forwards: Vec<Forward>,
         /// The ssh program and its leading arguments, split like a shell would.
-        #[arg(long, env = "BEACHHEAD_SSH", default_value = "ssh", value_name = "COMMAND")]
+        #[arg(long, env = "SSHUNNEL_SSH", default_value = "ssh", value_name = "COMMAND")]
         ssh_cmd: String,
         #[command(flatten)]
         relays: RelayArgs,
@@ -54,7 +54,7 @@ enum Command {
 #[derive(Debug, Args)]
 struct RelayArgs {
     /// Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay).
-    #[arg(long, env = "BEACHHEAD_RELAY_DIR", value_name = "DIR")]
+    #[arg(long, env = "SSHUNNEL_RELAY_DIR", value_name = "DIR")]
     relay_dir: Option<PathBuf>,
 }
 
@@ -94,7 +94,7 @@ fn run(cli: Cli) -> Void {
 
 fn print_relays(relays: &Relays) {
     println!("relays ({}):", relays.source());
-    for arch in beachhead::arch::Arch::ALL {
+    for arch in sshunnel::arch::Arch::ALL {
         match relays.get(arch) {
             Some(relay) => println!("  {:<8} sha256 {}  {} bytes", arch.name(), relay.sha256(), relay.len()),
             None => println!("  {:<8} (none)", arch.name()),
@@ -111,16 +111,11 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
 
     let session = Session::connect(ssh, destination, relays).await?;
     let relay = session.relay();
-    eprintln!("beachhead: relay {} {} {}", relay.arch(), &relay.sha256()[..12], session.bootstrap());
+    eprintln!("sshunnel: relay {} {} {}", relay.arch(), &relay.sha256()[..12], session.bootstrap());
 
     let mut serving = JoinSet::new();
     for (spec, listener) in forwards.iter().zip(listeners) {
-        eprintln!(
-            "beachhead: forwarding {} -> {}:{}",
-            listener.local_addr().context("reading a listener's address")?,
-            spec.host,
-            spec.port
-        );
+        eprintln!("sshunnel: forwarding {} -> {}:{}", listener.local_addr().context("reading a listener's address")?, spec.host, spec.port);
         serving.spawn(forward::serve(session.mux().clone(), listener, Arc::from(spec.host.as_str()), spec.port));
     }
     tokio::select! {

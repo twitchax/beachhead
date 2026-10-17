@@ -6,7 +6,7 @@
 
 use std::{process::Stdio, time::Duration};
 
-use beachhead::{
+use sshunnel::{
     arch::Arch,
     relays::Relays,
     tests::{FakeRemote, echo_server, host_arch, pattern, relay_dir},
@@ -20,22 +20,22 @@ use tokio::{
 };
 
 /// The binary with the env vars it reads cleared, so the host environment can't leak in.
-fn beachhead(dir: &TempDir) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_beachhead"));
+fn sshunnel(dir: &TempDir) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sshunnel"));
     cmd.current_dir(dir.path())
-        .env_remove("BEACHHEAD_RELAY_DIR")
-        .env_remove("BEACHHEAD_SSH")
+        .env_remove("SSHUNNEL_RELAY_DIR")
+        .env_remove("SSHUNNEL_SSH")
         .env_remove("RUST_LOG")
         .kill_on_drop(true);
     cmd
 }
 
-/// Starts `beachhead forward` and waits for its `forwarding <addr> -> ...` line; returns the
+/// Starts `sshunnel forward` and waits for its `forwarding <addr> -> ...` line; returns the
 /// child and the local address. The child's remaining stderr keeps draining in the background.
 async fn start_forward(dir: &TempDir, target: &str) -> (Child, String, Vec<String>) {
     let remote = FakeRemote::new(dir.path(), "sh", &[]).unwrap();
     let relays = relay_dir(dir.path()).unwrap();
-    let mut child = beachhead(dir)
+    let mut child = sshunnel(dir)
         .args(["forward", "-L", &format!("0:{target}"), "--ssh-cmd"])
         .arg(remote.ssh_path())
         .arg("--relay-dir")
@@ -48,8 +48,8 @@ async fn start_forward(dir: &TempDir, target: &str) -> (Child, String, Vec<Strin
     let mut seen = Vec::new();
     let addr = timeout(Duration::from_secs(30), async {
         loop {
-            let line = lines.next_line().await.unwrap().unwrap_or_else(|| panic!("beachhead exited; stderr:\n{}", seen.join("\n")));
-            if let Some(rest) = line.strip_prefix("beachhead: forwarding ") {
+            let line = lines.next_line().await.unwrap().unwrap_or_else(|| panic!("sshunnel exited; stderr:\n{}", seen.join("\n")));
+            if let Some(rest) = line.strip_prefix("sshunnel: forwarding ") {
                 let addr = rest.split_whitespace().next().unwrap().to_owned();
                 seen.push(line);
                 return addr;
@@ -58,7 +58,7 @@ async fn start_forward(dir: &TempDir, target: &str) -> (Child, String, Vec<Strin
         }
     })
     .await
-    .expect("beachhead starts forwarding");
+    .expect("sshunnel starts forwarding");
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
     (child, addr, seen)
 }
@@ -116,7 +116,7 @@ async fn e2e_forward_to_a_closed_port_closes_the_local_connection() {
 async fn e2e_relays_lists_each_arch_with_its_sha256() {
     let dir = TempDir::new().unwrap();
     let relays_dir = relay_dir(dir.path()).unwrap();
-    let out = beachhead(&dir).arg("relays").arg("--relay-dir").arg(&relays_dir).output().await.unwrap();
+    let out = sshunnel(&dir).arg("relays").arg("--relay-dir").arg(&relays_dir).output().await.unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8(out.stdout).unwrap();
 
@@ -130,7 +130,7 @@ async fn e2e_relays_lists_each_arch_with_its_sha256() {
 #[tokio::test]
 async fn e2e_relays_without_any_says_how_to_get_them() {
     let dir = TempDir::new().unwrap();
-    let out = beachhead(&dir).arg("relays").output().await.unwrap();
+    let out = sshunnel(&dir).arg("relays").output().await.unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--relay-dir"));
 }
@@ -138,7 +138,7 @@ async fn e2e_relays_without_any_says_how_to_get_them() {
 #[tokio::test]
 async fn e2e_forward_rejects_a_malformed_spec() {
     let dir = TempDir::new().unwrap();
-    let out = beachhead(&dir).args(["forward", "-L", "8080", "somewhere"]).output().await.unwrap();
+    let out = sshunnel(&dir).args(["forward", "-L", "8080", "somewhere"]).output().await.unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("[bind_address:]port:host:hostport"));
 }

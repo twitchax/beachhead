@@ -92,7 +92,7 @@ impl FakeRemote {
 ///
 /// # Errors
 ///
-/// Fails on an arch beachhead has no relay for.
+/// Fails on an arch sshunnel has no relay for.
 pub fn host_arch() -> Res<Arch> {
     Arch::from_name(std::env::consts::ARCH).with_context(|| format!("no relay arch for this host ({})", std::env::consts::ARCH))
 }
@@ -106,7 +106,7 @@ pub fn host_arch() -> Res<Arch> {
 ///
 /// Fails when the relay wasn't built, which happens when the tests run without `--workspace`.
 pub fn relay_binary() -> Res<PathBuf> {
-    let name = format!("beachhead-relay{}", std::env::consts::EXE_SUFFIX);
+    let name = format!("sshunnel-relay{}", std::env::consts::EXE_SUFFIX);
     let exe = std::env::current_exe().context("locating the test executable")?;
     exe.ancestors().skip(1).map(|dir| dir.join(&name)).find(|candidate| candidate.is_file()).with_context(|| {
         format!(
