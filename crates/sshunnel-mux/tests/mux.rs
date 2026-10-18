@@ -363,8 +363,9 @@ struct HandPeer {
 }
 
 impl HandPeer {
+    /// The client's next frame. Under a paused clock, one that never comes fails at once.
     async fn next(&mut self) -> Frame {
-        next_frame(&mut self.r, &mut self.buf).await
+        timeout(Duration::from_secs(10), next_frame(&mut self.r, &mut self.buf)).await.expect("the client sends a frame")
     }
 
     async fn send(&mut self, frame: Frame) {
@@ -375,13 +376,13 @@ impl HandPeer {
 }
 
 /// A client mux whose peer the test plays by hand.
-fn client_with_hand_peer() -> (Mux, HandPeer) {
+fn client_with_hand_peer() -> (Mux, Incoming, HandPeer) {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
-    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
+    let (client, incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
     tokio::spawn(driver);
     let (r, w) = split(b);
-    (client, HandPeer { r, w, buf: BytesMut::new() })
+    (client, incoming, HandPeer { r, w, buf: BytesMut::new() })
 }
 
 /// Opens a stream that the hand peer accepts.
@@ -405,7 +406,7 @@ enum PeerEnds {
 /// neither reads nor writes, then has the peer kill the stream. The pump must notice, though
 /// nothing local will ever wake it.
 async fn idle_pump_after(end: PeerEnds) -> anyhow::Error {
-    let (client, mut peer) = client_with_hand_peer();
+    let (client, _incoming, mut peer) = client_with_hand_peer();
     let (stream, id) = open_by_hand(&client, &mut peer).await;
     let (near, _idle_app) = duplex(SOCK_CAP);
     let pumped = tokio::spawn(pump(stream, near));
@@ -433,6 +434,46 @@ async fn a_reset_ends_a_pump_whose_local_side_is_idle() {
 async fn a_teardown_ends_a_pump_whose_local_side_is_idle() {
     let err = idle_pump_after(PeerEnds::HangsUp).await;
     assert!(format!("{err:#}").contains("closed"), "{err:#}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_returning_more_credit_than_it_was_sent_is_reset() {
+    let (client, _incoming, mut peer) = client_with_hand_peer();
+    let (_held, id) = open_by_hand(&client, &mut peer).await;
+    // Nothing was sent, so any credit at all tops the window.
+    peer.send(Frame::Window { stream: id, credit: 1 }).await;
+    let frame = peer.next().await;
+    assert!(matches!(&frame, Frame::Rst { stream, reason } if *stream == id && reason.contains("more credit")), "{frame:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_an_open_stream_resets_it() {
+    let (client, _incoming, mut peer) = client_with_hand_peer();
+    let (stream, id) = open_by_hand(&client, &mut peer).await;
+    drop(stream);
+    let frame = peer.next().await;
+    assert!(matches!(&frame, Frame::Rst { stream, .. } if *stream == id), "{frame:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_an_unanswered_open_request_rejects_it() {
+    let (_client, mut incoming, mut peer) = client_with_hand_peer();
+    // Even ids are the relay's to open.
+    let id = StreamId(2);
+    peer.send(Frame::Open { stream: id, host: "x".into(), port: 1 }).await;
+    drop(incoming.next().await.unwrap());
+    let frame = peer.next().await;
+    assert!(matches!(&frame, Frame::OpenErr { stream, .. } if *stream == id), "{frame:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_teardown_fails_an_open_in_flight() {
+    let (client, _incoming, mut peer) = client_with_hand_peer();
+    let opener = tokio::spawn(async move { client.open("x", 7).await });
+    assert!(matches!(peer.next().await, Frame::Open { .. }));
+    drop(peer);
+    let result = timeout(Duration::from_secs(10), opener).await.expect("the open fails rather than waiting forever").unwrap();
+    assert!(format!("{:#}", result.unwrap_err()).contains("closed"));
 }
 
 #[tokio::test]

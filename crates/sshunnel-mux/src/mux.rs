@@ -467,8 +467,10 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut writer: W, mut ctrl: mpsc::Unboun
             else => return Ok(()),
         };
         first.encode(&mut buf)?;
-        // Batch whatever else is ready, control first. Checking control before data at every step
-        // keeps a control frame ahead of any data queued after it.
+        // Batch whatever else is ready, control first, so credit goes back promptly. That is a
+        // priority, not an order: a control frame queued just after its channel was checked can
+        // still go out behind data queued later (an `OpenOk` behind its stream's first `Data`).
+        // That is harmless only because an opener registers its stream before its `Open` leaves.
         while buf.len() < WRITE_BATCH {
             let Some(next) = ctrl.try_recv().ok().or_else(|| data.try_recv().ok()) else { break };
             next.encode(&mut buf)?;
