@@ -16,7 +16,7 @@ use sshunnel::{
     arch::Arch,
     relays::{Relay, Relays, Source},
     session::{Bootstrap, Session},
-    tests::{FakeRemote, echo_server, full_disk_dir, host_arch, noexec_relay_dir, path_with, pattern, relay_dir, wrapped_relay_dir},
+    tests::{FakeRemote, echo_server, full_disk_dir, host_arch, noexec_relay_dir, path_with, pattern, relay_dir, shim_dir, wrapped_relay_dir},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -174,7 +174,7 @@ async fn e2e_a_cached_relay_that_is_a_symlink_is_replaced() {
 
 /// The tools the bootstrap needs. It uses a hasher and `mktemp` too when the remote has them, so a
 /// remote `PATH` with only these has no way to check a sha256.
-const BOOTSTRAP_TOOLS: &[&str] = &["sh", "uname", "id", "mkdir", "chmod", "ls", "wc", "head", "cat", "cp", "mv", "rm", "touch", "find"];
+const BOOTSTRAP_TOOLS: &[&str] = &["sh", "uname", "id", "mkdir", "chmod", "ls", "wc", "head", "cat", "cp", "mv", "rm", "find"];
 
 /// A remote whose `PATH` holds `tools` and nothing else.
 fn remote_with_tools(root: &Path, tools: &[&str]) -> FakeRemote {
@@ -188,6 +188,22 @@ fn remote_with_hasher(root: &Path, hasher: Option<&str>) -> FakeRemote {
     remote_with_tools(root, &tools)
 }
 
+/// Pushes, hits the cache, then replaces a same-size impostor: on `remote`, the cache works and
+/// still checks sha256s.
+async fn assert_cache_verifies(remote: &FakeRemote, relays: &Relays, label: &str) {
+    let relay = relays.get(host_arch().unwrap()).unwrap();
+    let cache = remote.home().join(".cache/sshunnel");
+
+    let first = connect(remote, relays).await;
+    assert_eq!(first.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) }, "{label}");
+    drop(first);
+    assert_cached(remote, relays, &cache).await;
+
+    plant(&cache.join(format!("relay-{}", relay.sha256())), &same_size_impostor(relay.len()), 0o700);
+    let replaced = connect(remote, relays).await;
+    assert_eq!(replaced.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) }, "{label} caught the wrong bytes");
+}
+
 /// With only `hasher` to check sha256s: the cache still hits, and still rejects the wrong bytes.
 async fn cache_verifies_with(hasher: &str) {
     if !installed(hasher) {
@@ -196,17 +212,96 @@ async fn cache_verifies_with(hasher: &str) {
     let root = TempDir::new().unwrap();
     let remote = remote_with_hasher(root.path(), Some(hasher));
     let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    assert_cache_verifies(&remote, &relays, hasher).await;
+}
+
+#[tokio::test]
+async fn e2e_busybox_alone_runs_the_bootstrap() {
+    if !installed("busybox") {
+        return skip("busybox");
+    }
+    let root = TempDir::new().unwrap();
+    // `sh` and every tool the script runs are busybox applets, as on a minimal remote: field
+    // positions, mktemp, find and the hasher all come from busybox.
+    let applets = root.path().join("busybox");
+    std::fs::create_dir_all(&applets).unwrap();
+    let status = std::process::Command::new("busybox").arg("--install").arg("-s").arg(&applets).status().unwrap();
+    assert!(status.success(), "busybox --install");
+    let remote = FakeRemote::new(root.path(), "sh", &[("PATH", &dir_of(&applets))]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    assert_cache_verifies(&remote, &relays, "busybox").await;
+}
+
+/// A remote `PATH` with `shims` ahead of this machine's own.
+fn path_with_shims(root: &Path, shims: &[(&str, &str)]) -> String {
+    format!("{}:{}", dir_of(&shim_dir(root, shims).unwrap()), std::env::var("PATH").unwrap())
+}
+
+#[tokio::test]
+async fn e2e_cache_dirs_another_user_owns_are_never_used() {
+    // Every candidate belongs to the test's uid, so an `id` that answers with another uid makes
+    // each of them someone else's: a genuine relay among them must not run.
+    const OTHER: &str = "4242424";
+    let root = TempDir::new().unwrap();
+    let path = path_with_shims(root.path(), &[("id", &format!("echo {OTHER}"))]);
+    let remote = FakeRemote::new(root.path(), "sh", &[("PATH", &path)]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
     let relay = relays.get(host_arch().unwrap()).unwrap();
+    plant(&remote.home().join(format!(".cache/sshunnel/relay-{}", relay.sha256())), relay.bytes(), 0o755);
+
+    let started = timeout(Duration::from_secs(30), Session::connect(&remote.ssh_command().unwrap(), "fake-host", &relays))
+        .await
+        .expect("the bootstrap finishes");
+    // The one candidate outside the TempDir, created empty under the other uid's name.
+    let _ = std::fs::remove_dir(format!("/dev/shm/sshunnel-{OTHER}"));
+    let err = started.err().expect("no candidate passes the owner check");
+    assert!(format!("{err:#}").contains("this user owns"), "{err:#}");
+}
+
+#[tokio::test]
+async fn e2e_a_cache_dir_others_can_write_to_never_serves_a_hit() {
+    let root = TempDir::new().unwrap();
+    let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    let cache = remote.home().join(".cache/sshunnel");
+    drop(connect(&remote, &relays).await);
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let second = connect(&remote, &relays).await;
+    assert_eq!(second.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) }, "no hit from a dir others can write to");
+    let mode = std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "the dir is made private before a relay goes in");
+    drop(second);
+    assert_cached(&remote, &relays, &cache).await;
+}
+
+#[tokio::test]
+async fn e2e_a_cache_the_user_cannot_chmod_still_serves_hits() {
+    let root = TempDir::new().unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    drop(connect(&FakeRemote::new(root.path(), "sh", &[]).unwrap(), &relays).await);
+    // A read-only filesystem refuses chmod even on a dir that is already private.
+    let path = path_with_shims(root.path(), &[("chmod", "exit 1")]);
+    let read_only = FakeRemote::new(root.path(), "sh", &[("PATH", &path)]).unwrap();
+    assert_cached(&read_only, &relays, &read_only.home().join(".cache/sshunnel")).await;
+}
+
+#[tokio::test]
+async fn e2e_a_broken_hasher_means_pushing_every_run() {
+    let root = TempDir::new().unwrap();
+    let tools: Vec<&str> = BOOTSTRAP_TOOLS.iter().copied().chain(["mktemp"]).collect();
+    let real = path_with(root.path(), &tools).unwrap();
+    // A sha256sum that answers, wrongly: a hasher too old for the flags the script passes, say.
+    let broken = shim_dir(root.path(), &[("sha256sum", "cat > /dev/null; echo 0000  -")]).unwrap();
+    let remote = FakeRemote::new(root.path(), "sh", &[("PATH", &format!("{}:{}", dir_of(&broken), dir_of(&real)))]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
     let cache = remote.home().join(".cache/sshunnel");
 
-    let first = connect(&remote, &relays).await;
-    assert_eq!(first.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) });
-    drop(first);
-    assert_cached(&remote, &relays, &cache).await;
-
-    plant(&cache.join(format!("relay-{}", relay.sha256())), &same_size_impostor(relay.len()), 0o700);
-    let replaced = connect(&remote, &relays).await;
-    assert_eq!(replaced.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) }, "{hasher} caught the wrong bytes");
+    for run in ["first", "second"] {
+        let session = connect(&remote, &relays).await;
+        assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) }, "{run} run");
+        assert_carries_tcp(&session, 10_000).await;
+    }
 }
 
 #[tokio::test]
@@ -394,12 +489,12 @@ fn age(path: &Path, days: u64) {
 }
 
 #[tokio::test]
-async fn e2e_relays_unused_for_30_days_are_evicted_on_install() {
+async fn e2e_relays_installed_over_30_days_ago_are_evicted_on_install() {
     let root = TempDir::new().unwrap();
     let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
     let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
     let cache = remote.home().join(".cache/sshunnel");
-    // Two other builds' relays: one last run 40 days ago, one yesterday.
+    // Two other builds' relays: one installed 40 days ago, one yesterday.
     let stale = cache.join(format!("relay-{}", "0".repeat(64)));
     let recent = cache.join(format!("relay-{}", "1".repeat(64)));
     plant(&stale, b"an old build", 0o700);
@@ -409,23 +504,8 @@ async fn e2e_relays_unused_for_30_days_are_evicted_on_install() {
 
     let session = connect(&remote, &relays).await;
     assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) });
-    assert!(!stale.exists(), "a relay unused for 40 days is evicted");
-    assert!(recent.exists(), "a relay used yesterday stays");
-}
-
-#[tokio::test]
-async fn e2e_a_cache_hit_marks_its_relay_as_used() {
-    let root = TempDir::new().unwrap();
-    let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
-    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
-    let cache = remote.home().join(".cache/sshunnel");
-    drop(connect(&remote, &relays).await);
-    let installed = cache.join(format!("relay-{}", relays.get(host_arch().unwrap()).unwrap().sha256()));
-    age(&installed, 40);
-
-    assert_cached(&remote, &relays, &cache).await;
-    let idle = std::fs::metadata(&installed).unwrap().modified().unwrap().elapsed().unwrap();
-    assert!(idle < Duration::from_hours(24), "the hit refreshed the relay's mtime ({idle:?} old), so eviction spares it");
+    assert!(!stale.exists(), "a relay installed 40 days ago is evicted");
+    assert!(recent.exists(), "a relay installed yesterday stays");
 }
 
 #[tokio::test]

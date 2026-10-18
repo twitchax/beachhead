@@ -47,8 +47,9 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Fails unless `0 < chunk <= window / 2` and the chunk fits a frame. A chunk over half the
-    /// window could stall: the receiver returns credit in half-window steps.
+    /// Fails unless `0 < chunk <= window / 2` and the chunk fits a frame. Credit returns in
+    /// half-window steps, so a sender cuts its chunk to half the peer's window; between two ends
+    /// sharing this config, a larger chunk would never go out whole.
     pub fn new(window: u32, chunk: usize) -> Res<Self> {
         if chunk == 0 || chunk > MAX_PAYLOAD {
             bail!("chunk {chunk} must be between 1 and {MAX_PAYLOAD} bytes");
@@ -129,11 +130,12 @@ impl Mux {
             }
             let id = StreamId(table.next_id);
             table.next_id = table.next_id.checked_add(2).context("stream ids exhausted")?;
+            let stream = self.shared.insert(&mut table, id, State::Open, Some(opened_tx));
             // Queued under the lock that allocated the id: the peer requires ids in increasing
             // order, so a concurrent open must not get its Open onto the wire first. The send
             // never blocks.
             self.shared.control(Frame::Open { stream: id, host: host.to_owned(), port });
-            self.shared.insert(&mut table, id, State::Open, Some(opened_tx))
+            stream
         };
 
         match opened_rx.await {

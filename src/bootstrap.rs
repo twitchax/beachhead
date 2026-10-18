@@ -32,31 +32,38 @@ H=; for h in sha256sum "shasum -a 256" "openssl dgst -sha256 -r"; do command -v 
 # mine PATH PATTERN: the ls -l mode of PATH matches PATTERN and this user owns it. ls -ld lists the
 # entry itself (an lstat), so a symlink shows as l... and never passes for a dir or a file.
 mine() { set -- "$2" $(ls -ldn "$1" 2>/dev/null); case $2 in $1) [ "$4" = "$u" ];; *) false;; esac; };
-# Trusted means a real directory this user owns: in a shared tmpfs, another user could plant one.
-# Once it is ours, the sticky bit keeps anyone else from replacing it, so only then make it private.
-trusted() { mine "$1" "d*" && chmod 700 "$1"; };
-# A dir to write into: created private when missing, then trusted like any other.
-usable() { mkdir -p -m 700 "$1" 2>/dev/null; trusted "$1"; };
+# Private means a real directory this user owns that no one else may write to: in a shared tmpfs,
+# another user could plant one. Once it is ours, the sticky bit keeps anyone else from replacing it.
+private() { mine "$1" "d????-??-*"; };
+# A dir to write into: created private when missing. One this user owns but others may write to is
+# made private first, and only after the owner check.
+usable() { mkdir -p -m 700 "$1" 2>/dev/null; private "$1" || { mine "$1" "d*" && chmod 700 "$1"; }; };
 # The right size, then the right sha256 when there is a hasher.
 sum() { [ "$(($(wc -c < "$1")))" = "$N" ] || return 1; [ -n "$H" ] || return 0; set -- $($H < "$1"); [ "$1" = "$S" ]; };
+# A received relay passes sum, unless the hasher is what is broken: one that gets the sha256 of
+# nothing wrong is dropped, and the relay is checked by size alone (ssh protects the bytes in
+# transit). Without a hasher there are no hits, so such a box gets a push every run.
+ok() { sum "$1" && return; r=$1; [ -n "$H" ] && set -- $(: | $H) && [ "$1" = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ] && return 1; H=; sum "$r"; };
 # A fresh, empty staging file in $1, its path on stdout: from mktemp where there is one, else named
-# for this shell's pid (which can collide across hosts sharing an NFS home).
-stage() { mktemp "$1/.relay-$S.XXXXXX" 2>/dev/null || { : > "$1/.relay-$S.$$" && echo "$1/.relay-$S.$$"; }; };
-# Relays this dir hasn't run in 30 days belong to old builds. A hit touches its relay, so a build
-# still in use somewhere stays.
-evict() { for o in "$1"/relay-*; do [ -n "$(find "$o" -mtime +30 2>/dev/null)" ] && rm -f "$o"; done; };
-# A cache hit needs a trusted dir, a file this user owns, a real sha256 and a probe that proves the
-# mount still allows exec. With no hasher there are no hits, and the client sends the relay instead.
-# Every probe reads /dev/null: the session is the client's, and the client is waiting.
-[ -n "$H" ] && for d do f=$d/relay-$S; trusted "$d" && mine "$f" "-*" && [ -x "$f" ] && sum "$f" && "$f" --probe </dev/null >/dev/null 2>&1 && { touch "$f" 2>/dev/null; echo "${P}READY $S $d"; exec "$f" --stdio; }; done;
+# for this shell's pid (which can collide across hosts sharing an NFS home). The fallback uses true,
+# not the special builtin :, whose failed redirection would end the shell.
+stage() { mktemp "$1/.relay-$S.XXXXXX" 2>/dev/null || { true > "$1/.relay-$S.$$" && echo "$1/.relay-$S.$$"; } 2>/dev/null; };
+# Relays installed over 30 days ago belong to old builds: clear them out as a new one goes in. One
+# still in use elsewhere is pushed again, once; in exchange, a hit costs nothing extra.
+evict() { find "$1" -name "relay-*" -mtime +30 -exec rm -f {} ";" 2>/dev/null; };
+# A cache hit needs a private dir, a regular file this user owns, a real sha256 and a probe that
+# proves the mount still allows exec; the [ -f ] spares all that for a dir with no copy. With no
+# hasher there are no hits, and the client sends the relay instead. Every probe reads /dev/null:
+# the session is the client's, and the client is waiting.
+[ -n "$H" ] && for d do f=$d/relay-$S; [ -f "$f" ] && private "$d" && mine "$f" "-*" && [ -x "$f" ] && sum "$f" && "$f" --probe </dev/null >/dev/null 2>&1 && { echo "${P}READY $S $d"; exec "$f" --stdio; }; done;
 # A miss: receive the relay into the first dir that can hold it. Each try sends SEND only once its
 # staging file exists, so a dir that can't take one costs no transfer. A write that fails (a full
 # disk, a quota) still drains its copy, which keeps the session in step for the next try.
-t=; e="no writable cache directory"; for d do usable "$d" && s=$(stage "$d") || continue; echo "${P}SEND $S $N"; if head -c "$N" | { cat > "$s" 2>/dev/null || { cat > /dev/null; false; }; }; then sum "$s" && { t=$s; break; }; rm -f "$s"; echo "${P}ERR the relay arrived corrupted"; exit 1; fi; rm -f "$s"; e="no cache directory had room for the relay"; done;
+t=; e="no writable cache directory this user owns"; for d do usable "$d" && s=$(stage "$d") || continue; echo "${P}SEND $S $N"; if head -c "$N" | { cat > "$s" 2>/dev/null || { cat > /dev/null; false; }; }; then ok "$s" && { t=$s; break; }; rm -f "$s"; echo "${P}ERR the relay arrived corrupted"; exit 1; fi; rm -f "$s"; e="no cache directory had room for the relay"; done;
 [ -n "$t" ] || { echo "${P}ERR $e"; exit 1; };
-chmod 700 "$t";
-# Install into the first dir whose mount allows exec. mv is atomic, so concurrent runs are safe.
-for d do usable "$d" || continue; if [ "${t%/*}" = "$d" ]; then s=$t; else s=$(stage "$d") && cp "$t" "$s" 2>/dev/null || { rm -f "$s"; continue; }; fi; chmod 700 "$s"; if "$s" --probe </dev/null >/dev/null 2>&1; then [ "$s" = "$t" ] || rm -f "$t"; mv -f "$s" "$d/relay-$S" && s=$d/relay-$S; evict "$d"; echo "${P}READY $S $d"; exec "$s" --stdio; fi; [ "$s" = "$t" ] || rm -f "$s"; done;
+# Install into the first dir whose mount allows exec; the dir holding the staged copy already
+# passed. mv is atomic, so concurrent runs are safe.
+for d do if [ "${t%/*}" = "$d" ]; then s=$t; else usable "$d" && s=$(stage "$d") || continue; cp "$t" "$s" 2>/dev/null || { rm -f "$s"; continue; }; fi; chmod 700 "$s"; if "$s" --probe </dev/null >/dev/null 2>&1; then [ "$s" = "$t" ] || rm -f "$t"; mv -f "$s" "$d/relay-$S" && s=$d/relay-$S; evict "$d"; echo "${P}READY $S $d"; exec "$s" --stdio; fi; [ "$s" = "$t" ] || rm -f "$s"; done;
 # Every mount is noexec: run from an anonymous memfd instead, uncached. Python unlinks the staged
 # file before anything can fail, so a python without memfd_create (older than 3.8, or behind
 # seccomp) leaves nothing behind. F is MFD_EXEC wherever vm.memfd_noexec exists (Linux 6.3+): at 1

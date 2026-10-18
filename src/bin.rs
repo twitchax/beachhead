@@ -103,7 +103,7 @@ fn print_relays(relays: &Relays) {
 }
 
 async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, relays: &Relays) -> Void {
-    // Bind first, so a port already in use fails before ssh runs.
+    // Bind first, so a port no address can take fails before ssh runs.
     let mut listeners = Vec::with_capacity(forwards.len());
     for spec in forwards {
         listeners.push(spec.bind().await?);

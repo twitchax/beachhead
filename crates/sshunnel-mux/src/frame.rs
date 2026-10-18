@@ -19,7 +19,7 @@ pub const MAX_REASON: usize = 1024;
 /// The first bytes of every `Hello`.
 pub const MAGIC: [u8; 4] = *b"SSHN";
 /// The protocol version both ends must agree on.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// A stream's id. The opener allocates them monotonically and never reuses one, so a late frame for
 /// a finished stream can be ignored. Id 0 is the connection itself (`Hello`).
@@ -120,12 +120,18 @@ impl Frame {
 
         Ok(match kind {
             Kind::Hello => {
-                fixed(10)?;
-                if payload[..4] != MAGIC {
-                    bail!("bad Hello magic {:?}", &payload[..4]);
+                if payload.len() < 6 || payload[..4] != MAGIC {
+                    bail!("bad Hello magic {:?}", &payload[..payload.len().min(4)]);
                 }
+                let version = payload.get_u16_at(4);
+                if version != VERSION {
+                    // Another version may lay out the rest differently: report the version alone,
+                    // and let the handshake refuse it by name rather than trip on the layout.
+                    return Ok(Self::Hello { version, window: 0 });
+                }
+                fixed(10)?;
                 Self::Hello {
-                    version: payload.get_u16_at(4),
+                    version,
                     window: u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]]),
                 }
             }

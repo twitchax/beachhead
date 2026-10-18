@@ -109,12 +109,13 @@ impl Forward {
             match TcpListener::bind(addr).await {
                 Ok(listener) => listeners.push(listener),
                 Err(e) => {
-                    // A family the host lacks is routine (a container without IPv6); anything else
-                    // is worth a word, since a client may well try that address.
-                    if e.kind() == ErrorKind::AddrNotAvailable {
-                        debug!(%addr, "not listening: {e}");
-                    } else {
+                    // A port taken on one family is worth a word, since a client may well reach
+                    // whatever holds it. A family the host lacks (a container without IPv6, a
+                    // kernel booted with it disabled) is routine, whichever errno says so.
+                    if e.kind() == ErrorKind::AddrInUse {
                         warn!("not listening on {addr}: {e}");
+                    } else {
+                        debug!(%addr, "not listening: {e}");
                     }
                     failed.get_or_insert(Err::new(e).context(format!("listening on {addr}")));
                 }

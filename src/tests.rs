@@ -182,6 +182,21 @@ pub fn full_disk_dir(root: &Path, full: &str, tools: &[&str]) -> Res<PathBuf> {
     Ok(dir)
 }
 
+/// A dir in `root` of `sh` scripts standing in for tools, given as (name, body) pairs. Ahead of the
+/// real `PATH`, each shadows the tool it names.
+///
+/// # Errors
+///
+/// Fails when a shim can't be written.
+pub fn shim_dir(root: &Path, shims: &[(&str, &str)]) -> Res<PathBuf> {
+    let dir = root.join("shims");
+    std::fs::create_dir_all(&dir).context("creating the shim dir")?;
+    for (tool, body) in shims {
+        write_executable(&dir.join(tool), &format!("#!/bin/sh\n{body}\n"))?;
+    }
+    Ok(dir)
+}
+
 /// Where `tool` lives on this machine's `PATH`.
 fn on_path(tool: &str) -> Res<PathBuf> {
     let path = std::env::var_os("PATH").context("PATH is not set")?;

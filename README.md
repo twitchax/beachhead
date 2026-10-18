@@ -34,8 +34,8 @@ sshunnel runs your system `ssh` (so the aliases, `ProxyCommand`, `Match` blocks 
 3. Otherwise asks for it. The client streams the relay down the same session, and the script
    checks it, installs the relay atomically (`mv`), and runs it. A noexec mount hands the
    relay to the next candidate (a full one asks for another copy there); when *every* candidate
-   is noexec, it runs from a `memfd` via `python3`, uncached. Relays an old build left behind go
-   once they have sat unused for 30 days.
+   is noexec, it runs from a `memfd` via `python3`, uncached. Relays an old build left behind are
+   cleared out 30 days after they were installed.
 
 Nothing is installed system-wide and the remote needs no root. Only the first run pays for the
 transfer, and a new build carries a new hash, which doubles as the upgrade path.
@@ -52,15 +52,15 @@ remote**:
 ```text
 $ sshunnel relays
 relays (embedded):
-  x86_64   sha256 79a29174ccf5b2b4d6470f69d8d262c751beb27aa029fc6799cbb9869225a164  605520 bytes
-  aarch64  sha256 97912e76ec29918c6d693745752b8676ad8d777be536172038d1edc652aaccf0  546680 bytes
+  x86_64   sha256 a0e309b80a71f62836712f6c441c887be46f4c357032ea58fcb29b766cfb3e0d  606672 bytes
+  aarch64  sha256 9f1087bf49fa09eb7333f1e48395573ea435b05646e72992c8f470c1fc3db05f  547352 bytes
 ```
 
 ## Usage
 
 ```text
 $ sshunnel forward -L 8080:server.lan:80 server
-sshunnel: relay x86_64 79a29174ccf5 pushed to /home/me/.cache/sshunnel
+sshunnel: relay x86_64 a0e309b80a71 pushed to /home/me/.cache/sshunnel
 sshunnel: forwarding 127.0.0.1:8080 -> server.lan:80
 sshunnel: forwarding [::1]:8080 -> server.lan:80
 ```
@@ -102,8 +102,8 @@ in the [bench log](.prds/PRD-0002.log.md)).
 
 ## Caveats
 
-- Remotes must be Linux on x86_64 or aarch64, with a POSIX `sh`, `uname`, `head -c` and `mkdir`
-  (GNU coreutils, busybox and toybox all qualify).
+- Remotes must be Linux on x86_64 or aarch64, with a POSIX `sh`, `uname`, `ls`, `head -c` and
+  `mkdir` (GNU coreutils, busybox and toybox all qualify).
 - A cache hit needs a sha256 hasher on the remote (`sha256sum`, `shasum` or `openssl`). Without
   one, the relay is sent on every run.
 - The relay resolves names with musl's resolver, which reads `/etc/hosts` and `/etc/resolv.conf`

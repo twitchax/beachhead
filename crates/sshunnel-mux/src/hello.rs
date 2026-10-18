@@ -83,6 +83,14 @@ mod unit {
     }
 
     #[tokio::test]
+    async fn an_older_hello_reports_its_version_not_its_layout() {
+        // Version 1's Hello: magic and version, no window.
+        let wire = [0, 0, 0, 0, 0, 0, 0, 0, 6, b'S', b'S', b'H', b'N', 0, 1];
+        let err = recv_hello(&mut &wire[..], &mut BytesMut::new()).await.unwrap_err();
+        assert!(err.to_string().contains("version 1"), "{err:#}");
+    }
+
+    #[tokio::test]
     async fn a_zero_window_is_refused() {
         let mut wire = BytesMut::new();
         Frame::Hello { version: VERSION, window: 0 }.encode(&mut wire).unwrap();
