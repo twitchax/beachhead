@@ -16,12 +16,23 @@ use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::TcpStream,
     process::{Child, Command},
+    sync::watch,
     time::timeout,
 };
 
 /// The binary with the env vars it reads cleared, so the host environment can't leak in.
 fn sshunnel(dir: &TempDir) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sshunnel"));
+    isolated(Command::new(env!("CARGO_BIN_EXE_sshunnel")), dir)
+}
+
+/// The binary under `ulimit -n fds`, so it runs out of file descriptors on demand.
+fn sshunnel_with_fd_limit(dir: &TempDir, fds: u32) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", &format!("ulimit -n {fds} && exec \"$0\" \"$@\""), env!("CARGO_BIN_EXE_sshunnel")]);
+    isolated(cmd, dir)
+}
+
+fn isolated(mut cmd: Command, dir: &TempDir) -> Command {
     cmd.current_dir(dir.path())
         .env_remove("SSHUNNEL_RELAY_DIR")
         .env_remove("SSHUNNEL_SSH")
@@ -30,12 +41,12 @@ fn sshunnel(dir: &TempDir) -> Command {
     cmd
 }
 
-/// Starts `sshunnel forward` and waits for its `forwarding <addr> -> ...` line; returns the
-/// child and the local address. The child's remaining stderr keeps draining in the background.
-async fn start_forward(dir: &TempDir, target: &str) -> (Child, String, Vec<String>) {
+/// Runs `cmd forward` and waits for its `forwarding <addr> -> ...` line; returns the child, the
+/// local address, and every stderr line so far, which keeps filling in the background.
+async fn start_forward(mut cmd: Command, dir: &TempDir, target: &str) -> (Child, String, watch::Receiver<Vec<String>>) {
     let remote = FakeRemote::new(dir.path(), "sh", &[]).unwrap();
     let relays = relay_dir(dir.path()).unwrap();
-    let mut child = sshunnel(dir)
+    let mut child = cmd
         .args(["forward", "-L", &format!("0:{target}"), "--ssh-cmd"])
         .arg(remote.ssh_path())
         .arg("--relay-dir")
@@ -45,22 +56,25 @@ async fn start_forward(dir: &TempDir, target: &str) -> (Child, String, Vec<Strin
         .spawn()
         .unwrap();
     let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
-    let mut seen = Vec::new();
+    let (seen, stderr) = watch::channel(Vec::new());
     let addr = timeout(Duration::from_secs(30), async {
         loop {
-            let line = lines.next_line().await.unwrap().unwrap_or_else(|| panic!("sshunnel exited; stderr:\n{}", seen.join("\n")));
-            if let Some(rest) = line.strip_prefix("sshunnel: forwarding ") {
-                let addr = rest.split_whitespace().next().unwrap().to_owned();
-                seen.push(line);
+            let line = lines.next_line().await.unwrap().unwrap_or_else(|| panic!("sshunnel exited; stderr:\n{}", seen.borrow().join("\n")));
+            let addr = line.strip_prefix("sshunnel: forwarding ").map(|rest| rest.split_whitespace().next().unwrap().to_owned());
+            seen.send_modify(|seen| seen.push(line));
+            if let Some(addr) = addr {
                 return addr;
             }
-            seen.push(line);
         }
     })
     .await
     .expect("sshunnel starts forwarding");
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    (child, addr, seen)
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            seen.send_modify(|seen| seen.push(line));
+        }
+    });
+    (child, addr, stderr)
 }
 
 async fn echo_through(addr: &str, data: &[u8]) -> Vec<u8> {
@@ -81,7 +95,8 @@ async fn echo_through(addr: &str, data: &[u8]) -> Vec<u8> {
 async fn e2e_forward_carries_tcp() {
     let dir = TempDir::new().unwrap();
     let echo = echo_server().await.unwrap();
-    let (_child, addr, stderr) = start_forward(&dir, &format!("127.0.0.1:{}", echo.port())).await;
+    let (_child, addr, stderr) = start_forward(sshunnel(&dir), &dir, &format!("127.0.0.1:{}", echo.port())).await;
+    let stderr = stderr.borrow();
     assert!(stderr.iter().any(|line| line.contains("pushed to")), "the first run pushes the relay: {stderr:?}");
 
     let data = pattern(7, 1 << 20);
@@ -101,11 +116,32 @@ async fn e2e_forward_carries_tcp() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_forward_survives_running_out_of_file_descriptors() {
+    let dir = TempDir::new().unwrap();
+    let echo = echo_server().await.unwrap();
+    let (mut child, addr, mut stderr) = start_forward(sshunnel_with_fd_limit(&dir, 32), &dir, &format!("127.0.0.1:{}", echo.port())).await;
+
+    // More connections than the forwarder has descriptors for, so an accept fails with EMFILE.
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.extend(TcpStream::connect(&addr).await.ok());
+    }
+    let failed = stderr.wait_for(|lines| lines.iter().any(|line| line.contains("accepting a local connection")));
+    timeout(Duration::from_secs(10), failed).await.expect("an accept fails").unwrap();
+
+    drop(held);
+    let data = pattern(9, 64 * 1024);
+    let served = TcpStream::connect(&addr).await.is_ok() && echo_through(&addr, &data).await == data;
+    assert!(served, "the forwarder serves again once descriptors free up; stderr:\n{}", stderr.borrow().join("\n"));
+    assert!(child.try_wait().unwrap().is_none(), "the forwarder is still running");
+}
+
 #[tokio::test]
 async fn e2e_forward_to_a_closed_port_closes_the_local_connection() {
     let dir = TempDir::new().unwrap();
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-    let (_child, addr, _) = start_forward(&dir, &closed.to_string()).await;
+    let (_child, addr, _) = start_forward(sshunnel(&dir), &dir, &closed.to_string()).await;
     let mut socket = TcpStream::connect(&addr).await.unwrap();
     let mut buf = Vec::new();
     let read = timeout(Duration::from_secs(10), socket.read_to_end(&mut buf)).await.expect("the local connection closes");

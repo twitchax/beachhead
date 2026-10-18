@@ -1,7 +1,7 @@
 //! Local TCP forwards, `ssh -L` style: listen locally, open a stream through the relay for each
 //! connection, and pump it.
 
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, anyhow, bail};
 use sshunnel_mux::{
@@ -88,14 +88,34 @@ impl Forward {
     }
 }
 
-/// Accepts connections on `listener` forever, opening a stream to `host:port` for each.
+/// The pause after a failed accept, doubling with each failure in a row up to [`MAX_BACKOFF`].
+const MIN_BACKOFF: Duration = Duration::from_millis(5);
+const MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Accepts connections on `listener` until dropped, opening a stream to `host:port` for each.
 ///
 /// # Errors
 ///
-/// Fails only when the listener itself fails; a failed connection is logged and dropped.
+/// None: like `ssh -L`, it outlives a failed accept (EMFILE once the process is out of
+/// descriptors) by logging it and retrying after a backoff, and a failed connection is logged and
+/// dropped.
 pub async fn serve(mux: Mux, listener: TcpListener, host: Arc<str>, port: u16) -> Void {
+    let mut backoff = MIN_BACKOFF;
     loop {
-        let (socket, peer) = listener.accept().await.context("accepting a local connection")?;
+        let (socket, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                backoff = MIN_BACKOFF;
+                accepted
+            }
+            Err(e) => {
+                // Out of descriptors, the connection stays queued and the next accept fails the
+                // same way at once: wait for live connections to close rather than spin.
+                warn!("accepting a local connection: {e}; retrying in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
         let (mux, host) = (mux.clone(), Arc::clone(&host));
         tokio::spawn(async move {
             // Frames already batch; Nagle would only add latency on top.
