@@ -33,8 +33,9 @@ sshunnel runs your system `ssh` (so the aliases, `ProxyCommand`, `Match` blocks 
    does), since `/dev/shm` and `/tmp` are shared with every other account on the box.
 3. Otherwise asks for it. The client streams the relay down the same session, and the script
    checks it, installs the relay atomically (`mv`), and runs it. A noexec mount hands the
-   relay to the next candidate; when *every* candidate is noexec, it runs from a `memfd` via
-   `python3`, uncached.
+   relay to the next candidate (a full one asks for another copy there); when *every* candidate
+   is noexec, it runs from a `memfd` via `python3`, uncached. Relays an old build left behind go
+   once they have sat unused for 30 days.
 
 Nothing is installed system-wide and the remote needs no root. Only the first run pays for the
 transfer, and a new build carries a new hash, which doubles as the upgrade path.

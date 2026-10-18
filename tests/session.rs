@@ -4,7 +4,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{os::unix::fs::PermissionsExt as _, path::Path, time::Duration};
+use std::{
+    os::unix::fs::PermissionsExt as _,
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use bytes::Bytes;
 use pretty_assertions::assert_eq;
@@ -12,7 +16,7 @@ use sshunnel::{
     arch::Arch,
     relays::{Relay, Relays, Source},
     session::{Bootstrap, Session},
-    tests::{FakeRemote, echo_server, host_arch, noexec_relay_dir, path_with, pattern, relay_dir},
+    tests::{FakeRemote, echo_server, full_disk_dir, host_arch, noexec_relay_dir, path_with, pattern, relay_dir, wrapped_relay_dir},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -168,15 +172,20 @@ async fn e2e_a_cached_relay_that_is_a_symlink_is_replaced() {
     assert!(std::fs::symlink_metadata(&entry).unwrap().file_type().is_file(), "the push replaced the link with a file");
 }
 
-/// The tools the bootstrap runs, besides a hasher: a remote `PATH` with only these has no way to
-/// check a sha256.
-const BOOTSTRAP_TOOLS: &[&str] = &["sh", "uname", "id", "mkdir", "chmod", "ls", "wc", "head", "cat", "cp", "mv", "rm"];
+/// The tools the bootstrap needs. It uses a hasher and `mktemp` too when the remote has them, so a
+/// remote `PATH` with only these has no way to check a sha256.
+const BOOTSTRAP_TOOLS: &[&str] = &["sh", "uname", "id", "mkdir", "chmod", "ls", "wc", "head", "cat", "cp", "mv", "rm", "touch", "find"];
 
-/// A remote whose `PATH` holds the bootstrap's tools plus `hasher` (if any).
-fn remote_with_hasher(root: &Path, hasher: Option<&str>) -> FakeRemote {
-    let tools: Vec<&str> = BOOTSTRAP_TOOLS.iter().copied().chain(hasher).collect();
-    let path = path_with(root, &tools).unwrap();
+/// A remote whose `PATH` holds `tools` and nothing else.
+fn remote_with_tools(root: &Path, tools: &[&str]) -> FakeRemote {
+    let path = path_with(root, tools).unwrap();
     FakeRemote::new(root, "sh", &[("PATH", &dir_of(&path))]).unwrap()
+}
+
+/// A remote whose `PATH` holds the bootstrap's tools, `mktemp`, and `hasher` (if any).
+fn remote_with_hasher(root: &Path, hasher: Option<&str>) -> FakeRemote {
+    let tools: Vec<&str> = BOOTSTRAP_TOOLS.iter().copied().chain(["mktemp"]).chain(hasher).collect();
+    remote_with_tools(root, &tools)
 }
 
 /// With only `hasher` to check sha256s: the cache still hits, and still rejects the wrong bytes.
@@ -258,6 +267,20 @@ async fn e2e_noexec_unwritable_cache_dir_falls_through_to_the_next_candidate() {
     assert_carries_tcp(&session, 100_000).await;
 }
 
+/// Every candidate (the cache, `TMPDIR` and `/dev/shm`) ends in a `sshunnel*` dir; a memfd runs as
+/// `/dev/fd/N`, which doesn't match. `/dev/shm/sshunnel-<uid>` is the one dir outside the `TempDir`
+/// this touches, and only with staged copies, which the bootstrap removes.
+const NOEXEC_EVERYWHERE: &str = "*/sshunnel*/relay-*|*/sshunnel*/.relay-*";
+
+/// A dir holding a `sitecustomize.py` of `code`: on a remote's `PYTHONPATH`, python3 runs it before
+/// the memfd fallback's own code.
+fn python_site(root: &Path, code: &str) -> String {
+    let dir = root.join("python-site");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("sitecustomize.py"), code).unwrap();
+    dir_of(&dir)
+}
+
 #[tokio::test]
 async fn e2e_noexec_everywhere_falls_back_to_memfd() {
     if !installed("python3") {
@@ -265,10 +288,7 @@ async fn e2e_noexec_everywhere_falls_back_to_memfd() {
     }
     let root = TempDir::new().unwrap();
     let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
-    // Every candidate (the cache, TMPDIR and /dev/shm) ends in a sshunnel* dir; a memfd runs as
-    // /dev/fd/N, which doesn't match. /dev/shm/sshunnel-<uid> is the one dir outside the TempDir
-    // this touches, and only its staged copy, which the bootstrap removes.
-    let relays = Relays::from_dir(&noexec_relay_dir(root.path(), "*/sshunnel*/relay-*|*/sshunnel*/.relay-*").unwrap()).unwrap();
+    let relays = Relays::from_dir(&noexec_relay_dir(root.path(), NOEXEC_EVERYWHERE).unwrap()).unwrap();
 
     let session = connect(&remote, &relays).await;
     assert_eq!(session.bootstrap(), &Bootstrap::Memfd);
@@ -277,6 +297,135 @@ async fn e2e_noexec_everywhere_falls_back_to_memfd() {
         assert!(!dir.join(format!("relay-{}", session.relay().sha256())).exists(), "a memfd run caches nothing in {}", dir.display());
         assert_eq!(strays(&dir), Vec::<String>::new(), "staged copies are cleaned up in {}", dir.display());
     }
+}
+
+#[tokio::test]
+async fn e2e_a_failed_memfd_fallback_leaves_no_staged_copy() {
+    if !installed("python3") {
+        return skip("python3");
+    }
+    let root = TempDir::new().unwrap();
+    // A python3 without memfd_create: older than 3.8, or under a seccomp filter that denies it.
+    let site = python_site(root.path(), "import os\ndel os.memfd_create\n");
+    let remote = FakeRemote::new(root.path(), "sh", &[("PYTHONPATH", &site)]).unwrap();
+    let relays = Relays::from_dir(&noexec_relay_dir(root.path(), NOEXEC_EVERYWHERE).unwrap()).unwrap();
+
+    let started = timeout(Duration::from_secs(30), Session::connect(&remote.ssh_command().unwrap(), "fake-host", &relays))
+        .await
+        .expect("the bootstrap finishes");
+    assert!(started.is_err(), "the relay can't start without memfd_create");
+    for dir in [remote.home().join(".cache/sshunnel"), root.path().join("tmp").join(format!("sshunnel-{}", uid()))] {
+        assert_eq!(strays(&dir), Vec::<String>::new(), "no staged copy is left in {}", dir.display());
+    }
+}
+
+#[tokio::test]
+async fn e2e_the_memfd_fallback_runs_under_vm_memfd_noexec_1() {
+    if !installed("python3") {
+        return skip("python3");
+    }
+    if !Path::new("/proc/sys/vm/memfd_noexec").exists() {
+        return skip("a kernel with vm.memfd_noexec (Linux 6.3+)");
+    }
+    let root = TempDir::new().unwrap();
+    // Under vm.memfd_noexec=1 the kernel seals a memfd made without MFD_EXEC (0x10) as noexec
+    // (MFD_NOEXEC_SEAL, 0x8). Setting the sysctl takes root, so python plays the kernel's part.
+    let site = python_site(
+        root.path(),
+        "import os\nreal = os.memfd_create\nos.memfd_create = lambda name, flags=os.MFD_CLOEXEC: real(name, flags if flags & 0x10 else flags | 0x8)\n",
+    );
+    let remote = FakeRemote::new(root.path(), "sh", &[("PYTHONPATH", &site)]).unwrap();
+    let relays = Relays::from_dir(&noexec_relay_dir(root.path(), NOEXEC_EVERYWHERE).unwrap()).unwrap();
+
+    let session = connect(&remote, &relays).await;
+    assert_eq!(session.bootstrap(), &Bootstrap::Memfd);
+    assert_carries_tcp(&session, 10_000).await;
+}
+
+#[tokio::test]
+async fn e2e_a_full_cache_dir_falls_through_to_the_next_candidate() {
+    let root = TempDir::new().unwrap();
+    let run = root.path().join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    // The bootstrap writes a relay with these; on a full disk, every one of them fails there.
+    let full = full_disk_dir(root.path(), "*/.cache/sshunnel/*", &["head", "cat", "cp"]).unwrap();
+    let path = format!("{}:{}", dir_of(&full), std::env::var("PATH").unwrap());
+    let remote = FakeRemote::new(root.path(), "sh", &[("XDG_RUNTIME_DIR", &dir_of(&run)), ("PATH", &path)]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+
+    let session = connect(&remote, &relays).await;
+    assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&run.join("sshunnel")) });
+    assert_carries_tcp(&session, 100_000).await;
+    assert_eq!(strays(&remote.home().join(".cache/sshunnel")), Vec::<String>::new(), "the failed copies are cleaned up");
+}
+
+#[tokio::test]
+async fn e2e_the_probe_cannot_read_the_session() {
+    let root = TempDir::new().unwrap();
+    let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
+    // A relay whose --probe reads stdin. Given the session, it would wait on a client that sends
+    // nothing until READY (or eat the bytes the client did send).
+    let relays = Relays::from_dir(&wrapped_relay_dir(root.path(), "case \"$1\" in --probe) [ -z \"$(head -c 1)\" ] || exit 1;; esac").unwrap()).unwrap();
+
+    let session = connect(&remote, &relays).await;
+    assert!(matches!(session.bootstrap(), Bootstrap::Pushed { .. }), "{}", session.bootstrap());
+    assert_carries_tcp(&session, 10_000).await;
+}
+
+#[tokio::test]
+async fn e2e_staging_works_without_mktemp() {
+    let root = TempDir::new().unwrap();
+    let tools: Vec<&str> = BOOTSTRAP_TOOLS.iter().copied().chain(["sha256sum"]).collect();
+    let remote = remote_with_tools(root.path(), &tools);
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    let cache = remote.home().join(".cache/sshunnel");
+
+    let first = connect(&remote, &relays).await;
+    assert_eq!(first.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) });
+    assert_eq!(strays(&cache), Vec::<String>::new());
+    drop(first);
+    assert_cached(&remote, &relays, &cache).await;
+}
+
+/// Sets `path`'s modification time to `days` ago.
+fn age(path: &Path, days: u64) {
+    let then = SystemTime::now() - Duration::from_hours(days * 24);
+    std::fs::File::open(path).unwrap().set_modified(then).unwrap();
+}
+
+#[tokio::test]
+async fn e2e_relays_unused_for_30_days_are_evicted_on_install() {
+    let root = TempDir::new().unwrap();
+    let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    let cache = remote.home().join(".cache/sshunnel");
+    // Two other builds' relays: one last run 40 days ago, one yesterday.
+    let stale = cache.join(format!("relay-{}", "0".repeat(64)));
+    let recent = cache.join(format!("relay-{}", "1".repeat(64)));
+    plant(&stale, b"an old build", 0o700);
+    age(&stale, 40);
+    plant(&recent, b"a build still in use", 0o700);
+    age(&recent, 1);
+
+    let session = connect(&remote, &relays).await;
+    assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) });
+    assert!(!stale.exists(), "a relay unused for 40 days is evicted");
+    assert!(recent.exists(), "a relay used yesterday stays");
+}
+
+#[tokio::test]
+async fn e2e_a_cache_hit_marks_its_relay_as_used() {
+    let root = TempDir::new().unwrap();
+    let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    let cache = remote.home().join(".cache/sshunnel");
+    drop(connect(&remote, &relays).await);
+    let installed = cache.join(format!("relay-{}", relays.get(host_arch().unwrap()).unwrap().sha256()));
+    age(&installed, 40);
+
+    assert_cached(&remote, &relays, &cache).await;
+    let idle = std::fs::metadata(&installed).unwrap().modified().unwrap().elapsed().unwrap();
+    assert!(idle < Duration::from_hours(24), "the hit refreshed the relay's mtime ({idle:?} old), so eviction spares it");
 }
 
 #[tokio::test]
@@ -366,11 +515,11 @@ fn installed(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
-/// CI installs every shell these tests name, so a missing one there is a failure; a dev box just
-/// says what it skipped.
-fn skip(program: &str) {
-    assert!(std::env::var_os("CI").is_none(), "{program} is not installed on this CI runner");
-    eprintln!("skipped: {program} is not installed");
+/// CI provides every program and kernel feature these tests name, so a missing one there is a
+/// failure; a dev box just says what it skipped.
+fn skip(what: &str) {
+    assert!(std::env::var_os("CI").is_none(), "{what} is missing on this CI runner");
+    eprintln!("skipped: {what} is missing");
 }
 
 fn uid() -> String {

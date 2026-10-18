@@ -39,20 +39,31 @@ trusted() { mine "$1" "d*" && chmod 700 "$1"; };
 usable() { mkdir -p -m 700 "$1" 2>/dev/null; trusted "$1"; };
 # The right size, then the right sha256 when there is a hasher.
 sum() { [ "$(($(wc -c < "$1")))" = "$N" ] || return 1; [ -n "$H" ] || return 0; set -- $($H < "$1"); [ "$1" = "$S" ]; };
+# A fresh, empty staging file in $1, its path on stdout: from mktemp where there is one, else named
+# for this shell's pid (which can collide across hosts sharing an NFS home).
+stage() { mktemp "$1/.relay-$S.XXXXXX" 2>/dev/null || { : > "$1/.relay-$S.$$" && echo "$1/.relay-$S.$$"; }; };
+# Relays this dir hasn't run in 30 days belong to old builds. A hit touches its relay, so a build
+# still in use somewhere stays.
+evict() { for o in "$1"/relay-*; do [ -n "$(find "$o" -mtime +30 2>/dev/null)" ] && rm -f "$o"; done; };
 # A cache hit needs a trusted dir, a file this user owns, a real sha256 and a probe that proves the
 # mount still allows exec. With no hasher there are no hits, and the client sends the relay instead.
-[ -n "$H" ] && for d do f=$d/relay-$S; trusted "$d" && mine "$f" "-*" && [ -x "$f" ] && sum "$f" && "$f" --probe >/dev/null 2>&1 && { echo "${P}READY $S $d"; exec "$f" --stdio; }; done;
-# A miss: find a staging file first, so a failure is reported before the client sends anything.
-t=; for d do usable "$d" && : > "$d/.relay-$S.$$" 2>/dev/null && { t=$d/.relay-$S.$$; break; }; done;
-[ -n "$t" ] || { echo "${P}ERR no writable cache directory"; exit 1; };
-echo "${P}SEND $S $N";
-head -c "$N" > "$t" && sum "$t" || { rm -f "$t"; echo "${P}ERR the relay arrived corrupted"; exit 1; };
+# Every probe reads /dev/null: the session is the client's, and the client is waiting.
+[ -n "$H" ] && for d do f=$d/relay-$S; trusted "$d" && mine "$f" "-*" && [ -x "$f" ] && sum "$f" && "$f" --probe </dev/null >/dev/null 2>&1 && { touch "$f" 2>/dev/null; echo "${P}READY $S $d"; exec "$f" --stdio; }; done;
+# A miss: receive the relay into the first dir that can hold it. Each try sends SEND only once its
+# staging file exists, so a dir that can't take one costs no transfer. A write that fails (a full
+# disk, a quota) still drains its copy, which keeps the session in step for the next try.
+t=; e="no writable cache directory"; for d do usable "$d" && s=$(stage "$d") || continue; echo "${P}SEND $S $N"; if head -c "$N" | { cat > "$s" 2>/dev/null || { cat > /dev/null; false; }; }; then sum "$s" && { t=$s; break; }; rm -f "$s"; echo "${P}ERR the relay arrived corrupted"; exit 1; fi; rm -f "$s"; e="no cache directory had room for the relay"; done;
+[ -n "$t" ] || { echo "${P}ERR $e"; exit 1; };
 chmod 700 "$t";
 # Install into the first dir whose mount allows exec. mv is atomic, so concurrent runs are safe.
-for d do usable "$d" || continue; s=$d/.relay-$S.$$; [ "$s" = "$t" ] || cp "$t" "$s" 2>/dev/null || continue; chmod 700 "$s"; if "$s" --probe >/dev/null 2>&1; then [ "$s" = "$t" ] || rm -f "$t"; mv -f "$s" "$d/relay-$S" && s=$d/relay-$S; echo "${P}READY $S $d"; exec "$s" --stdio; fi; [ "$s" = "$t" ] || rm -f "$s"; done;
-# Every mount is noexec: run from an anonymous memfd instead, uncached. Flags 0 (no MFD_CLOEXEC)
-# so a relay that is a #! script runs too; the fd the relay inherits is harmless.
-command -v python3 >/dev/null 2>&1 && { echo "${P}READY $S memfd"; exec python3 -c "import os,sys;s=os.open(sys.argv[1],os.O_RDONLY);m=os.memfd_create(sys.argv[2],0);os.sendfile(m,s,0,os.fstat(s).st_size);os.unlink(sys.argv[1]);os.execve(m,sys.argv[2:],os.environ)" "$t" sshunnel-relay --stdio; };
+for d do usable "$d" || continue; if [ "${t%/*}" = "$d" ]; then s=$t; else s=$(stage "$d") && cp "$t" "$s" 2>/dev/null || { rm -f "$s"; continue; }; fi; chmod 700 "$s"; if "$s" --probe </dev/null >/dev/null 2>&1; then [ "$s" = "$t" ] || rm -f "$t"; mv -f "$s" "$d/relay-$S" && s=$d/relay-$S; evict "$d"; echo "${P}READY $S $d"; exec "$s" --stdio; fi; [ "$s" = "$t" ] || rm -f "$s"; done;
+# Every mount is noexec: run from an anonymous memfd instead, uncached. Python unlinks the staged
+# file before anything can fail, so a python without memfd_create (older than 3.8, or behind
+# seccomp) leaves nothing behind. F is MFD_EXEC wherever vm.memfd_noexec exists (Linux 6.3+): at 1
+# it seals any memfd made without it noexec, and older kernels reject the flag. No MFD_CLOEXEC, so a
+# relay that is a #! script runs too; the fd the relay inherits is harmless.
+F=0; [ -e /proc/sys/vm/memfd_noexec ] && F=16;
+command -v python3 >/dev/null 2>&1 && { echo "${P}READY $S memfd"; exec python3 -c "import os,sys;s=os.open(sys.argv[1],os.O_RDONLY);os.unlink(sys.argv[1]);m=os.memfd_create(sys.argv[3],int(sys.argv[2]));os.sendfile(m,s,0,os.fstat(s).st_size);os.execve(m,sys.argv[3:],os.environ)" "$t" "$F" sshunnel-relay --stdio; };
 rm -f "$t"; echo "${P}ERR every directory is noexec and python3 is missing for the memfd fallback"; exit 1
 "#;
 

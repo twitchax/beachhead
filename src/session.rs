@@ -195,7 +195,9 @@ async fn run_bootstrap(stdout: &mut BufReader<ChildStdout>, stdin: ChildStdin, r
                 if relay.len() != len {
                     bail!("the remote expects {len} bytes of relay {sha256}, but it is {} bytes", relay.len());
                 }
-                let mut pipe = stdin.take().context("the remote asked for the relay twice")?;
+                // Another SEND means the remote couldn't store the last copy (a full disk, say)
+                // and drained it on its way to the next dir, so the pipe is free for one more.
+                let mut pipe = reclaim(push.take(), stdin.take()).await?;
                 let bytes = relay.bytes().clone();
                 // Push while still reading: if the remote fails mid-transfer, its ERR line is the
                 // error worth reporting, not the broken pipe.
@@ -215,15 +217,19 @@ async fn run_bootstrap(stdout: &mut BufReader<ChildStdout>, stdin: ChildStdin, r
                     (dir, true) => Bootstrap::Pushed { dir: dir.to_owned() },
                     (dir, false) => Bootstrap::Cached { dir: dir.to_owned() },
                 };
-                let stdin = match (push, stdin) {
-                    (Some(push), _) => push.await.map_err(|e| anyhow!("the relay push failed: {e}"))??,
-                    (None, Some(stdin)) => stdin,
-                    (None, None) => bail!("lost the ssh stdin pipe"),
-                };
-                return Ok((relay, bootstrap, stdin));
+                return Ok((relay, bootstrap, reclaim(push, stdin).await?));
             }
             Line::Err(reason) => bail!("the remote bootstrap failed: {reason}"),
         }
+    }
+}
+
+/// The ssh stdin pipe, back from the push holding it when there was one.
+async fn reclaim(push: Option<JoinHandle<Res<ChildStdin>>>, stdin: Option<ChildStdin>) -> Res<ChildStdin> {
+    match (push, stdin) {
+        (Some(push), _) => push.await.map_err(|e| anyhow!("the relay push failed: {e}"))?,
+        (None, Some(stdin)) => Ok(stdin),
+        (None, None) => bail!("lost the ssh stdin pipe"),
     }
 }
 

@@ -136,14 +136,59 @@ pub fn relay_dir(root: &Path) -> Res<PathBuf> {
 ///
 /// Fails when the relay is missing or the script can't be written.
 pub fn noexec_relay_dir(root: &Path, noexec: &str) -> Res<PathBuf> {
-    let dir = root.join("noexec-relays");
+    wrapped_relay_dir(
+        root,
+        &format!("# Simulates a noexec mount: refuse to run from a matching path.\ncase \"$0\" in {noexec}) exit 126;; esac"),
+    )
+}
+
+/// A relay dir in `root` whose relay is a script that runs the `sh` lines in `prelude`, then execs
+/// the real relay: a relay that misbehaves in one chosen way.
+///
+/// # Errors
+///
+/// Fails when the relay is missing or the script can't be written.
+pub fn wrapped_relay_dir(root: &Path, prelude: &str) -> Res<PathBuf> {
+    let dir = root.join("wrapped-relays");
     std::fs::create_dir_all(&dir).context("creating the relay dir")?;
-    let script = format!(
-        "#!/bin/sh\n# Simulates a noexec mount: refuse to run from a matching path.\ncase \"$0\" in {noexec}) exit 126;; esac\nexec {} \"$@\"\n",
-        quote(&relay_binary()?.to_string_lossy())?
-    );
+    let script = format!("#!/bin/sh\n{prelude}\nexec {} \"$@\"\n", quote(&relay_binary()?.to_string_lossy())?);
     write_executable(&dir.join(host_arch()?.file_name()), &script)?;
     Ok(dir)
+}
+
+/// A dir in `root` of shims for `tools` that act as if every path matching the `case` pattern
+/// `full` sat on a full disk: stdout bound for one goes to `/dev/full` (so writes fail with ENOSPC),
+/// and a run whose last argument is one (`cp src dst`) fails outright. Goes first on a remote's
+/// `PATH`. Linux only: the shim reads its stdout's target from `/proc`.
+///
+/// # Errors
+///
+/// Fails when a tool isn't on `PATH` or a shim can't be written.
+pub fn full_disk_dir(root: &Path, full: &str, tools: &[&str]) -> Res<PathBuf> {
+    let dir = root.join("full-disk");
+    std::fs::create_dir_all(&dir).context("creating the shim dir")?;
+    for tool in tools {
+        let real = quote(&on_path(tool)?.to_string_lossy())?;
+        let script = format!(
+            "#!/bin/sh\n\
+             # Simulates a full disk under matching paths.\n\
+             case $(readlink /proc/$$/fd/1) in {full}) exec {real} \"$@\" > /dev/full;; esac\n\
+             last=; for last do :; done\n\
+             case $last in {full}) echo \"{tool}: $last: No space left on device\" >&2; exit 1;; esac\n\
+             exec {real} \"$@\"\n"
+        );
+        write_executable(&dir.join(tool), &script)?;
+    }
+    Ok(dir)
+}
+
+/// Where `tool` lives on this machine's `PATH`.
+fn on_path(tool: &str) -> Res<PathBuf> {
+    let path = std::env::var_os("PATH").context("PATH is not set")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(tool))
+        .find(|p| p.is_file())
+        .with_context(|| format!("{tool} is not on PATH"))
 }
 
 /// A dir in `root` holding only `tools`, each linked to the copy on this machine's `PATH`. As a
@@ -155,13 +200,8 @@ pub fn noexec_relay_dir(root: &Path, noexec: &str) -> Res<PathBuf> {
 pub fn path_with(root: &Path, tools: &[&str]) -> Res<PathBuf> {
     let dir = root.join("bin");
     std::fs::create_dir_all(&dir).context("creating the tool dir")?;
-    let path = std::env::var_os("PATH").context("PATH is not set")?;
     for tool in tools {
-        let found = std::env::split_paths(&path)
-            .map(|d| d.join(tool))
-            .find(|p| p.is_file())
-            .with_context(|| format!("{tool} is not on PATH"))?;
-        std::os::unix::fs::symlink(&found, dir.join(tool)).with_context(|| format!("linking {tool}"))?;
+        std::os::unix::fs::symlink(on_path(tool)?, dir.join(tool)).with_context(|| format!("linking {tool}"))?;
     }
     Ok(dir)
 }
