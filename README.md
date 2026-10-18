@@ -52,15 +52,15 @@ remote**:
 ```text
 $ sshunnel relays
 relays (embedded):
-  x86_64   sha256 a0e309b80a71f62836712f6c441c887be46f4c357032ea58fcb29b766cfb3e0d  606672 bytes
-  aarch64  sha256 9f1087bf49fa09eb7333f1e48395573ea435b05646e72992c8f470c1fc3db05f  547352 bytes
+  x86_64   sha256 884f282e43456ee8810e35d921843cf0ae56df14e0966a78af074e768acbac34  605456 bytes
+  aarch64  sha256 9a5e3373a0b37de33d49bc27547162e085f811b39ae451c955f0a576802ada1c  546760 bytes
 ```
 
 ## Usage
 
 ```text
 $ sshunnel forward -L 8080:server.lan:80 server
-sshunnel: relay x86_64 a0e309b80a71 pushed to /home/me/.cache/sshunnel
+sshunnel: relay x86_64 884f282e4345 pushed to /home/me/.cache/sshunnel
 sshunnel: forwarding 127.0.0.1:8080 -> server.lan:80
 sshunnel: forwarding [::1]:8080 -> server.lan:80
 ```
@@ -94,8 +94,8 @@ best of three, x86_64 Linux, OpenSSH 10.2):
 | `ssh -L` | 497 MiB/s | 533 MiB/s | 556 MiB/s |
 | `sshunnel forward -L` | 484 MiB/s | 449 MiB/s | 490 MiB/s |
 
-Bootstrap to ready takes 146 ms when the relay has to be pushed and 111 ms from cache, and ssh's own
-connection setup is most of either figure. These are loopback numbers, so they measure overhead
+Bootstrap to ready takes about 140 ms when the relay has to be pushed and 120 ms from cache, and
+ssh's own connection setup is most of either figure. These are loopback numbers, so they measure overhead
 rather than any real link. A single stream's throughput tracks window ÷ round trip: a 256 KiB
 window held one stream to roughly half of `ssh -L`, which is why the default is 1 MiB (the sweep is
 in the [bench log](.prds/PRD-0002.log.md)).
