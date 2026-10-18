@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{path::Path, time::Duration};
+use std::{os::unix::fs::PermissionsExt as _, path::Path, time::Duration};
 
 use bytes::Bytes;
 use pretty_assertions::assert_eq;
@@ -12,7 +12,7 @@ use sshunnel::{
     arch::Arch,
     relays::{Relay, Relays, Source},
     session::{Bootstrap, Session},
-    tests::{FakeRemote, echo_server, host_arch, noexec_relay_dir, pattern, relay_dir},
+    tests::{FakeRemote, echo_server, host_arch, noexec_relay_dir, path_with, pattern, relay_dir},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -86,6 +86,31 @@ async fn e2e_the_client_disables_the_pty_and_escape_character() {
     assert!(args[4].starts_with("sh -c '"), "{}", args[4]);
 }
 
+/// Puts `contents` at `path` with `mode`, by rename: a relay that ran from `path` may still be
+/// running, and writing over a running binary fails (ETXTBSY).
+fn plant(path: &Path, contents: &[u8], mode: u32) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let staged = path.with_extension("planting");
+    std::fs::write(&staged, contents).unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+/// An executable script exactly `len` bytes long that passes `--probe` and serves nothing: only the
+/// sha256 can tell it from the relay it impersonates.
+fn same_size_impostor(len: usize) -> Vec<u8> {
+    let mut script = b"#!/bin/sh\nexit 0\n".to_vec();
+    script.resize(len, b'#');
+    script
+}
+
+/// Runs the bootstrap once more against a cache the previous run filled, and expects a hit.
+async fn assert_cached(remote: &FakeRemote, relays: &Relays, dir: &Path) {
+    let session = connect(remote, relays).await;
+    assert_eq!(session.bootstrap(), &Bootstrap::Cached { dir: dir_of(dir) });
+    assert_carries_tcp(&session, 10_000).await;
+}
+
 #[tokio::test]
 async fn e2e_a_cached_relay_with_the_wrong_bytes_is_replaced() {
     let root = TempDir::new().unwrap();
@@ -93,17 +118,110 @@ async fn e2e_a_cached_relay_with_the_wrong_bytes_is_replaced() {
     let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
     let relay = relays.get(host_arch().unwrap()).unwrap();
     let cache = remote.home().join(".cache/sshunnel");
-    std::fs::create_dir_all(&cache).unwrap();
-    // Same name and size, different bytes: only the sha256 check can tell.
     let planted = cache.join(format!("relay-{}", relay.sha256()));
-    let mut fake = std::fs::read(sshunnel::tests::relay_binary().unwrap()).unwrap();
-    fake[0] ^= 0xFF;
-    std::fs::write(&planted, &fake).unwrap();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut std::fs::metadata(&planted).unwrap().permissions(), 0o755);
+    plant(&planted, &same_size_impostor(relay.len()), 0o700);
 
     let session = connect(&remote, &relays).await;
     assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) });
     assert_carries_tcp(&session, 10_000).await;
+    assert!(std::fs::read(&planted).unwrap() == relay.bytes()[..], "the push replaced the impostor");
+}
+
+#[tokio::test]
+async fn e2e_a_symlinked_cache_dir_is_never_used() {
+    let root = TempDir::new().unwrap();
+    let run = root.path().join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    let remote = FakeRemote::new(root.path(), "sh", &[("XDG_RUNTIME_DIR", &dir_of(&run))]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    let relay = relays.get(host_arch().unwrap()).unwrap();
+    // A dir this user doesn't control, holding the genuine relay under its real name, linked into
+    // the first candidate's place. Nothing in it may run, and nothing may be written to it.
+    let foreign = root.path().join("foreign");
+    plant(&foreign.join(format!("relay-{}", relay.sha256())), relay.bytes(), 0o755);
+    std::fs::create_dir_all(remote.home().join(".cache")).unwrap();
+    std::os::unix::fs::symlink(&foreign, remote.home().join(".cache/sshunnel")).unwrap();
+
+    let session = connect(&remote, &relays).await;
+    assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&run.join("sshunnel")) });
+    assert_carries_tcp(&session, 10_000).await;
+    let left: Vec<_> = std::fs::read_dir(&foreign).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(left, [format!("relay-{}", relay.sha256())], "the foreign dir is untouched");
+}
+
+#[tokio::test]
+async fn e2e_a_cached_relay_that_is_a_symlink_is_replaced() {
+    let root = TempDir::new().unwrap();
+    let remote = FakeRemote::new(root.path(), "sh", &[]).unwrap();
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    let relay = relays.get(host_arch().unwrap()).unwrap();
+    // The right bytes, but somewhere else: the cache entry must be the user's own file.
+    let elsewhere = root.path().join("elsewhere/relay");
+    plant(&elsewhere, relay.bytes(), 0o755);
+    let cache = remote.home().join(".cache/sshunnel");
+    std::fs::create_dir_all(&cache).unwrap();
+    let entry = cache.join(format!("relay-{}", relay.sha256()));
+    std::os::unix::fs::symlink(&elsewhere, &entry).unwrap();
+
+    let session = connect(&remote, &relays).await;
+    assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) });
+    assert!(std::fs::symlink_metadata(&entry).unwrap().file_type().is_file(), "the push replaced the link with a file");
+}
+
+/// The tools the bootstrap runs, besides a hasher: a remote `PATH` with only these has no way to
+/// check a sha256.
+const BOOTSTRAP_TOOLS: &[&str] = &["sh", "uname", "id", "mkdir", "chmod", "ls", "wc", "head", "cat", "cp", "mv", "rm"];
+
+/// A remote whose `PATH` holds the bootstrap's tools plus `hasher` (if any).
+fn remote_with_hasher(root: &Path, hasher: Option<&str>) -> FakeRemote {
+    let tools: Vec<&str> = BOOTSTRAP_TOOLS.iter().copied().chain(hasher).collect();
+    let path = path_with(root, &tools).unwrap();
+    FakeRemote::new(root, "sh", &[("PATH", &dir_of(&path))]).unwrap()
+}
+
+/// With only `hasher` to check sha256s: the cache still hits, and still rejects the wrong bytes.
+async fn cache_verifies_with(hasher: &str) {
+    if !installed(hasher) {
+        return skip(hasher);
+    }
+    let root = TempDir::new().unwrap();
+    let remote = remote_with_hasher(root.path(), Some(hasher));
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    let relay = relays.get(host_arch().unwrap()).unwrap();
+    let cache = remote.home().join(".cache/sshunnel");
+
+    let first = connect(&remote, &relays).await;
+    assert_eq!(first.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) });
+    drop(first);
+    assert_cached(&remote, &relays, &cache).await;
+
+    plant(&cache.join(format!("relay-{}", relay.sha256())), &same_size_impostor(relay.len()), 0o700);
+    let replaced = connect(&remote, &relays).await;
+    assert_eq!(replaced.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) }, "{hasher} caught the wrong bytes");
+}
+
+#[tokio::test]
+async fn e2e_cache_hits_verify_with_shasum_when_sha256sum_is_missing() {
+    cache_verifies_with("shasum").await;
+}
+
+#[tokio::test]
+async fn e2e_cache_hits_verify_with_openssl_when_sha256sum_is_missing() {
+    cache_verifies_with("openssl").await;
+}
+
+#[tokio::test]
+async fn e2e_without_a_hasher_the_relay_is_always_pushed() {
+    let root = TempDir::new().unwrap();
+    let remote = remote_with_hasher(root.path(), None);
+    let relays = Relays::from_dir(&relay_dir(root.path()).unwrap()).unwrap();
+    let cache = remote.home().join(".cache/sshunnel");
+
+    for run in ["first", "second"] {
+        let session = connect(&remote, &relays).await;
+        assert_eq!(session.bootstrap(), &Bootstrap::Pushed { dir: dir_of(&cache) }, "{run} run");
+        assert_carries_tcp(&session, 10_000).await;
+    }
 }
 
 #[tokio::test]

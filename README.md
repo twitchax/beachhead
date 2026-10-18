@@ -28,8 +28,9 @@ sshunnel runs your system `ssh` (so the aliases, `ProxyCommand`, `Match` blocks 
 1. Picks the relay for `uname -m`. There is one for x86_64 and one for aarch64, each a static musl
    binary of roughly 600 KB, so the remote's glibc version never enters into it.
 2. Looks for `relay-<sha256>` in `~/.cache/sshunnel`, then `$XDG_RUNTIME_DIR`, `/dev/shm` and
-   `$TMPDIR`, and runs it if its size and sha256 match and a `--probe` proves the mount still
-   allows exec.
+   `$TMPDIR`, and runs it if its sha256 matches and a `--probe` proves the mount still allows
+   exec. A cached copy counts only when the user owns both it and its directory (a symlink never
+   does), since `/dev/shm` and `/tmp` are shared with every other account on the box.
 3. Otherwise asks for it. The client streams the relay down the same session, and the script
    checks it, installs the relay atomically (`mv`), and runs it. A noexec mount hands the
    relay to the next candidate; when *every* candidate is noexec, it runs from a `memfd` via
@@ -101,6 +102,8 @@ in the [bench log](.prds/PRD-0002.log.md)).
 
 - Remotes must be Linux on x86_64 or aarch64, with a POSIX `sh`, `uname`, `head -c` and `mkdir`
   (GNU coreutils, busybox and toybox all qualify).
+- A cache hit needs a sha256 hasher on the remote (`sha256sum`, `shasum` or `openssl`). Without
+  one, the relay is sent on every run.
 - The relay resolves names with musl's resolver, which reads `/etc/hosts` and `/etc/resolv.conf`
   and ignores `nsswitch.conf`. The systemd-resolved stub works; mDNS (`.local`), LDAP and NIS names
   don't.

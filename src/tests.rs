@@ -146,6 +146,26 @@ pub fn noexec_relay_dir(root: &Path, noexec: &str) -> Res<PathBuf> {
     Ok(dir)
 }
 
+/// A dir in `root` holding only `tools`, each linked to the copy on this machine's `PATH`. As a
+/// remote's `PATH`, it stands in for a box that lacks everything else (no `sha256sum`, say).
+///
+/// # Errors
+///
+/// Fails when a tool isn't on `PATH` or a link can't be made.
+pub fn path_with(root: &Path, tools: &[&str]) -> Res<PathBuf> {
+    let dir = root.join("bin");
+    std::fs::create_dir_all(&dir).context("creating the tool dir")?;
+    let path = std::env::var_os("PATH").context("PATH is not set")?;
+    for tool in tools {
+        let found = std::env::split_paths(&path)
+            .map(|d| d.join(tool))
+            .find(|p| p.is_file())
+            .with_context(|| format!("{tool} is not on PATH"))?;
+        std::os::unix::fs::symlink(&found, dir.join(tool)).with_context(|| format!("linking {tool}"))?;
+    }
+    Ok(dir)
+}
+
 /// A loopback TCP echo server that half-closes after echoing; returns its address.
 ///
 /// # Errors

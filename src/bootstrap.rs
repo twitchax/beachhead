@@ -27,20 +27,29 @@ case $(uname -m) in @ARMS@ *) echo "${P}ERR unsupported arch $(uname -m)"; exit 
 u=$(id -u);
 # Candidate dirs, best first. The ${X:+"..."} form adds the runtime dir only when it is set.
 set -- "${XDG_CACHE_HOME:-$HOME/.cache}/sshunnel" ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR/sshunnel"} "/dev/shm/sshunnel-$u" "${TMPDIR:-/tmp}/sshunnel-$u";
-# Usable means a real directory this user owns: in a shared tmpfs, another user could plant one.
-safe() { [ -L "$1" ] && return 1; mkdir -p "$1" 2>/dev/null; chmod 700 "$1" 2>/dev/null && [ -O "$1" ]; };
-# The right size, then the right sha256 when sha256sum exists.
-sum() { [ "$(($(wc -c < "$1")))" = "$N" ] || return 1; command -v sha256sum >/dev/null 2>&1 || return 0; set -- $(sha256sum "$1"); [ "$1" = "$S" ]; };
-# A cache hit needs the right bytes and a probe that proves the mount still allows exec.
-for d do f=$d/relay-$S; [ -x "$f" ] && sum "$f" && "$f" --probe >/dev/null 2>&1 && { echo "${P}READY $S $d"; exec "$f" --stdio; }; done;
+# H is the first sha256 hasher on PATH, or empty. Each prints the hex digest as its first word.
+H=; for h in sha256sum "shasum -a 256" "openssl dgst -sha256 -r"; do command -v ${h%% *} >/dev/null 2>&1 && { H=$h; break; }; done;
+# mine PATH PATTERN: the ls -l mode of PATH matches PATTERN and this user owns it. ls -ld lists the
+# entry itself (an lstat), so a symlink shows as l... and never passes for a dir or a file.
+mine() { set -- "$2" $(ls -ldn "$1" 2>/dev/null); case $2 in $1) [ "$4" = "$u" ];; *) false;; esac; };
+# Trusted means a real directory this user owns: in a shared tmpfs, another user could plant one.
+# Once it is ours, the sticky bit keeps anyone else from replacing it, so only then make it private.
+trusted() { mine "$1" "d*" && chmod 700 "$1"; };
+# A dir to write into: created private when missing, then trusted like any other.
+usable() { mkdir -p -m 700 "$1" 2>/dev/null; trusted "$1"; };
+# The right size, then the right sha256 when there is a hasher.
+sum() { [ "$(($(wc -c < "$1")))" = "$N" ] || return 1; [ -n "$H" ] || return 0; set -- $($H < "$1"); [ "$1" = "$S" ]; };
+# A cache hit needs a trusted dir, a file this user owns, a real sha256 and a probe that proves the
+# mount still allows exec. With no hasher there are no hits, and the client sends the relay instead.
+[ -n "$H" ] && for d do f=$d/relay-$S; trusted "$d" && mine "$f" "-*" && [ -x "$f" ] && sum "$f" && "$f" --probe >/dev/null 2>&1 && { echo "${P}READY $S $d"; exec "$f" --stdio; }; done;
 # A miss: find a staging file first, so a failure is reported before the client sends anything.
-t=; for d do safe "$d" && : > "$d/.relay-$S.$$" 2>/dev/null && { t=$d/.relay-$S.$$; break; }; done;
+t=; for d do usable "$d" && : > "$d/.relay-$S.$$" 2>/dev/null && { t=$d/.relay-$S.$$; break; }; done;
 [ -n "$t" ] || { echo "${P}ERR no writable cache directory"; exit 1; };
 echo "${P}SEND $S $N";
 head -c "$N" > "$t" && sum "$t" || { rm -f "$t"; echo "${P}ERR the relay arrived corrupted"; exit 1; };
 chmod 700 "$t";
 # Install into the first dir whose mount allows exec. mv is atomic, so concurrent runs are safe.
-for d do safe "$d" || continue; s=$d/.relay-$S.$$; [ "$s" = "$t" ] || cp "$t" "$s" 2>/dev/null || continue; chmod 700 "$s"; if "$s" --probe >/dev/null 2>&1; then [ "$s" = "$t" ] || rm -f "$t"; mv -f "$s" "$d/relay-$S" && s=$d/relay-$S; echo "${P}READY $S $d"; exec "$s" --stdio; fi; [ "$s" = "$t" ] || rm -f "$s"; done;
+for d do usable "$d" || continue; s=$d/.relay-$S.$$; [ "$s" = "$t" ] || cp "$t" "$s" 2>/dev/null || continue; chmod 700 "$s"; if "$s" --probe >/dev/null 2>&1; then [ "$s" = "$t" ] || rm -f "$t"; mv -f "$s" "$d/relay-$S" && s=$d/relay-$S; echo "${P}READY $S $d"; exec "$s" --stdio; fi; [ "$s" = "$t" ] || rm -f "$s"; done;
 # Every mount is noexec: run from an anonymous memfd instead, uncached. Flags 0 (no MFD_CLOEXEC)
 # so a relay that is a #! script runs too; the fd the relay inherits is harmless.
 command -v python3 >/dev/null 2>&1 && { echo "${P}READY $S memfd"; exec python3 -c "import os,sys;s=os.open(sys.argv[1],os.O_RDONLY);m=os.memfd_create(sys.argv[2],0);os.sendfile(m,s,0,os.fstat(s).st_size);os.unlink(sys.argv[1]);os.execve(m,sys.argv[2:],os.environ)" "$t" sshunnel-relay --stdio; };
