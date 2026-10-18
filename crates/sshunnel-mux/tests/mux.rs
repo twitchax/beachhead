@@ -106,6 +106,8 @@ async fn serve(mut incoming: Incoming) {
                     drop(far);
                 });
             }
+            // Opens, then hangs up at once: an open that only needs to succeed.
+            "accept" => drop(request.accept()),
             "refuse" => request.reject("connection refused"),
             other => panic!("unexpected host {other}"),
         }
@@ -173,6 +175,29 @@ async fn fifty_concurrent_streams_echo_intact() {
         }
     });
     all.await.expect("50 streams finish");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_opens_reach_the_peer_in_id_order() {
+    // The relay resets any id at or below the last it saw, so an Open that loses a race to the
+    // wire fails. Enough opens across 8 threads make that race all but certain to show.
+    const OPENS: usize = 10_000;
+    let mux = connect(small());
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..OPENS {
+        let mux = mux.clone();
+        tasks.spawn(async move { mux.open("accept", 7).await.map(drop) });
+    }
+    let mut failures = Vec::new();
+    let all = timeout(Duration::from_secs(60), async {
+        while let Some(done) = tasks.join_next().await {
+            if let Err(e) = done.unwrap() {
+                failures.push(format!("{e:#}"));
+            }
+        }
+    });
+    all.await.expect("every open finishes");
+    assert!(failures.is_empty(), "{} of {OPENS} opens failed, e.g. {}", failures.len(), failures[0]);
 }
 
 #[tokio::test(start_paused = true)]

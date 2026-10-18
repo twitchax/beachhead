@@ -128,13 +128,12 @@ impl Mux {
             }
             let id = StreamId(table.next_id);
             table.next_id = table.next_id.checked_add(2).context("stream ids exhausted")?;
+            // Queued under the lock that allocated the id: the peer requires ids in increasing
+            // order, so a concurrent open must not get its Open onto the wire first. The send
+            // never blocks.
+            self.shared.control(Frame::Open { stream: id, host: host.to_owned(), port });
             self.shared.insert(&mut table, id, State::Open, Some(opened_tx))
         };
-        self.shared.control(Frame::Open {
-            stream: stream.id(),
-            host: host.to_owned(),
-            port,
-        });
 
         match opened_rx.await {
             Ok(Ok(())) => Ok(stream),
