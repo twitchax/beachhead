@@ -278,7 +278,8 @@ struct Entry {
     inbound: mpsc::UnboundedSender<Inbound>,
     credit: Arc<Semaphore>,
     outstanding: Arc<AtomicU32>,
-    /// Wakes the stream's upload, which may be parked on a local read the reset will never end.
+    /// Wakes a pump whose download is done but whose upload is parked on a local read that the
+    /// reset will never end.
     reset: Arc<Notify>,
     opened: Option<oneshot::Sender<Result<(), String>>>,
 }

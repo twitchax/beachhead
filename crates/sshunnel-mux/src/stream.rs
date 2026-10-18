@@ -126,7 +126,26 @@ where
     let shared = Arc::clone(&stream.shared);
     let result = {
         let Stream { inbound, credit, outstanding, reset, .. } = &mut stream;
-        tokio::try_join!(upload(&shared, id, credit, reset, reader), download(&shared, id, inbound, outstanding, writer))
+        let up = upload(&shared, id, credit, reader);
+        let down = download(&shared, id, inbound, outstanding, writer);
+        tokio::pin!(up, down);
+        tokio::select! {
+            sent = &mut up => match sent {
+                // The download still hears a reset itself, through the inbound channel.
+                Ok(sent) => down.await.map(|received| (sent, received)),
+                Err(e) => Err(e),
+            },
+            received = &mut down => match received {
+                // The peer has sent Fin, so nothing more reaches the inbound channel, and an idle
+                // local side would never wake the upload: from here on, a reset (or teardown) must.
+                // Watching only now keeps the per-read path free of it.
+                Ok(received) => tokio::select! {
+                    sent = &mut up => sent.map(|sent| (sent, received)),
+                    () = reset.notified() => Err(anyhow!("stream reset by peer or connection closed")),
+                },
+                Err(e) => Err(e),
+            },
+        }
     };
     match result {
         Ok((sent, received)) => {
@@ -140,21 +159,15 @@ where
     }
 }
 
-/// Local socket to peer: read a chunk, pay for it in credit, queue it. A reset or teardown ends it
-/// even mid-read: once the peer has sent `Fin`, nothing else would wake an idle local side.
-async fn upload<R: AsyncRead + Unpin>(shared: &Shared, id: StreamId, credit: &Semaphore, reset: &Notify, mut reader: R) -> Res<u64> {
+/// Local socket to peer: read a chunk, pay for it in credit, queue it.
+async fn upload<R: AsyncRead + Unpin>(shared: &Shared, id: StreamId, credit: &Semaphore, mut reader: R) -> Res<u64> {
     let chunk = shared.send_chunk;
     let mut buf = BytesMut::new();
     let mut sent = 0;
     loop {
         // Once the writer has encoded the previous chunk, `reserve` reclaims its space.
         buf.reserve(chunk);
-        let mut room = (&mut buf).limit(chunk);
-        // `read_buf` is cancel safe: losing the race reads nothing.
-        let n = tokio::select! {
-            n = reader.read_buf(&mut room) => n.context("reading from the local socket")?,
-            () = reset.notified() => bail!("stream reset by peer or connection closed"),
-        };
+        let n = reader.read_buf(&mut (&mut buf).limit(chunk)).await.context("reading from the local socket")?;
         if n == 0 {
             shared.send_data(Frame::Fin { stream: id }).await?;
             return Ok(sent);
