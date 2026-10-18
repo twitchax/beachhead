@@ -15,7 +15,7 @@ use anyhow::{Context as _, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
-    sync::{Semaphore, mpsc, oneshot},
+    sync::{Notify, Semaphore, mpsc, oneshot},
 };
 use tracing::debug;
 
@@ -269,12 +269,15 @@ struct Entry {
     inbound: mpsc::UnboundedSender<Inbound>,
     credit: Arc<Semaphore>,
     outstanding: Arc<AtomicU32>,
+    /// Wakes the stream's upload, which may be parked on a local read the reset will never end.
+    reset: Arc<Notify>,
     opened: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 impl Entry {
     fn abort(mut self, reason: &str) {
         self.credit.close();
+        self.reset.notify_one();
         if let Some(opened) = self.opened.take() {
             let _ = opened.send(Err(reason.to_owned()));
         }
@@ -293,14 +296,16 @@ impl Shared {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let credit = Arc::new(Semaphore::new(self.config.window as usize));
         let outstanding = Arc::new(AtomicU32::new(0));
+        let reset = Arc::new(Notify::new());
         let entry = Entry {
             inbound: inbound_tx,
             credit: Arc::clone(&credit),
             outstanding: Arc::clone(&outstanding),
+            reset: Arc::clone(&reset),
             opened,
         };
         table.streams.insert(id, entry);
-        Stream::new(id, inbound_rx, credit, outstanding, Arc::clone(self), state)
+        Stream::new(id, inbound_rx, credit, outstanding, reset, Arc::clone(self), state)
     }
 
     /// Queues a control frame. A closed writer means the connection is already tearing down, which

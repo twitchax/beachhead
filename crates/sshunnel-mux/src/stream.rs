@@ -10,7 +10,7 @@ use anyhow::{Context as _, anyhow, bail};
 use bytes::{BufMut as _, Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
-    sync::{Semaphore, mpsc},
+    sync::{Notify, Semaphore, mpsc},
 };
 
 use crate::{
@@ -43,17 +43,19 @@ pub struct Stream {
     inbound: mpsc::UnboundedReceiver<Inbound>,
     credit: Arc<Semaphore>,
     outstanding: Arc<AtomicU32>,
+    reset: Arc<Notify>,
     pub(crate) shared: Arc<Shared>,
     pub(crate) state: State,
 }
 
 impl Stream {
-    pub(crate) fn new(id: StreamId, inbound: mpsc::UnboundedReceiver<Inbound>, credit: Arc<Semaphore>, outstanding: Arc<AtomicU32>, shared: Arc<Shared>, state: State) -> Self {
+    pub(crate) fn new(id: StreamId, inbound: mpsc::UnboundedReceiver<Inbound>, credit: Arc<Semaphore>, outstanding: Arc<AtomicU32>, reset: Arc<Notify>, shared: Arc<Shared>, state: State) -> Self {
         Self {
             id,
             inbound,
             credit,
             outstanding,
+            reset,
             shared,
             state,
         }
@@ -123,8 +125,8 @@ where
     let id = stream.id;
     let shared = Arc::clone(&stream.shared);
     let result = {
-        let Stream { inbound, credit, outstanding, .. } = &mut stream;
-        tokio::try_join!(upload(&shared, id, credit, reader), download(&shared, id, inbound, outstanding, writer))
+        let Stream { inbound, credit, outstanding, reset, .. } = &mut stream;
+        tokio::try_join!(upload(&shared, id, credit, reset, reader), download(&shared, id, inbound, outstanding, writer))
     };
     match result {
         Ok((sent, received)) => {
@@ -138,15 +140,21 @@ where
     }
 }
 
-/// Local socket to peer: read a chunk, pay for it in credit, queue it.
-async fn upload<R: AsyncRead + Unpin>(shared: &Shared, id: StreamId, credit: &Semaphore, mut reader: R) -> Res<u64> {
+/// Local socket to peer: read a chunk, pay for it in credit, queue it. A reset or teardown ends it
+/// even mid-read: once the peer has sent `Fin`, nothing else would wake an idle local side.
+async fn upload<R: AsyncRead + Unpin>(shared: &Shared, id: StreamId, credit: &Semaphore, reset: &Notify, mut reader: R) -> Res<u64> {
     let chunk = shared.config.chunk();
     let mut buf = BytesMut::new();
     let mut sent = 0;
     loop {
         // Once the writer has encoded the previous chunk, `reserve` reclaims its space.
         buf.reserve(chunk);
-        let n = reader.read_buf(&mut (&mut buf).limit(chunk)).await.context("reading from the local socket")?;
+        let mut room = (&mut buf).limit(chunk);
+        // `read_buf` is cancel safe: losing the race reads nothing.
+        let n = tokio::select! {
+            n = reader.read_buf(&mut room) => n.context("reading from the local socket")?,
+            () = reset.notified() => bail!("stream reset by peer or connection closed"),
+        };
         if n == 0 {
             shared.send_data(Frame::Fin { stream: id }).await?;
             return Ok(sent);

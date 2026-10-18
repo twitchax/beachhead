@@ -16,12 +16,12 @@ use std::{
 use bytes::BytesMut;
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
-    Config, Incoming, Mux, Role,
+    Config, Incoming, Mux, Role, Stream,
     frame::{Frame, StreamId},
     pump, start,
 };
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex, split},
+    io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, ReadHalf, WriteHalf, duplex, split},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -301,6 +301,86 @@ async fn next_frame(r: &mut (impl tokio::io::AsyncRead + Unpin), buf: &mut Bytes
         }
         assert!(r.read_buf(buf).await.unwrap() > 0, "peer hung up");
     }
+}
+
+/// The far end of a client mux, played by hand: the test reads its frames and writes the replies.
+struct HandPeer {
+    r: ReadHalf<DuplexStream>,
+    w: WriteHalf<DuplexStream>,
+    buf: BytesMut,
+}
+
+impl HandPeer {
+    async fn next(&mut self) -> Frame {
+        next_frame(&mut self.r, &mut self.buf).await
+    }
+
+    async fn send(&mut self, frame: Frame) {
+        let mut out = BytesMut::new();
+        frame.encode(&mut out).unwrap();
+        self.w.write_all(&out).await.unwrap();
+    }
+}
+
+/// A client mux whose peer the test plays by hand.
+fn client_with_hand_peer() -> (Mux, HandPeer) {
+    let (a, b) = duplex(PIPE_CAP);
+    let (ar, aw) = split(a);
+    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small());
+    tokio::spawn(driver);
+    let (r, w) = split(b);
+    (client, HandPeer { r, w, buf: BytesMut::new() })
+}
+
+/// Opens a stream that the hand peer accepts.
+async fn open_by_hand(client: &Mux, peer: &mut HandPeer) -> (Stream, StreamId) {
+    let opener = {
+        let client = client.clone();
+        tokio::spawn(async move { client.open("x", 7).await })
+    };
+    let Frame::Open { stream, .. } = peer.next().await else { panic!("expected Open") };
+    peer.send(Frame::OpenOk { stream }).await;
+    (opener.await.unwrap().unwrap(), stream)
+}
+
+/// How the hand peer kills a stream.
+enum PeerEnds {
+    Reset,
+    HangsUp,
+}
+
+/// Pumps a stream the peer has finished sending on, against a local app that holds its socket and
+/// neither reads nor writes, then has the peer kill the stream. The pump must notice, though
+/// nothing local will ever wake it.
+async fn idle_pump_after(end: PeerEnds) -> anyhow::Error {
+    let (client, mut peer) = client_with_hand_peer();
+    let (stream, id) = open_by_hand(&client, &mut peer).await;
+    let (near, _idle_app) = duplex(SOCK_CAP);
+    let pumped = tokio::spawn(pump(stream, near));
+    peer.send(Frame::Fin { stream: id }).await;
+    let _alive = match end {
+        PeerEnds::Reset => {
+            peer.send(Frame::Rst { stream: id, reason: "gone".into() }).await;
+            Some(peer)
+        }
+        PeerEnds::HangsUp => {
+            drop(peer);
+            None
+        }
+    };
+    timeout(Duration::from_secs(10), pumped).await.expect("the pump ends").unwrap().unwrap_err()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_ends_a_pump_whose_local_side_is_idle() {
+    let err = idle_pump_after(PeerEnds::Reset).await;
+    assert!(format!("{err:#}").contains("reset"), "{err:#}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_teardown_ends_a_pump_whose_local_side_is_idle() {
+    let err = idle_pump_after(PeerEnds::HangsUp).await;
+    assert!(format!("{err:#}").contains("closed"), "{err:#}");
 }
 
 #[tokio::test]
