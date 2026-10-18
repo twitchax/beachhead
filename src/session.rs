@@ -118,10 +118,11 @@ impl Session {
         };
 
         // The relay speaks first; until its Hello arrives, `head -c` may still be reading the pipe.
+        let config = Config::default();
         let mut buf = BytesMut::new();
-        recv_hello(&mut stdout, &mut buf).await.context("waiting for the relay's Hello")?;
-        send_hello(&mut stdin).await?;
-        let (mux, _incoming, driver) = start(stdout, buf, stdin, Role::Client, Config::default());
+        let relay_window = recv_hello(&mut stdout, &mut buf).await.context("waiting for the relay's Hello")?;
+        send_hello(&mut stdin, config.window()).await?;
+        let (mux, _incoming, driver) = start(stdout, buf, stdin, Role::Client, config, relay_window);
         Ok(Self {
             mux,
             relay,

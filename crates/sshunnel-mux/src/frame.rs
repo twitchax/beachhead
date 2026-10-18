@@ -40,8 +40,9 @@ impl std::fmt::Display for StreamId {
 /// One frame on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
-    /// The first frame in each direction, on [`StreamId::CONNECTION`].
-    Hello { version: u16 },
+    /// The first frame in each direction, on [`StreamId::CONNECTION`]: the protocol version, and
+    /// the sender's receive window, the most it lets the peer have in flight on one stream.
+    Hello { version: u16, window: u32 },
     /// Ask the peer to dial `host:port` for a new stream.
     Open { stream: StreamId, host: String, port: u16 },
     /// The peer dialed; data may flow.
@@ -119,11 +120,14 @@ impl Frame {
 
         Ok(match kind {
             Kind::Hello => {
-                fixed(6)?;
+                fixed(10)?;
                 if payload[..4] != MAGIC {
                     bail!("bad Hello magic {:?}", &payload[..4]);
                 }
-                Self::Hello { version: payload.get_u16_at(4) }
+                Self::Hello {
+                    version: payload.get_u16_at(4),
+                    window: u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]]),
+                }
             }
             Kind::Open => {
                 if payload.len() < 2 {
@@ -171,10 +175,11 @@ impl Frame {
     /// Fails when a `Data` payload or an `Open` host exceeds its limit.
     pub fn encode(&self, buf: &mut BytesMut) -> Void {
         match self {
-            Self::Hello { version } => {
-                put_header(buf, StreamId::CONNECTION, Kind::Hello, 6);
+            Self::Hello { version, window } => {
+                put_header(buf, StreamId::CONNECTION, Kind::Hello, 10);
                 buf.put_slice(&MAGIC);
                 buf.put_u16(*version);
+                buf.put_u32(*window);
             }
             Self::Open { stream, host, port } => {
                 if host.len() > MAX_HOST {
@@ -289,7 +294,7 @@ mod unit {
     fn every_kind() -> Vec<Frame> {
         let s = StreamId(7);
         vec![
-            Frame::Hello { version: VERSION },
+            Frame::Hello { version: VERSION, window: 1 << 20 },
             Frame::Open {
                 stream: s,
                 host: "server.lan".into(),
@@ -327,8 +332,8 @@ mod unit {
         let window = encoded(&Frame::Window { stream: StreamId(7), credit: 0x0102_0304 });
         assert_eq!(&window[..], &[0, 0, 0, 7, 5, 0, 0, 0, 4, 1, 2, 3, 4][..]);
 
-        let hello = encoded(&Frame::Hello { version: 1 });
-        assert_eq!(&hello[..], &[0, 0, 0, 0, 0, 0, 0, 0, 6, b'S', b'S', b'H', b'N', 0, 1][..]);
+        let hello = encoded(&Frame::Hello { version: 1, window: 0x0010_0000 });
+        assert_eq!(&hello[..], &[0, 0, 0, 0, 0, 0, 0, 0, 10, b'S', b'S', b'H', b'N', 0, 1, 0, 0x10, 0, 0][..]);
 
         let open = encoded(&Frame::Open {
             stream: StreamId(1),
@@ -386,15 +391,15 @@ mod unit {
 
     #[test]
     fn hello_with_bad_magic_is_rejected() {
-        let mut raw = header(0, 0, 6);
-        raw.extend_from_slice(b"SSH-\x00\x01");
+        let mut raw = header(0, 0, 10);
+        raw.extend_from_slice(b"SSH-\x00\x01\x00\x10\x00\x00");
         assert!(Frame::decode(&mut BytesMut::from(&raw[..])).unwrap_err().to_string().contains("magic"));
     }
 
     #[test]
     fn hello_must_ride_the_connection_id_and_streams_must_not() {
-        let mut hello = header(5, 0, 6);
-        hello.extend_from_slice(b"SSHN\x00\x01");
+        let mut hello = header(5, 0, 10);
+        hello.extend_from_slice(b"SSHN\x00\x01\x00\x10\x00\x00");
         assert!(Frame::decode(&mut BytesMut::from(&hello[..])).is_err());
 
         let fin_on_zero = header(0, 6, 0);

@@ -50,11 +50,17 @@ fn pattern(seed: u64, len: usize) -> Vec<u8> {
 
 /// Starts a client and a relay mux over one in-memory pipe and serves the relay side.
 fn connect(config: Config) -> Mux {
+    connect_pair(config, config)
+}
+
+/// [`connect`], with each end's own config.
+fn connect_pair(client_config: Config, relay_config: Config) -> Mux {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
     let (br, bw) = split(b);
-    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, config);
-    let (_relay, relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, config);
+    // Each end learns the other's window from its Hello; here the test hands it over directly.
+    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, client_config, relay_config.window());
+    let (_relay, relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, relay_config, client_config.window());
     tokio::spawn(client_driver);
     tokio::spawn(relay_driver);
     tokio::spawn(serve(relay_incoming));
@@ -232,6 +238,52 @@ async fn stalled_consumer_caps_producer_at_one_window() {
     assert!((window..=ceiling).contains(&accepted), "accepted {accepted} bytes, expected {window}..={ceiling}");
 }
 
+/// A client whose window is four times the relay's (`small`).
+fn roomy() -> Config {
+    Config::new(4 * WINDOW, CHUNK).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ends_with_different_windows_echo_intact() {
+    let mux = connect_pair(roomy(), small());
+    let data = pattern(4, 256 * 1024);
+    let (sock, _pump) = open(&mux, "echo").await;
+    let reply = timeout(Duration::from_secs(30), round_trip(sock, data.clone())).await.expect("the echo finishes");
+    assert!(reply == data, "echo differs ({} of {} bytes back)", reply.len(), data.len());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chunk_over_half_the_peers_window_is_cut_to_fit() {
+    // A 32 KiB chunk can never be paid for out of the relay's 16 KiB window. The local socket
+    // holds a whole chunk, so a read can fill one.
+    let client = Config::new(8 * WINDOW, 8 * CHUNK).unwrap();
+    let mux = connect_pair(client, small());
+    let data = pattern(5, 256 * 1024);
+    let stream = mux.open("echo", 7).await.unwrap();
+    let (near, sock) = duplex(8 * CHUNK);
+    tokio::spawn(pump(stream, near));
+    let reply = timeout(Duration::from_secs(30), round_trip(sock, data.clone()))
+        .await
+        .expect("the echo finishes rather than stalling on credit");
+    assert!(reply == data, "echo differs ({} of {} bytes back)", reply.len(), data.len());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_consumer_caps_the_producer_at_the_consumers_window() {
+    // The relay consumes here, and its window is a quarter of the client's.
+    let mux = connect_pair(roomy(), small());
+    let (sock, pumped) = open(&mux, "sink").await;
+    let (accepted, producer) = produce(sock);
+    quiesce().await;
+    assert!(!pumped.is_finished() && !producer.is_finished(), "the producer is parked on credit, not cut off by a reset");
+
+    // The same accounting as `stalled_consumer_caps_producer_at_one_window`, with the relay's window.
+    let accepted = accepted.load(Ordering::SeqCst);
+    let window = WINDOW as usize;
+    let ceiling = window + CHUNK + SOCK_CAP + SOCK_CAP;
+    assert!((window..=ceiling).contains(&accepted), "accepted {accepted} bytes, expected {window}..={ceiling}");
+}
+
 #[tokio::test]
 async fn data_flows_back_after_a_half_close() {
     let mux = connect(small());
@@ -263,7 +315,7 @@ async fn a_vanished_target_resets_the_client_stream() {
 async fn a_dead_connection_fails_opens_and_live_streams() {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
-    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small());
+    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
     let driver = tokio::spawn(driver);
 
     let (mut br, mut bw) = split(b);
@@ -326,7 +378,7 @@ impl HandPeer {
 fn client_with_hand_peer() -> (Mux, HandPeer) {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
-    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small());
+    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
     tokio::spawn(driver);
     let (r, w) = split(b);
     (client, HandPeer { r, w, buf: BytesMut::new() })
@@ -387,7 +439,7 @@ async fn a_teardown_ends_a_pump_whose_local_side_is_idle() {
 async fn a_peer_exceeding_its_credit_is_reset() {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
-    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small());
+    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
     tokio::spawn(driver);
     let (mut br, mut bw) = split(b);
 
@@ -429,7 +481,7 @@ async fn an_open_with_the_wrong_parity_is_reset() {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
     // The client opens odd ids, so an odd id arriving from the relay is the client's own space.
-    let (_client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small());
+    let (_client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
     tokio::spawn(driver);
     let (mut br, mut bw) = split(b);
 

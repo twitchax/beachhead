@@ -143,7 +143,7 @@ where
 /// Local socket to peer: read a chunk, pay for it in credit, queue it. A reset or teardown ends it
 /// even mid-read: once the peer has sent `Fin`, nothing else would wake an idle local side.
 async fn upload<R: AsyncRead + Unpin>(shared: &Shared, id: StreamId, credit: &Semaphore, reset: &Notify, mut reader: R) -> Res<u64> {
-    let chunk = shared.config.chunk();
+    let chunk = shared.send_chunk;
     let mut buf = BytesMut::new();
     let mut sent = 0;
     loop {

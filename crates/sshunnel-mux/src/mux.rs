@@ -33,8 +33,9 @@ const READ_RESERVE: usize = 64 * 1024;
 /// How many encoded bytes the writer batches into one write.
 const WRITE_BATCH: usize = 256 * 1024;
 
-/// Flow-control sizes. Both ends must use the same values: each enforces its own window against
-/// the peer and assumes the peer's matches.
+/// This side's flow-control sizes. The window goes to the peer in this side's `Hello` and is
+/// enforced against it; the peer's own window, from its `Hello`, caps what this side sends. The
+/// ends may differ.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     window: u32,
@@ -64,7 +65,7 @@ impl Config {
         self.window
     }
 
-    /// The largest `Data` payload this side sends.
+    /// The largest `Data` payload this side sends, before the cap at half the peer's window.
     #[must_use]
     pub fn chunk(&self) -> usize {
         self.chunk
@@ -200,12 +201,13 @@ impl OpenRequest {
 }
 
 /// Starts a connection over a pipe whose `Hello`s were already exchanged (see [`crate::hello`]).
-/// `buffered` holds bytes already read past the peer's `Hello`.
+/// `buffered` holds bytes already read past the peer's `Hello`, and `peer_window` is the window it
+/// announced: every stream's starting credit, and the most the peer may ever return.
 ///
 /// Returns the opener, the peer's open requests, and the driver: the future that runs the reader
 /// and the writer. The caller spawns it; it resolves when the connection ends, after failing every
 /// open and live stream.
-pub fn start<R, W>(reader: R, buffered: BytesMut, writer: W, role: Role, config: Config) -> (Mux, Incoming, impl Future<Output = Void> + Send + 'static)
+pub fn start<R, W>(reader: R, buffered: BytesMut, writer: W, role: Role, config: Config, peer_window: u32) -> (Mux, Incoming, impl Future<Output = Void> + Send + 'static)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -224,6 +226,9 @@ where
         ctrl: ctrl_tx,
         data: data_tx,
         config,
+        peer_window,
+        // Credit returns in half-window steps, so a chunk over half the peer's window could stall.
+        send_chunk: config.chunk.min(peer_window as usize / 2).max(1),
         role,
     });
 
@@ -252,6 +257,10 @@ pub(crate) struct Shared {
     ctrl: mpsc::UnboundedSender<Frame>,
     data: mpsc::Sender<Frame>,
     pub(crate) config: Config,
+    /// The window the peer announced: each stream's starting send credit.
+    peer_window: u32,
+    /// The largest `Data` payload this side sends to this peer.
+    pub(crate) send_chunk: usize,
     role: Role,
 }
 
@@ -294,7 +303,7 @@ impl Shared {
 
     fn insert(self: &Arc<Self>, table: &mut Table, id: StreamId, state: State, opened: Option<oneshot::Sender<Result<(), String>>>) -> Stream {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        let credit = Arc::new(Semaphore::new(self.config.window as usize));
+        let credit = Arc::new(Semaphore::new(self.peer_window as usize));
         let outstanding = Arc::new(AtomicU32::new(0));
         let reset = Arc::new(Notify::new());
         let entry = Entry {
@@ -402,7 +411,7 @@ impl Shared {
         let mut table = self.table();
         let Some(entry) = table.streams.get(&stream) else { return };
         // An honest peer returns at most what this side sent, so credit never tops the window.
-        if entry.credit.available_permits() + credit as usize > self.config.window as usize {
+        if entry.credit.available_permits() + credit as usize > self.peer_window as usize {
             let entry = table.streams.remove(&stream);
             drop(table);
             self.violation(stream, entry, "the peer returned more credit than it was sent");

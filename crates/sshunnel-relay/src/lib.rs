@@ -29,11 +29,12 @@ pub fn run_stdio() -> Void {
     let result = runtime.block_on(async {
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
+        let config = Config::default();
         // The relay speaks first: the client stays quiet until this Hello arrives.
-        send_hello(&mut stdout).await?;
+        send_hello(&mut stdout, config.window()).await?;
         let mut buf = BytesMut::new();
-        recv_hello(&mut stdin, &mut buf).await?;
-        let (_mux, incoming, driver) = start(stdin, buf, stdout, Role::Relay, Config::default());
+        let client_window = recv_hello(&mut stdin, &mut buf).await?;
+        let (_mux, incoming, driver) = start(stdin, buf, stdout, Role::Relay, config, client_window);
         tokio::spawn(serve(incoming));
         driver.await
     });

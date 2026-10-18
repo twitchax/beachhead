@@ -32,9 +32,9 @@ async fn connect() -> (Mux, Child) {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     let mut buf = BytesMut::new();
-    recv_hello(&mut stdout, &mut buf).await.unwrap();
-    send_hello(&mut stdin).await.unwrap();
-    let (mux, _incoming, driver) = start(stdout, buf, stdin, Role::Client, Config::default());
+    let relay_window = recv_hello(&mut stdout, &mut buf).await.unwrap();
+    send_hello(&mut stdin, Config::default().window()).await.unwrap();
+    let (mux, _incoming, driver) = start(stdout, buf, stdin, Role::Client, Config::default(), relay_window);
     tokio::spawn(driver);
     (mux, child)
 }
@@ -110,7 +110,7 @@ async fn e2e_stdio_exits_cleanly_when_stdin_closes() {
     let mut stdout = child.stdout.take().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     recv_hello(&mut stdout, &mut BytesMut::new()).await.unwrap();
-    send_hello(&mut stdin).await.unwrap();
+    send_hello(&mut stdin, Config::default().window()).await.unwrap();
     drop(stdin);
     let status = timeout(Duration::from_secs(10), child.wait()).await.expect("the relay exits").unwrap();
     assert!(status.success(), "{status}");

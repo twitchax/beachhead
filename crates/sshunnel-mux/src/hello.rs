@@ -1,39 +1,44 @@
-//! The handshake: one `Hello` each way before the mux starts. The relay speaks first; the client
-//! answers only after reading the relay's `Hello`, because until then the bootstrap's `head -c` may
-//! still be reading the pipe and would swallow anything extra.
+//! The handshake: one `Hello` each way before the mux starts, each announcing its sender's receive
+//! window. The relay speaks first; the client answers only after reading the relay's `Hello`,
+//! because until then the bootstrap's `head -c` may still be reading the pipe and would swallow
+//! anything extra.
 
 use anyhow::{Context as _, bail};
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::{
-    base::Void,
+    base::{Res, Void},
     frame::{Frame, HEADER_LEN, VERSION},
 };
 
-/// Writes and flushes this side's `Hello`.
+/// Writes and flushes this side's `Hello`, announcing `window`, the most this side lets the peer
+/// have in flight on one stream (its [`crate::Config::window`]).
 ///
 /// # Errors
 ///
 /// Fails when the pipe is closed.
-pub async fn send_hello<W: AsyncWrite + Unpin>(writer: &mut W) -> Void {
+pub async fn send_hello<W: AsyncWrite + Unpin>(writer: &mut W, window: u32) -> Void {
     let mut buf = BytesMut::new();
-    Frame::Hello { version: VERSION }.encode(&mut buf)?;
+    Frame::Hello { version: VERSION, window }.encode(&mut buf)?;
     writer.write_all(&buf).await.context("sending Hello")?;
     writer.flush().await.context("flushing Hello")
 }
 
-/// Reads the peer's `Hello`. Bytes read past it stay in `buf` for the mux to decode.
+/// Reads the peer's `Hello` and returns the window it announced, for [`crate::start`]. Bytes read
+/// past it stay in `buf` for the mux to decode.
 ///
 /// # Errors
 ///
-/// Fails when the first frame is not a `Hello` for this protocol version, or the peer hangs up.
-pub async fn recv_hello<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut BytesMut) -> Void {
+/// Fails when the first frame is not a `Hello` for this protocol version, it announces a zero
+/// window (no stream could ever send), or the peer hangs up.
+pub async fn recv_hello<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut BytesMut) -> Res<u32> {
     loop {
         if let Some(frame) = Frame::decode(buf).context("decoding the peer's Hello")? {
             return match frame {
-                Frame::Hello { version: VERSION } => Ok(()),
-                Frame::Hello { version } => bail!("the peer speaks protocol version {version}; this side speaks {VERSION}"),
+                Frame::Hello { version: VERSION, window: 0 } => bail!("the peer announced a zero window, so no stream could send"),
+                Frame::Hello { version: VERSION, window } => Ok(window),
+                Frame::Hello { version, .. } => bail!("the peer speaks protocol version {version}; this side speaks {VERSION}"),
                 other => bail!("expected Hello, got {}", other.name()),
             };
         }
@@ -55,16 +60,16 @@ mod unit {
     use crate::frame::StreamId;
 
     #[tokio::test]
-    async fn hello_round_trips_and_keeps_what_follows() {
+    async fn hello_round_trips_its_window_and_keeps_what_follows() {
         let (mut a, mut b) = duplex(1024);
-        send_hello(&mut a).await.unwrap();
+        send_hello(&mut a, 48 * 1024).await.unwrap();
         let mut next = BytesMut::new();
         Frame::Fin { stream: StreamId(1) }.encode(&mut next).unwrap();
         a.write_all(&next).await.unwrap();
         drop(a);
 
         let mut buf = BytesMut::new();
-        recv_hello(&mut b, &mut buf).await.unwrap();
+        assert_eq!(recv_hello(&mut b, &mut buf).await.unwrap(), 48 * 1024);
         b.read_buf(&mut buf).await.unwrap();
         assert_eq!(Frame::decode(&mut buf).unwrap(), Some(Frame::Fin { stream: StreamId(1) }));
     }
@@ -72,9 +77,17 @@ mod unit {
     #[tokio::test]
     async fn another_version_is_refused() {
         let mut wire = BytesMut::new();
-        Frame::Hello { version: VERSION + 1 }.encode(&mut wire).unwrap();
+        Frame::Hello { version: VERSION + 1, window: 1024 }.encode(&mut wire).unwrap();
         let err = recv_hello(&mut &wire[..], &mut BytesMut::new()).await.unwrap_err();
         assert!(err.to_string().contains("version"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_window_is_refused() {
+        let mut wire = BytesMut::new();
+        Frame::Hello { version: VERSION, window: 0 }.encode(&mut wire).unwrap();
+        let err = recv_hello(&mut &wire[..], &mut BytesMut::new()).await.unwrap_err();
+        assert!(err.to_string().contains("zero window"), "{err:#}");
     }
 
     #[tokio::test]

@@ -52,8 +52,8 @@ async fn stalled_stream_heap_is_bounded_by_its_window() {
     let config = Config::new(WINDOW, CHUNK).unwrap();
     let (a, b) = duplex(64 * 1024);
     let ((ar, aw), (br, bw)) = (split(a), split(b));
-    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, config);
-    let (_relay, mut relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, config);
+    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, config, WINDOW);
+    let (_relay, mut relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, config, WINDOW);
     tokio::spawn(client_driver);
     tokio::spawn(relay_driver);
     // The stalled consumer: accepted, then never pumped, so every byte stays queued in the mux.
