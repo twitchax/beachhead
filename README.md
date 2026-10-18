@@ -62,6 +62,7 @@ relays (embedded):
 $ sshunnel forward -L 8080:server.lan:80 server
 sshunnel: relay x86_64 79a29174ccf5 pushed to /home/me/.cache/sshunnel
 sshunnel: forwarding 127.0.0.1:8080 -> server.lan:80
+sshunnel: forwarding [::1]:8080 -> server.lan:80
 ```
 
 The relay resolves and dials `server.lan` on the remote, so names that only exist inside that
@@ -77,7 +78,7 @@ Arguments:
   <DESTINATION>  Where to run the relay, exactly as you'd pass it to ssh (config aliases work)
 
 Options:
-  -L, --local <SPEC>       `[bind_address:]port:host:hostport`. The relay resolves and dials host; port 0 picks a free local port
+  -L, --local <SPEC>       `[bind_address:]port:host:hostport`. The relay resolves and dials host; the bind address defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port
       --ssh-cmd <COMMAND>  The ssh program and its leading arguments, split like a shell would [env: SSHUNNEL_SSH=] [default: ssh]
       --relay-dir <DIR>    Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay) [env: SSHUNNEL_RELAY_DIR=]
   -h, --help               Print help

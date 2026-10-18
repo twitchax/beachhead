@@ -32,8 +32,8 @@ struct Cli {
 enum Command {
     /// Forward local TCP ports through a relay on DESTINATION, like `ssh -L`.
     Forward {
-        /// `[bind_address:]port:host:hostport`. The relay resolves and dials host; port 0 picks a
-        /// free local port.
+        /// `[bind_address:]port:host:hostport`. The relay resolves and dials host; the bind address
+        /// defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port.
         #[arg(short = 'L', long = "local", value_name = "SPEC", required = true)]
         forwards: Vec<Forward>,
         /// The ssh program and its leading arguments, split like a shell would.
@@ -114,9 +114,12 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
     eprintln!("sshunnel: relay {} {} {}", relay.arch(), &relay.sha256()[..12], session.bootstrap());
 
     let mut serving = JoinSet::new();
-    for (spec, listener) in forwards.iter().zip(listeners) {
-        eprintln!("sshunnel: forwarding {} -> {}:{}", listener.local_addr().context("reading a listener's address")?, spec.host, spec.port);
-        serving.spawn(forward::serve(session.mux().clone(), listener, Arc::from(spec.host.as_str()), spec.port));
+    for (spec, bound) in forwards.iter().zip(listeners) {
+        let host: Arc<str> = Arc::from(spec.host.as_str());
+        for listener in bound {
+            eprintln!("sshunnel: forwarding {} -> {}:{}", listener.local_addr().context("reading a listener's address")?, spec.host, spec.port);
+            serving.spawn(forward::serve(session.mux().clone(), listener, Arc::clone(&host), spec.port));
+        }
     }
     tokio::select! {
         closed = session.closed() => {

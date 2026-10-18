@@ -116,6 +116,27 @@ async fn e2e_forward_carries_tcp() {
     }
 }
 
+#[tokio::test]
+async fn e2e_forward_listens_on_the_ipv6_loopback_too() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        return assert!(std::env::var_os("CI").is_none(), "CI runners have an IPv6 loopback");
+    }
+    let dir = TempDir::new().unwrap();
+    let echo = echo_server().await.unwrap();
+    let (_child, _, mut stderr) = start_forward(sshunnel(&dir), &dir, &format!("127.0.0.1:{}", echo.port())).await;
+    // `-L port:host:hostport` binds like `ssh -L`: each family's loopback, so a client that tries
+    // ::1 first (Node 17+, say) reaches it too.
+    let listening = stderr.wait_for(|lines| lines.iter().any(|line| line.starts_with("sshunnel: forwarding [::1]:")));
+    let lines = timeout(Duration::from_secs(10), listening).await.expect("sshunnel listens on ::1").unwrap().clone();
+    let v6 = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("sshunnel: forwarding ")?.split_whitespace().next().filter(|a| a.starts_with("[::1]")))
+        .unwrap();
+
+    let data = pattern(11, 64 * 1024);
+    assert!(echo_through(v6, &data).await == data);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_forward_survives_running_out_of_file_descriptors() {
     let dir = TempDir::new().unwrap();
