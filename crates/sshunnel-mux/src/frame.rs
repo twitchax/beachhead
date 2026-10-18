@@ -1,6 +1,7 @@
 //! The wire format: a 9-byte header (`stream: u32 BE | kind: u8 | len: u32 BE`) and a payload of at
 //! most [`MAX_PAYLOAD`] bytes. Decoding is incremental over a `BytesMut`, the tokio-util `Decoder`
-//! shape, and `Data` payloads come out as zero-copy `Bytes`.
+//! shape. Each payload is copied out into a `Bytes` of its own, so a queued `Data` frame holds
+//! exactly the bytes its credit paid for.
 
 use anyhow::{anyhow, bail};
 use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
@@ -96,7 +97,10 @@ impl Frame {
         }
 
         buf.advance(HEADER_LEN);
-        let payload = buf.split_to(len).freeze();
+        // A copy, not a view: a payload frozen out of `buf` would keep the reader's whole read
+        // buffer alive for as long as it sat queued, so credit would no longer bound memory.
+        let payload = Bytes::copy_from_slice(&buf[..len]);
+        buf.advance(len);
         Self::parse(stream, kind, payload).map(Some)
     }
 
