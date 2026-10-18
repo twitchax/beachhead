@@ -293,20 +293,38 @@ impl Forwarder {
         let child = Guard(child);
 
         let (ready_tx, ready_rx) = mpsc::channel();
+        let mut readiness = Readiness::new(targets);
         thread::spawn(move || {
-            let mut forwarding = 0;
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 eprintln!("  {line}");
-                if line.starts_with("sshunnel: forwarding") {
-                    forwarding += 1;
-                    if forwarding == 2 {
-                        let _ = ready_tx.send(());
-                    }
+                if readiness.saw(&line) {
+                    let _ = ready_tx.send(());
                 }
             }
         });
         ready_rx.recv_timeout(Duration::from_secs(60)).context("sshunnel didn't report its forwards within 60s")?;
         Ok((Self { ports, _child: child }, start.elapsed()))
+    }
+}
+
+/// Follows `sshunnel forward`'s stderr until every target has a `forwarding <addr> -> <target>`
+/// line. A forward prints one per local address it listens on (`127.0.0.1` and `::1`), so lines are
+/// matched to targets, not counted.
+struct Readiness {
+    waiting: Vec<String>,
+}
+
+impl Readiness {
+    fn new(targets: &[String]) -> Self {
+        Self { waiting: targets.to_vec() }
+    }
+
+    /// Notes one stderr line; true for the line that leaves no target waiting.
+    fn saw(&mut self, line: &str) -> bool {
+        let Some(forward) = line.strip_prefix("sshunnel: forwarding ") else { return false };
+        let before = self.waiting.len();
+        self.waiting.retain(|target| !forward.ends_with(&format!("-> {target}")));
+        before > 0 && self.waiting.is_empty()
     }
 }
 
@@ -319,4 +337,20 @@ fn wait_for_port(port: u16) -> Result<()> {
         thread::sleep(Duration::from_millis(50));
     }
     bail!("nothing listened on port {port} within 30s")
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    #[test]
+    fn ready_once_every_target_has_reported() {
+        let targets = ["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()];
+        let mut readiness = Readiness::new(&targets);
+        assert!(!readiness.saw("sshunnel: relay x86_64 0123456789ab pushed to /tmp/cache"));
+        assert!(!readiness.saw("sshunnel: forwarding 127.0.0.1:9 -> 127.0.0.1:1"));
+        assert!(!readiness.saw("sshunnel: forwarding [::1]:9 -> 127.0.0.1:1"), "a forward's second address is not the other forward");
+        assert!(readiness.saw("sshunnel: forwarding 127.0.0.1:8 -> 127.0.0.1:2"));
+        assert!(!readiness.saw("sshunnel: forwarding [::1]:8 -> 127.0.0.1:2"), "ready is reported once");
+    }
 }
