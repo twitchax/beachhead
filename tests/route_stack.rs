@@ -14,14 +14,14 @@ use bytes::Bytes;
 use pretty_assertions::assert_eq;
 use smoltcp::{
     phy::ChecksumCapabilities,
-    wire::{Icmpv4DstUnreachable, Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr},
+    wire::{Icmpv4DstUnreachable, Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr},
 };
 use sshunnel::{
     route::{
         DNS_ADDR, TUN_ADDR,
         names::{FakeMap, today},
         router::Router,
-        stack::{self, Dns, MAX_HELD, MAX_QUERIES},
+        stack::{self, Dns, MAX_HELD, MAX_QUERIES, Packets},
         targets::Targets,
     },
     tests::{AppStack, Connect, FakeTunnel, Icmp, Sent, echo_server, pattern},
@@ -31,7 +31,7 @@ use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener,
-    sync::watch,
+    sync::{mpsc, watch},
     time::timeout,
 };
 
@@ -83,11 +83,16 @@ fn rig(targets: &[&str]) -> Rig {
     rig_with(targets, NoDns)
 }
 
-fn rig_with(targets: &[&str], dns: impl Dns) -> Rig {
+/// A router for `targets`, with its fake-address map in the returned dir.
+fn router(targets: &[&str]) -> (Arc<Router>, TempDir) {
     let state = TempDir::new().unwrap();
     let names = FakeMap::load(state.path().join("names"), today()).unwrap();
     let targets: Vec<String> = targets.iter().map(|t| (*t).to_owned()).collect();
-    let router = Arc::new(Router::new(Targets::parse(&targets, &[]).unwrap(), names));
+    (Arc::new(Router::new(Targets::parse(&targets, &[]).unwrap(), names)), state)
+}
+
+fn rig_with(targets: &[&str], dns: impl Dns) -> Rig {
+    let (router, state) = router(targets);
     let tunnel = FakeTunnel::new();
     let (app, packets) = AppStack::new().unwrap();
     tokio::spawn(stack::run(packets, tunnel.clone(), Arc::clone(&router), Arc::new(dns)));
@@ -137,6 +142,26 @@ fn port_unreachable() -> Bytes {
     let mut buf = vec![0; ip.buffer_len() + icmp.buffer_len()];
     ip.emit(&mut Ipv4Packet::new_unchecked(&mut buf[..]), &caps);
     icmp.emit(&mut Icmpv4Packet::new_unchecked(&mut buf[ip.buffer_len()..]), &caps);
+    buf.into()
+}
+
+/// A UDP datagram from the device's address and `port` to `10.99.0.5:9999`.
+fn datagram(port: u16) -> Bytes {
+    let caps = ChecksumCapabilities::default();
+    let (from, to) = (TUN_ADDR, Ipv4Addr::new(10, 99, 0, 5));
+    let payload = b"hello";
+    let udp = UdpRepr { src_port: port, dst_port: 9999 };
+    let ip = Ipv4Repr {
+        src_addr: from,
+        dst_addr: to,
+        next_header: IpProtocol::Udp,
+        payload_len: 8 + payload.len(),
+        hop_limit: 64,
+    };
+    let mut buf = vec![0; ip.buffer_len() + ip.payload_len];
+    ip.emit(&mut Ipv4Packet::new_unchecked(&mut buf[..]), &caps);
+    let datagram = &mut UdpPacket::new_unchecked(&mut buf[ip.buffer_len()..]);
+    udp.emit(datagram, &from.into(), &to.into(), payload.len(), |space| space.copy_from_slice(payload), &caps);
     buf.into()
 }
 
@@ -336,6 +361,7 @@ async fn multicast_broadcast_and_icmp_errors_get_no_answer() {
     // What a kernel sends on any link: LLMNR, broadcasts, router solicitations.
     assert_eq!(rig.app.udp(at("224.0.0.252", 5355), b"llmnr").await, None);
     assert_eq!(rig.app.udp(at("255.255.255.255", 9), b"hello").await, None);
+    assert_eq!(rig.app.udp(at("198.19.255.255", 9), b"hello").await, None);
     assert_eq!(rig.app.ping("ff02::2".parse().unwrap()).await, None);
     // Never an ICMP error about an ICMP error.
     rig.app.send(port_unreachable()).await.unwrap();
@@ -360,6 +386,60 @@ async fn a_port_reused_during_time_wait_connects_at_once() {
     rig.app.connect_from(41_000, to).await.unwrap();
     assert!(started.elapsed() < Duration::from_millis(500), "took {:?}", started.elapsed());
     assert_eq!(rig.tunnel.opens().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_stack_reads_on_after_a_device_backlog() {
+    const N: u16 = 200;
+    let (router, _state) = router(&["10.99.0.0/16"]);
+    // A device that takes fewer packets at a time than the stack queues for it, in bursts.
+    let (to_stack, rx) = mpsc::channel(1024);
+    let (tx, mut from_stack) = mpsc::channel(64);
+    tokio::spawn(stack::run(Packets { rx, tx }, FakeTunnel::new(), router, Arc::new(NoDns)));
+
+    for port in 0..N {
+        to_stack.send(datagram(40_000 + port)).await.unwrap();
+    }
+    let mut answered = 0;
+    loop {
+        // Let the stack run until it waits on the device, then take everything it wrote.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut burst = 0;
+        while from_stack.try_recv().is_ok() {
+            burst += 1;
+        }
+        if burst == 0 {
+            break;
+        }
+        answered += burst;
+    }
+    assert_eq!(answered, N, "the stack stopped reading its device");
+
+    to_stack.send(datagram(50_000)).await.unwrap();
+    assert!(timeout(Duration::from_secs(5), from_stack.recv()).await.is_ok(), "a later packet went unread");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_failure_on_a_reused_port_leaves_the_new_connection_alone() {
+    let rig = rig(&["10.99.0.0/16"]);
+    let fail = rig.tunnel.fail_late("10.99.0.5", 80);
+    let to = at("10.99.0.5", 80);
+
+    // Both ends close the first connection, leaving the stack's end in TIME-WAIT and its relay
+    // stream yet to fail.
+    let mut first = rig.app.connect_from(41_000, to).await.unwrap();
+    assert_eq!(first.read(&mut [0; 1]).await.unwrap(), 0);
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The port's next connection takes over the 4-tuple; then the first one's stream fails.
+    let _second = rig.app.connect_from(41_000, to).await.unwrap();
+    let before = rig.app.tap().len();
+    fail.open();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let after = rig.app.tap().split_off(before);
+    assert!(!after.iter().any(|p| matches!(p, Sent::Tcp { rst: true, .. })), "the new connection was reset: {after:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

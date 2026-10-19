@@ -6,10 +6,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use anyhow::Context as _;
+use anyhow::{Context as _, bail};
 use sshunnel_mux::{OpenError, ResolveError, Traffic, base::Res, frame::OpenErrKind, frame::ResolveErrKind};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, copy, copy_bidirectional, split},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, copy, copy_bidirectional, sink, split},
     net::TcpStream,
     sync::{Notify, watch},
 };
@@ -29,6 +29,8 @@ enum Dial {
     Stall,
     /// Succeeds with a connection whose remote end closes at once.
     Hangup,
+    /// Like `Hangup`, then fails once the app has closed too and the gate opens.
+    FailLate(watch::Receiver<bool>),
 }
 
 #[derive(Default)]
@@ -95,6 +97,16 @@ impl FakeTunnel {
         self.script().dials.insert((host.to_owned(), port), Dial::Hangup);
     }
 
+    /// Opens of `host:port` succeed with a connection whose remote end closes at once and which
+    /// fails only after the app has closed its end too and the returned gate opens: a relay
+    /// stream that resets after the app is done with it.
+    #[must_use]
+    pub fn fail_late(&self, host: &str, port: u16) -> Gate {
+        let (gate, waiting) = watch::channel(false);
+        self.script().dials.insert((host.to_owned(), port), Dial::FailLate(waiting));
+        Gate(gate)
+    }
+
     /// Lookups of `name` answer `answer`.
     pub fn name(&self, name: &str, answer: Result<(), ResolveErrKind>) {
         self.script().names.insert(name.to_owned(), answer);
@@ -138,6 +150,8 @@ pub enum FakeConn {
     Stall,
     /// Closes at once.
     Hangup,
+    /// Closes its sending side at once, then fails once the app has closed and the gate opens.
+    FailLate(watch::Receiver<bool>),
 }
 
 impl Tunnel for FakeTunnel {
@@ -161,6 +175,7 @@ impl Tunnel for FakeTunnel {
             }
             Some(Dial::Stall) => Ok(FakeConn::Stall),
             Some(Dial::Hangup) => Ok(FakeConn::Hangup),
+            Some(Dial::FailLate(gate)) => Ok(FakeConn::FailLate(gate)),
         }
     }
 
@@ -197,6 +212,13 @@ impl Conn for FakeConn {
             Self::Hangup => {
                 drop(io);
                 Ok(Traffic::default())
+            }
+            Self::FailLate(mut gate) => {
+                let (mut r, mut w) = split(io);
+                w.shutdown().await.context("closing")?;
+                let sent = copy(&mut r, &mut sink()).await.context("draining")?;
+                let _ = gate.wait_for(|open| *open).await;
+                bail!("the remote reset after {sent} bytes")
             }
         }
     }

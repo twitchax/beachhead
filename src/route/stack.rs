@@ -37,7 +37,7 @@ use sshunnel_mux::{OpenError, Traffic, frame::OpenErrKind};
 use tokio::{
     io::{AsyncRead as _, AsyncWrite as _, DuplexStream, ReadBuf, duplex},
     sync::mpsc::{self, OwnedPermit, error::SendError, error::TrySendError},
-    task::{AbortHandle, JoinSet},
+    task::{self, AbortHandle, JoinSet},
     time::{Instant, Sleep},
 };
 use tracing::debug;
@@ -145,17 +145,21 @@ struct Stack<T: Tunnel, D: Dns> {
 impl<T: Tunnel, D: Dns> Stack<T, D> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Void> {
         for _ in 0..PASSES {
-            let mut again = false;
-            for read in 1..=BATCH {
+            // Whether `rx` holds this task's waker: `recv` registers none when it hands over a
+            // packet, so a pass that stops reading early must read again before it sleeps.
+            let mut listening = false;
+            for _ in 0..BATCH {
                 if self.engine.backlogged() {
                     break;
                 }
                 match self.rx.poll_recv(cx) {
                     Poll::Ready(Some(packet)) => self.classify(packet),
                     Poll::Ready(None) => return Poll::Ready(Ok(())),
-                    Poll::Pending => break,
+                    Poll::Pending => {
+                        listening = true;
+                        break;
+                    }
                 }
-                again |= read == BATCH;
             }
             if let Err(e) = self.finish(cx) {
                 return Poll::Ready(Err(e));
@@ -171,7 +175,9 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
             if let Err(e) = self.engine.flush(cx) {
                 return Poll::Ready(Err(e));
             }
-            again |= self.engine.wait(cx);
+            // Still backlogged after a flush means the device is full, and its permit wakes us.
+            // `|`, not `||`: the timer is armed either way.
+            let again = (!listening && !self.engine.backlogged()) | self.engine.wait(cx);
             if !again {
                 return Poll::Pending;
             }
@@ -183,7 +189,8 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
     /// Sends a packet where it belongs: smoltcp, a held SYN, the DNS server, or an ICMP refusal.
     fn classify(&mut self, packet: Bytes) {
         let Some(ip) = Ip::parse(&packet) else { return };
-        // Router solicitations, MLD reports and broadcasts aren't for any one host to answer.
+        // Router solicitations, MLD reports and broadcasts (the device subnet's included) aren't
+        // for any one host to answer.
         if !unicast(ip.src) || !unicast(ip.dst) {
             return;
         }
@@ -262,8 +269,8 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
                 self.engine.send_opt(udp_packet(SocketAddr::new(DNS_ADDR.into(), DNS_PORT), asker, &answer));
             }
         }
-        while let Poll::Ready(Some(pumped)) = self.pumps.poll_join_next(cx) {
-            let (flow, traffic) = match pumped {
+        while let Poll::Ready(Some(pumped)) = self.pumps.poll_join_next_with_id(cx) {
+            let (pump, (flow, traffic)) = match pumped {
                 Ok(pumped) => pumped,
                 // The stack aborted it when the app reset the connection.
                 Err(e) if e.is_cancelled() => continue,
@@ -273,8 +280,11 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
                 Ok(traffic) => debug!(%flow, sent = traffic.sent, received = traffic.received, "connection closed"),
                 Err(e) => {
                     debug!(%flow, "connection failed: {e:#}");
-                    // The remote end reset or the session dropped: reset the app too.
-                    if let Some(&handle) = self.flows.get(&flow) {
+                    // The remote end reset or the session dropped: reset the app too, unless the
+                    // app has since reused the 4-tuple for a connection of its own.
+                    if let Some(&handle) = self.flows.get(&flow)
+                        && self.engine.pumped_by(handle, pump)
+                    {
                         self.engine.abort(handle);
                     }
                 }
@@ -340,7 +350,7 @@ pub(crate) fn is_icmp_error(proto: IpProtocol, kind: u8) -> bool {
 
 fn unicast(addr: IpAddr) -> bool {
     match addr {
-        IpAddr::V4(v4) => !(v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified()),
+        IpAddr::V4(v4) => !(v4.is_multicast() || v4.is_broadcast() || v4 == FAKE_RANGE.broadcast() || v4.is_unspecified()),
         IpAddr::V6(v6) => !(v6.is_multicast() || v6.is_unspecified()),
     }
 }
@@ -559,6 +569,11 @@ impl Engine {
     pub(crate) fn remove(&mut self, handle: SocketHandle) {
         self.bridges.remove(&handle);
         self.sockets.remove(handle);
+    }
+
+    /// Whether `pump` is the task on the far end of `handle`'s pipe.
+    fn pumped_by(&self, handle: SocketHandle, pump: task::Id) -> bool {
+        self.bridges.get(&handle).and_then(|bridge| bridge.pump.as_ref()).is_some_and(|abort| abort.id() == pump)
     }
 
     /// Resets a connection; the bridge sweep removes it once the RST is out.
