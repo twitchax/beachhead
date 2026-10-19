@@ -9,6 +9,8 @@ pub mod dns;
 #[cfg(target_os = "linux")]
 pub mod helper;
 pub mod names;
+#[cfg(target_os = "linux")]
+pub mod peers;
 pub mod router;
 pub mod stack;
 #[cfg(target_os = "linux")]

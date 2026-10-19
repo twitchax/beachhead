@@ -46,6 +46,16 @@ impl SshCommand {
     }
 }
 
+impl SshCommand {
+    /// `ssh -O check <destination>` with the user's own arguments, so it sees the same config and
+    /// control path as the session. Output is piped; stdin is closed.
+    pub(crate) fn check_command(&self, destination: &str) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args).args(["-O", "check", destination]).stdin(Stdio::null()).kill_on_drop(true);
+        command
+    }
+}
+
 impl Default for SshCommand {
     fn default() -> Self {
         Self {
@@ -83,7 +93,7 @@ pub struct Session {
     bootstrap: Bootstrap,
     driver: JoinHandle<Void>,
     /// Held so ssh lives exactly as long as the session (`kill_on_drop`).
-    _ssh: Child,
+    ssh: Child,
 }
 
 impl Session {
@@ -128,8 +138,14 @@ impl Session {
             relay,
             bootstrap,
             driver: tokio::spawn(driver),
-            _ssh: child,
+            ssh: child,
         })
+    }
+
+    /// The pid of the ssh process carrying the session; `None` once it has been reaped.
+    #[must_use]
+    pub fn ssh_pid(&self) -> Option<u32> {
+        self.ssh.id()
     }
 
     /// The handle for opening streams through the relay.
