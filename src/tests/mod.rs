@@ -13,6 +13,12 @@ use tokio::{io::AsyncWriteExt as _, net::TcpListener};
 
 use crate::{arch::Arch, base::Res, session::SshCommand};
 
+mod app;
+mod tunnel;
+
+pub use app::{AppConn, AppStack, Connect, Icmp, Sent};
+pub use tunnel::{FakeConn, FakeTunnel, Gate};
+
 /// A stand-in for a remote machine: a fake `ssh` that ignores its options and destination and runs
 /// the remote command here, through a chosen login shell, with `HOME` and every cache candidate
 /// except `/dev/shm` inside `root`. That covers push, exec and cache with no sshd.

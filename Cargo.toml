@@ -51,6 +51,7 @@ bytes.workspace = true
 ipnet = "2"
 sha2 = "0.11"
 shlex = "2"
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time"] }
 tracing.workspace = true
 
@@ -61,6 +62,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], option
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+# Paused time for the netstack's held-SYN and timeout tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
