@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use sshunnel_mux::{Config, Role, pump, start};
+use sshunnel_mux::{Config, Request, Role, pump, start};
 use tokio::{
     io::{AsyncWriteExt as _, duplex, split},
     time::sleep,
@@ -60,7 +60,9 @@ async fn stalled_stream_heap_is_bounded_by_its_window() {
     tokio::spawn(async move {
         let mut held = Vec::new();
         while let Some(request) = relay_incoming.next().await {
-            held.push(request.accept());
+            if let Request::Open(request) = request {
+                held.push(request.accept());
+            }
         }
     });
     let stream = client.open("sink", 7).await.unwrap();

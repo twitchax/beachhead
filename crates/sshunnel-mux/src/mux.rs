@@ -21,7 +21,7 @@ use tracing::debug;
 
 use crate::{
     base::{Res, Void},
-    frame::{Frame, HEADER_LEN, MAX_HOST, MAX_PAYLOAD, StreamId},
+    frame::{Frame, HEADER_LEN, MAX_HOST, MAX_PAYLOAD, OpenErrKind, ResolveErrKind, StreamId},
     stream::{Inbound, State, Stream},
 };
 
@@ -106,6 +106,56 @@ impl Role {
     }
 }
 
+/// Why [`Mux::open`] failed: the peer's typed refusal, or a local failure (kind
+/// [`OpenErrKind::Other`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenError {
+    pub kind: OpenErrKind,
+    pub reason: String,
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl OpenError {
+    fn other(reason: impl Into<String>) -> Self {
+        Self {
+            kind: OpenErrKind::Other,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Why [`Mux::resolve`] failed: the peer's typed answer, or a local failure (kind
+/// [`ResolveErrKind::Failed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolveError {
+    pub kind: ResolveErrKind,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+impl ResolveError {
+    fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ResolveErrKind::Failed,
+            reason: reason.into(),
+        }
+    }
+}
+
 /// The handle for opening streams. Clones share one connection.
 #[derive(Clone)]
 pub struct Mux {
@@ -117,19 +167,18 @@ impl Mux {
     ///
     /// # Errors
     ///
-    /// Fails when the peer refuses or the connection is gone.
-    pub async fn open(&self, host: &str, port: u16) -> Res<Stream> {
+    /// Fails when the peer refuses (with its kind) or the connection is gone.
+    pub async fn open(&self, host: &str, port: u16) -> Result<Stream, OpenError> {
         if host.len() > MAX_HOST {
-            bail!("host `{host}` is longer than {MAX_HOST} bytes");
+            return Err(OpenError::other(format!("host `{host}` is longer than {MAX_HOST} bytes")));
         }
         let (opened_tx, opened_rx) = oneshot::channel();
         let mut stream = {
             let mut table = self.shared.table();
             if let Some(reason) = &table.dead {
-                bail!("connection closed: {reason}");
+                return Err(OpenError::other(format!("connection closed: {reason}")));
             }
-            let id = StreamId(table.next_id);
-            table.next_id = table.next_id.checked_add(2).context("stream ids exhausted")?;
+            let id = table.allocate_id().map_err(|e| OpenError::other(format!("{e:#}")))?;
             let stream = self.shared.insert(&mut table, id, State::Open, Some(opened_tx));
             // Queued under the lock that allocated the id: the peer requires ids in increasing
             // order, so a concurrent open must not get its Open onto the wire first. The send
@@ -140,26 +189,59 @@ impl Mux {
 
         match opened_rx.await {
             Ok(Ok(())) => Ok(stream),
-            Ok(Err(reason)) => {
+            Ok(Err(e)) => {
                 stream.state = State::Finished;
-                bail!("{host}:{port}: {reason}")
+                Err(e)
             }
             Err(_) => {
                 stream.state = State::Finished;
-                bail!("connection closed while opening {host}:{port}")
+                Err(OpenError::other(format!("connection closed while opening {host}:{port}")))
             }
         }
     }
+
+    /// Asks the peer to resolve `host` with its own resolver, so the answer is what the peer's
+    /// network would say.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the peer's typed answer, or [`ResolveErrKind::Failed`] when the connection is
+    /// gone.
+    pub async fn resolve(&self, host: &str) -> Result<(), ResolveError> {
+        if host.len() > MAX_HOST {
+            return Err(ResolveError::failed(format!("host `{host}` is longer than {MAX_HOST} bytes")));
+        }
+        let (answer_tx, answer_rx) = oneshot::channel();
+        {
+            let mut table = self.shared.table();
+            if let Some(reason) = &table.dead {
+                return Err(ResolveError::failed(format!("connection closed: {reason}")));
+            }
+            let id = table.allocate_id().map_err(|e| ResolveError::failed(format!("{e:#}")))?;
+            table.resolves.insert(id, answer_tx);
+            // Same lock, same order rule as `open`.
+            self.shared.control(Frame::Resolve { stream: id, host: host.to_owned() });
+        }
+        answer_rx.await.unwrap_or_else(|_| Err(ResolveError::failed(format!("connection closed while resolving {host}"))))
+    }
 }
 
-/// Streams the peer asked this side to open.
+/// Something the peer asked this side to do.
+pub enum Request {
+    /// Dial a host.
+    Open(OpenRequest),
+    /// Resolve a name.
+    Resolve(ResolveRequest),
+}
+
+/// Requests the peer made of this side.
 pub struct Incoming {
-    rx: mpsc::UnboundedReceiver<OpenRequest>,
+    rx: mpsc::UnboundedReceiver<Request>,
 }
 
 impl Incoming {
     /// The next request, or `None` once the connection is gone.
-    pub async fn next(&mut self) -> Option<OpenRequest> {
+    pub async fn next(&mut self) -> Option<Request> {
         self.rx.recv().await
     }
 }
@@ -193,12 +275,50 @@ impl OpenRequest {
     }
 
     /// Tells the peer the open failed.
-    pub fn reject(mut self, reason: &str) {
+    pub fn reject(mut self, kind: OpenErrKind, reason: &str) {
         self.stream.state = State::Finished;
         self.stream.shared.control(Frame::OpenErr {
             stream: self.stream.id(),
+            kind,
             reason: reason.to_owned(),
         });
+    }
+}
+
+/// A peer's request to resolve `host`. Dropping it unanswered answers [`ResolveErrKind::Failed`].
+pub struct ResolveRequest {
+    host: String,
+    stream: StreamId,
+    shared: Arc<Shared>,
+    answered: bool,
+}
+
+impl ResolveRequest {
+    /// The name the peer asked about.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Tells the peer how the lookup went.
+    pub fn answer(mut self, result: Result<(), ResolveError>) {
+        self.answered = true;
+        self.shared.control(match result {
+            Ok(()) => Frame::Resolved { stream: self.stream },
+            Err(ResolveError { kind, reason }) => Frame::ResolveErr { stream: self.stream, kind, reason },
+        });
+    }
+}
+
+impl Drop for ResolveRequest {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.shared.control(Frame::ResolveErr {
+                stream: self.stream,
+                kind: ResolveErrKind::Failed,
+                reason: "not answered".to_owned(),
+            });
+        }
     }
 }
 
@@ -219,6 +339,7 @@ where
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
     let table = Table {
         streams: HashMap::new(),
+        resolves: HashMap::new(),
         next_id: role.first_id(),
         last_peer_id: 0,
         dead: None,
@@ -268,11 +389,23 @@ pub(crate) struct Shared {
 
 struct Table {
     streams: HashMap<StreamId, Entry>,
+    /// Resolves awaiting an answer. They share `next_id` with streams but carry no data, so they
+    /// need no credit or channel.
+    resolves: HashMap<StreamId, oneshot::Sender<Result<(), ResolveError>>>,
     next_id: u32,
     last_peer_id: u32,
     /// Set once, when the connection ends; checked under the same lock as inserts, so no stream
     /// can register after teardown and wait forever.
     dead: Option<String>,
+}
+
+impl Table {
+    /// The next id this side may open with; opens and resolves draw from one sequence.
+    fn allocate_id(&mut self) -> Res<StreamId> {
+        let id = StreamId(self.next_id);
+        self.next_id = self.next_id.checked_add(2).context("stream ids exhausted")?;
+        Ok(id)
+    }
 }
 
 /// The reader's view of one stream.
@@ -283,7 +416,7 @@ struct Entry {
     /// Wakes a pump whose download is done but whose upload is parked on a local read that the
     /// reset will never end.
     reset: Arc<Notify>,
-    opened: Option<oneshot::Sender<Result<(), String>>>,
+    opened: Option<oneshot::Sender<Result<(), OpenError>>>,
 }
 
 impl Entry {
@@ -291,7 +424,7 @@ impl Entry {
         self.credit.close();
         self.reset.notify_one();
         if let Some(opened) = self.opened.take() {
-            let _ = opened.send(Err(reason.to_owned()));
+            let _ = opened.send(Err(OpenError::other(reason)));
         }
         let _ = self.inbound.send(Inbound::Reset(reason.to_owned()));
     }
@@ -304,7 +437,7 @@ impl Shared {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn insert(self: &Arc<Self>, table: &mut Table, id: StreamId, state: State, opened: Option<oneshot::Sender<Result<(), String>>>) -> Stream {
+    fn insert(self: &Arc<Self>, table: &mut Table, id: StreamId, state: State, opened: Option<oneshot::Sender<Result<(), OpenError>>>) -> Stream {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let credit = Arc::new(Semaphore::new(self.peer_window as usize));
         let outstanding = Arc::new(AtomicU32::new(0));
@@ -336,7 +469,7 @@ impl Shared {
         self.table().streams.remove(&id).is_some()
     }
 
-    fn dispatch(self: &Arc<Self>, frame: Frame, incoming: &mpsc::UnboundedSender<OpenRequest>) -> Void {
+    fn dispatch(self: &Arc<Self>, frame: Frame, incoming: &mpsc::UnboundedSender<Request>) -> Void {
         match frame {
             Frame::Hello { .. } => bail!("unexpected Hello mid-connection"),
             Frame::Open { stream, host, port } => self.on_open(stream, host, port, incoming),
@@ -345,12 +478,18 @@ impl Shared {
                     let _ = opened.send(Ok(()));
                 }
             }
-            Frame::OpenErr { stream, reason } => {
+            Frame::OpenErr { stream, kind, reason } => {
                 let entry = self.table().streams.remove(&stream);
-                if let Some(entry) = entry {
+                if let Some(mut entry) = entry {
+                    if let Some(opened) = entry.opened.take() {
+                        let _ = opened.send(Err(OpenError { kind, reason: reason.clone() }));
+                    }
                     entry.abort(&reason);
                 }
             }
+            Frame::Resolve { stream, host } => self.on_resolve(stream, host, incoming),
+            Frame::Resolved { stream } => self.answer_resolve(stream, Ok(())),
+            Frame::ResolveErr { stream, kind, reason } => self.answer_resolve(stream, Err(ResolveError { kind, reason })),
             Frame::Data { stream, data } => self.on_data(stream, data),
             Frame::Window { stream, credit } => self.on_window(stream, credit),
             Frame::Fin { stream } => {
@@ -363,24 +502,35 @@ impl Shared {
                 if let Some(entry) = entry {
                     debug!(%stream, %reason, "peer reset stream");
                     entry.abort(&reason);
+                } else {
+                    // A resolve the peer refused outright (a bad id) is reset, not answered.
+                    self.answer_resolve(stream, Err(ResolveError::failed(reason)));
                 }
             }
         }
         Ok(())
     }
 
-    fn on_open(self: &Arc<Self>, stream: StreamId, host: String, port: u16, incoming: &mpsc::UnboundedSender<OpenRequest>) {
+    /// Checks that `stream` is the peer's to open and newer than any it opened before, and records
+    /// it. On failure, resets it and returns `false`.
+    fn admit_peer_id(&self, table: &mut Table, stream: StreamId) -> bool {
+        if self.role.owns(stream) || stream.0 <= table.last_peer_id {
+            self.control(Frame::Rst {
+                stream,
+                reason: format!("stream id {stream} is not the peer's to open"),
+            });
+            return false;
+        }
+        table.last_peer_id = stream.0;
+        true
+    }
+
+    fn on_open(self: &Arc<Self>, stream: StreamId, host: String, port: u16, incoming: &mpsc::UnboundedSender<Request>) {
         let request = {
             let mut table = self.table();
-            if self.role.owns(stream) || stream.0 <= table.last_peer_id {
-                drop(table);
-                self.control(Frame::Rst {
-                    stream,
-                    reason: format!("stream id {stream} is not the peer's to open"),
-                });
+            if !self.admit_peer_id(&mut table, stream) {
                 return;
             }
-            table.last_peer_id = stream.0;
             OpenRequest {
                 host,
                 port,
@@ -389,7 +539,28 @@ impl Shared {
         };
         debug!(%stream, host = request.host, port, "peer opened stream");
         // With no one accepting, the returned request drops here, which rejects it.
-        let _ = incoming.send(request);
+        let _ = incoming.send(Request::Open(request));
+    }
+
+    fn on_resolve(self: &Arc<Self>, stream: StreamId, host: String, incoming: &mpsc::UnboundedSender<Request>) {
+        if !self.admit_peer_id(&mut self.table(), stream) {
+            return;
+        }
+        debug!(%stream, %host, "peer asked to resolve");
+        // With no one serving, the returned request drops here, which answers `Failed`.
+        let _ = incoming.send(Request::Resolve(ResolveRequest {
+            host,
+            stream,
+            shared: Arc::clone(self),
+            answered: false,
+        }));
+    }
+
+    fn answer_resolve(&self, stream: StreamId, result: Result<(), ResolveError>) {
+        let waiting = self.table().resolves.remove(&stream);
+        if let Some(waiting) = waiting {
+            let _ = waiting.send(result);
+        }
     }
 
     fn on_data(&self, stream: StreamId, data: Bytes) {
@@ -433,19 +604,22 @@ impl Shared {
     }
 
     fn teardown(&self, reason: &str) {
-        let streams = {
+        let (streams, resolves) = {
             let mut table = self.table();
             table.dead = Some(reason.to_owned());
-            std::mem::take(&mut table.streams)
+            (std::mem::take(&mut table.streams), std::mem::take(&mut table.resolves))
         };
         let reason = format!("connection closed: {reason}");
+        for waiting in resolves.into_values() {
+            let _ = waiting.send(Err(ResolveError::failed(reason.clone())));
+        }
         for entry in streams.into_values() {
             entry.abort(&reason);
         }
     }
 }
 
-async fn read_loop<R: AsyncRead + Unpin>(mut reader: R, mut buf: BytesMut, shared: &Arc<Shared>, incoming: mpsc::UnboundedSender<OpenRequest>) -> Void {
+async fn read_loop<R: AsyncRead + Unpin>(mut reader: R, mut buf: BytesMut, shared: &Arc<Shared>, incoming: mpsc::UnboundedSender<Request>) -> Void {
     loop {
         while let Some(frame) = Frame::decode(&mut buf)? {
             shared.dispatch(frame, &incoming)?;

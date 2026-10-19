@@ -22,4 +22,8 @@ why the version moved the way it did.
 - `sshunnel relays`: the arch, sha256 and size of each relay the client would execute.
 - `cargo xtask relay`, `dist` and `bench`: build the relays and `SHA256SUMS`, build a client with
   them embedded, and compare throughput against `ssh -L`.
+- Protocol v3: `Resolve` / `Resolved` / `ResolveErr` frames, so the relay can resolve a name with
+  its own resolver (`getaddrinfo`), and a kind on `OpenErr` (refused, unreachable, timed out,
+  other), so a failed dial says why. A cached v2 relay is simply replaced, since the cache is keyed
+  by hash.
 - Initial scaffold.

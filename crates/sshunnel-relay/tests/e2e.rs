@@ -10,6 +10,7 @@ use bytes::BytesMut;
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
     Config, Mux, Role,
+    frame::ResolveErrKind,
     hello::{recv_hello, send_hello},
     pump, start,
 };
@@ -102,6 +103,25 @@ async fn e2e_stdio_reports_a_refused_dial() {
     let (mux, _child) = connect().await;
     let err = mux.open("127.0.0.1", port).await.unwrap_err();
     assert!(format!("{err:#}").to_lowercase().contains("refused"), "{err:#}");
+}
+
+#[tokio::test]
+async fn e2e_stdio_reports_a_refused_dial_with_its_kind() {
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let (mux, _child) = connect().await;
+    let err = mux.open("127.0.0.1", port).await.unwrap_err();
+    assert_eq!(err.kind, sshunnel_mux::frame::OpenErrKind::Refused);
+}
+
+#[tokio::test]
+async fn relay_answers_a_resolve() {
+    let (mux, _child) = connect().await;
+    timeout(Duration::from_secs(30), mux.resolve("localhost")).await.unwrap().unwrap();
+    let err = timeout(Duration::from_secs(30), mux.resolve("nonexistent.invalid")).await.unwrap().unwrap_err();
+    assert_eq!(err.kind, ResolveErrKind::NoSuchName, "{err}");
 }
 
 #[tokio::test]

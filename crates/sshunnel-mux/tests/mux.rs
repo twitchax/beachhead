@@ -16,8 +16,8 @@ use std::{
 use bytes::BytesMut;
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
-    Config, Incoming, Mux, Role, Stream,
-    frame::{Frame, StreamId},
+    Config, Incoming, Mux, Request, ResolveError, Role, Stream,
+    frame::{Frame, OpenErrKind, ResolveErrKind, StreamId},
     pump, start,
 };
 use tokio::{
@@ -70,6 +70,7 @@ fn connect_pair(client_config: Config, relay_config: Config) -> Mux {
 /// The relay's stand-in targets, picked by the `Open` host.
 async fn serve(mut incoming: Incoming) {
     while let Some(request) = incoming.next().await {
+        let Request::Open(request) = request else { panic!("unexpected Resolve") };
         match request.host() {
             "echo" => {
                 let (near, far) = duplex(SOCK_CAP);
@@ -114,7 +115,7 @@ async fn serve(mut incoming: Incoming) {
             }
             // Opens, then hangs up at once: an open that only needs to succeed.
             "accept" => drop(request.accept()),
-            "refuse" => request.reject("connection refused"),
+            "refuse" => request.reject(OpenErrKind::Refused, "connection refused"),
             other => panic!("unexpected host {other}"),
         }
     }
@@ -293,6 +294,14 @@ async fn data_flows_back_after_a_half_close() {
 }
 
 #[tokio::test]
+async fn a_refused_open_reports_its_kind() {
+    let mux = connect(small());
+    let err = mux.open("refuse", 7).await.unwrap_err();
+    assert_eq!(err.kind, OpenErrKind::Refused);
+    assert_eq!(err.reason, "connection refused");
+}
+
+#[tokio::test]
 async fn a_refused_open_reports_the_reason() {
     let mux = connect(small());
     let err = mux.open("refuse", 7).await.unwrap_err();
@@ -464,6 +473,122 @@ async fn dropping_an_unanswered_open_request_rejects_it() {
     drop(incoming.next().await.unwrap());
     let frame = peer.next().await;
     assert!(matches!(&frame, Frame::OpenErr { stream, .. } if *stream == id), "{frame:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn resolve_round_trips_both_answers() {
+    let (client, _incoming, mut peer) = client_with_hand_peer();
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move { client.resolve("wiki.corp.example").await }
+    });
+    let Frame::Resolve { stream, host } = peer.next().await else { panic!("expected Resolve") };
+    assert_eq!(host, "wiki.corp.example");
+    peer.send(Frame::Resolved { stream }).await;
+    first.await.unwrap().unwrap();
+
+    let second = tokio::spawn(async move { client.resolve("nope.invalid").await });
+    let Frame::Resolve { stream: second_id, .. } = peer.next().await else {
+        panic!("expected Resolve")
+    };
+    assert!(second_id > stream);
+    peer.send(Frame::ResolveErr {
+        stream: second_id,
+        kind: ResolveErrKind::NoSuchName,
+        reason: "no such name".into(),
+    })
+    .await;
+    let err = second.await.unwrap().unwrap_err();
+    assert_eq!(err.kind, ResolveErrKind::NoSuchName);
+    assert_eq!(err.reason, "no such name");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dropped_resolve_request_answers_failed() {
+    let (_client, mut incoming, mut peer) = client_with_hand_peer();
+    let id = StreamId(2);
+    peer.send(Frame::Resolve { stream: id, host: "x".into() }).await;
+    let Some(Request::Resolve(request)) = incoming.next().await else {
+        panic!("expected a Resolve request")
+    };
+    assert_eq!(request.host(), "x");
+    drop(request);
+    let frame = peer.next().await;
+    assert!(
+        matches!(&frame, Frame::ResolveErr { stream, kind: ResolveErrKind::Failed, reason } if *stream == id && reason == "not answered"),
+        "{frame:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answered_resolve_request_sends_its_answer() {
+    let (_client, mut incoming, mut peer) = client_with_hand_peer();
+    peer.send(Frame::Resolve { stream: StreamId(2), host: "x".into() }).await;
+    let Some(Request::Resolve(request)) = incoming.next().await else {
+        panic!("expected a Resolve request")
+    };
+    request.answer(Ok(()));
+    assert!(matches!(peer.next().await, Frame::Resolved { stream } if stream == StreamId(2)));
+
+    peer.send(Frame::Resolve { stream: StreamId(4), host: "y".into() }).await;
+    let Some(Request::Resolve(request)) = incoming.next().await else {
+        panic!("expected a Resolve request")
+    };
+    request.answer(Err(ResolveError {
+        kind: ResolveErrKind::NoSuchName,
+        reason: "unknown".into(),
+    }));
+    let frame = peer.next().await;
+    assert!(
+        matches!(&frame, Frame::ResolveErr { stream, kind: ResolveErrKind::NoSuchName, reason } if *stream == StreamId(4) && reason == "unknown"),
+        "{frame:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resolve_with_a_stale_id_is_reset() {
+    let (_client, mut incoming, mut peer) = client_with_hand_peer();
+    peer.send(Frame::Open {
+        stream: StreamId(4),
+        host: "x".into(),
+        port: 1,
+    })
+    .await;
+    let _open = incoming.next().await.unwrap();
+    peer.send(Frame::Resolve { stream: StreamId(2), host: "x".into() }).await;
+    let frame = peer.next().await;
+    assert!(matches!(&frame, Frame::Rst { stream, .. } if *stream == StreamId(2)), "{frame:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn teardown_fails_a_pending_resolve() {
+    let (client, _incoming, mut peer) = client_with_hand_peer();
+    let resolver = tokio::spawn(async move { client.resolve("x").await });
+    assert!(matches!(peer.next().await, Frame::Resolve { .. }));
+    drop(peer);
+    let err = timeout(Duration::from_secs(10), resolver)
+        .await
+        .expect("the resolve fails rather than waiting forever")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.kind, ResolveErrKind::Failed);
+    assert!(err.reason.contains("connection closed"), "{err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn resolve_ids_share_the_open_order() {
+    let (client, _incoming, mut peer) = client_with_hand_peer();
+    let task = tokio::spawn(async move { tokio::join!(client.resolve("a"), client.open("b", 7)) });
+    let Frame::Resolve { stream: resolve_id, .. } = peer.next().await else {
+        panic!("expected Resolve first")
+    };
+    let Frame::Open { stream: open_id, .. } = peer.next().await else { panic!("expected Open second") };
+    assert!(resolve_id < open_id);
+    peer.send(Frame::Resolved { stream: resolve_id }).await;
+    peer.send(Frame::OpenOk { stream: open_id }).await;
+    let (resolved, opened) = task.await.unwrap();
+    resolved.unwrap();
+    opened.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

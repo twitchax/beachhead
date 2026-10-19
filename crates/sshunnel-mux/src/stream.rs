@@ -15,7 +15,7 @@ use tokio::{
 
 use crate::{
     base::Res,
-    frame::{Frame, StreamId},
+    frame::{Frame, OpenErrKind, StreamId},
     mux::Shared,
 };
 
@@ -74,7 +74,11 @@ impl Stream {
         if self.shared.forget(self.id) {
             let reason = reason.to_owned();
             let frame = if was_pending {
-                Frame::OpenErr { stream: self.id, reason }
+                Frame::OpenErr {
+                    stream: self.id,
+                    kind: OpenErrKind::Other,
+                    reason,
+                }
             } else {
                 Frame::Rst { stream: self.id, reason }
             };

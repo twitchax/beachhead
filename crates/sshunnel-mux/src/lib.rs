@@ -9,5 +9,5 @@ pub mod hello;
 mod mux;
 mod stream;
 
-pub use mux::{Config, Incoming, Mux, OpenRequest, Role, start};
+pub use mux::{Config, Incoming, Mux, OpenError, OpenRequest, Request, ResolveError, ResolveRequest, Role, start};
 pub use stream::{Stream, Traffic, pump};

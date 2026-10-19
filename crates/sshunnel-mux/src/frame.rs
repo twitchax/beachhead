@@ -12,14 +12,65 @@ use crate::base::{Res, Void};
 pub const HEADER_LEN: usize = 9;
 /// The largest payload a decoder accepts, so a garbage length can't make it allocate.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
-/// The longest `Open` host, matching DNS's own limit.
+/// The longest `Open` or `Resolve` host, matching DNS's own limit.
 pub const MAX_HOST: usize = 255;
-/// `OpenErr` and `Rst` reasons are cut to this many bytes (on a char boundary) when encoded.
+/// `OpenErr`, `ResolveErr` and `Rst` reasons are cut to this many bytes (on a char boundary) when encoded.
 pub const MAX_REASON: usize = 1024;
 /// The first bytes of every `Hello`.
 pub const MAGIC: [u8; 4] = *b"SSHN";
 /// The protocol version both ends must agree on.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
+
+/// Why a dial failed, as one wire byte ahead of the `OpenErr` reason. The discriminants are the wire
+/// values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OpenErrKind {
+    /// The host answered and nothing listens on the port.
+    Refused = 0,
+    /// No route to the host or network.
+    Unreachable = 1,
+    /// The dial timed out.
+    TimedOut = 2,
+    /// Anything else, including a name that doesn't resolve.
+    Other = 3,
+}
+
+impl TryFrom<u8> for OpenErrKind {
+    type Error = crate::base::Err;
+
+    fn try_from(byte: u8) -> Res<Self> {
+        Ok(match byte {
+            0 => Self::Refused,
+            1 => Self::Unreachable,
+            2 => Self::TimedOut,
+            3 => Self::Other,
+            other => bail!("unknown OpenErr kind {other}"),
+        })
+    }
+}
+
+/// Why a name lookup failed, as one wire byte ahead of the `ResolveErr` reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResolveErrKind {
+    /// The resolver says the name does not exist.
+    NoSuchName = 0,
+    /// The lookup failed for any other reason.
+    Failed = 1,
+}
+
+impl TryFrom<u8> for ResolveErrKind {
+    type Error = crate::base::Err;
+
+    fn try_from(byte: u8) -> Res<Self> {
+        Ok(match byte {
+            0 => Self::NoSuchName,
+            1 => Self::Failed,
+            other => bail!("unknown ResolveErr kind {other}"),
+        })
+    }
+}
 
 /// A stream's id. The opener allocates them monotonically and never reuses one, so a late frame for
 /// a finished stream can be ignored. Id 0 is the connection itself (`Hello`).
@@ -48,7 +99,13 @@ pub enum Frame {
     /// The peer dialed; data may flow.
     OpenOk { stream: StreamId },
     /// The peer could not dial.
-    OpenErr { stream: StreamId, reason: String },
+    OpenErr { stream: StreamId, kind: OpenErrKind, reason: String },
+    /// Ask the peer to resolve `host` with its own resolver. Rides a fresh stream id, like `Open`.
+    Resolve { stream: StreamId, host: String },
+    /// The name resolved.
+    Resolved { stream: StreamId },
+    /// The name did not resolve.
+    ResolveErr { stream: StreamId, kind: ResolveErrKind, reason: String },
     /// Stream bytes, at most [`MAX_PAYLOAD`] of them; the receiver's credit pays for each one.
     Data { stream: StreamId, data: Bytes },
     /// Return `credit` bytes of send credit to the peer.
@@ -68,6 +125,9 @@ impl Frame {
             Self::Open { .. } => "Open",
             Self::OpenOk { .. } => "OpenOk",
             Self::OpenErr { .. } => "OpenErr",
+            Self::Resolve { .. } => "Resolve",
+            Self::Resolved { .. } => "Resolved",
+            Self::ResolveErr { .. } => "ResolveErr",
             Self::Data { .. } => "Data",
             Self::Window { .. } => "Window",
             Self::Fin { .. } => "Fin",
@@ -151,10 +211,33 @@ impl Frame {
                 fixed(0)?;
                 Self::OpenOk { stream }
             }
-            Kind::OpenErr => Self::OpenErr {
-                stream,
-                reason: String::from_utf8_lossy(&payload).into_owned(),
-            },
+            Kind::OpenErr => {
+                let (kind, reason) = split_kind(kind, &payload)?;
+                Self::OpenErr {
+                    stream,
+                    kind: OpenErrKind::try_from(kind)?,
+                    reason,
+                }
+            }
+            Kind::Resolve => {
+                if payload.len() > MAX_HOST {
+                    bail!("Resolve host is {} bytes, over the {MAX_HOST}-byte limit", payload.len());
+                }
+                let host = std::str::from_utf8(&payload).map_err(|e| anyhow!("Resolve host is not UTF-8: {e}"))?.to_owned();
+                Self::Resolve { stream, host }
+            }
+            Kind::Resolved => {
+                fixed(0)?;
+                Self::Resolved { stream }
+            }
+            Kind::ResolveErr => {
+                let (kind, reason) = split_kind(kind, &payload)?;
+                Self::ResolveErr {
+                    stream,
+                    kind: ResolveErrKind::try_from(kind)?,
+                    reason,
+                }
+            }
             Kind::Data => Self::Data { stream, data: payload },
             Kind::Window => {
                 fixed(4)?;
@@ -196,7 +279,16 @@ impl Frame {
                 buf.put_slice(host.as_bytes());
             }
             Self::OpenOk { stream } => put_header(buf, *stream, Kind::OpenOk, 0),
-            Self::OpenErr { stream, reason } => put_reason(buf, *stream, Kind::OpenErr, reason),
+            Self::OpenErr { stream, kind, reason } => put_reason(buf, *stream, Kind::OpenErr, Some(*kind as u8), reason),
+            Self::Resolve { stream, host } => {
+                if host.len() > MAX_HOST {
+                    bail!("Resolve host is {} bytes, over the {MAX_HOST}-byte limit", host.len());
+                }
+                put_header(buf, *stream, Kind::Resolve, host.len());
+                buf.put_slice(host.as_bytes());
+            }
+            Self::Resolved { stream } => put_header(buf, *stream, Kind::Resolved, 0),
+            Self::ResolveErr { stream, kind, reason } => put_reason(buf, *stream, Kind::ResolveErr, Some(*kind as u8), reason),
             Self::Data { stream, data } => {
                 if data.len() > MAX_PAYLOAD {
                     bail!("Data payload is {} bytes, over the {MAX_PAYLOAD}-byte limit", data.len());
@@ -209,7 +301,7 @@ impl Frame {
                 buf.put_u32(*credit);
             }
             Self::Fin { stream } => put_header(buf, *stream, Kind::Fin, 0),
-            Self::Rst { stream, reason } => put_reason(buf, *stream, Kind::Rst, reason),
+            Self::Rst { stream, reason } => put_reason(buf, *stream, Kind::Rst, None, reason),
         }
         Ok(())
     }
@@ -227,6 +319,9 @@ enum Kind {
     Window = 5,
     Fin = 6,
     Rst = 7,
+    Resolve = 8,
+    Resolved = 9,
+    ResolveErr = 10,
 }
 
 impl TryFrom<u8> for Kind {
@@ -242,6 +337,9 @@ impl TryFrom<u8> for Kind {
             5 => Self::Window,
             6 => Self::Fin,
             7 => Self::Rst,
+            8 => Self::Resolve,
+            9 => Self::Resolved,
+            10 => Self::ResolveErr,
             other => bail!("unknown frame kind {other}"),
         })
     }
@@ -256,13 +354,25 @@ fn put_header(buf: &mut BytesMut, stream: StreamId, kind: Kind, len: usize) {
     buf.put_u32(len as u32);
 }
 
-fn put_reason(buf: &mut BytesMut, stream: StreamId, kind: Kind, reason: &str) {
+/// A reason frame: an optional kind byte, then the reason cut to [`MAX_REASON`].
+fn put_reason(buf: &mut BytesMut, stream: StreamId, kind: Kind, detail: Option<u8>, reason: &str) {
     let mut end = reason.len().min(MAX_REASON);
     while !reason.is_char_boundary(end) {
         end -= 1;
     }
-    put_header(buf, stream, kind, end);
+    put_header(buf, stream, kind, end + usize::from(detail.is_some()));
+    if let Some(detail) = detail {
+        buf.put_u8(detail);
+    }
     buf.put_slice(&reason.as_bytes()[..end]);
+}
+
+/// Splits a kind-prefixed reason payload into the kind byte and the reason.
+fn split_kind(frame: Kind, payload: &[u8]) -> Res<(u8, String)> {
+    let Some((&kind, reason)) = payload.split_first() else {
+        bail!("{frame:?} payload is empty, expected a kind byte");
+    };
+    Ok((kind, String::from_utf8_lossy(reason).into_owned()))
 }
 
 /// Big-endian reads at an offset, for payloads whose length was already checked.
@@ -309,7 +419,15 @@ mod unit {
             Frame::OpenOk { stream: s },
             Frame::OpenErr {
                 stream: s,
+                kind: OpenErrKind::Refused,
                 reason: "connection refused".into(),
+            },
+            Frame::Resolve { stream: s, host: "server.lan".into() },
+            Frame::Resolved { stream: s },
+            Frame::ResolveErr {
+                stream: s,
+                kind: ResolveErrKind::NoSuchName,
+                reason: "no such name".into(),
             },
             Frame::Data {
                 stream: s,
@@ -322,6 +440,79 @@ mod unit {
                 reason: "reset by peer".into(),
             },
         ]
+    }
+
+    #[test]
+    fn v3_frames_round_trip() {
+        let s = StreamId(9);
+        let mut frames = vec![
+            Frame::Resolve {
+                stream: s,
+                host: "wiki.corp.example".into(),
+            },
+            Frame::Resolved { stream: s },
+        ];
+        for kind in [OpenErrKind::Refused, OpenErrKind::Unreachable, OpenErrKind::TimedOut, OpenErrKind::Other] {
+            frames.push(Frame::OpenErr {
+                stream: s,
+                kind,
+                reason: "no route".into(),
+            });
+        }
+        for kind in [ResolveErrKind::NoSuchName, ResolveErrKind::Failed] {
+            frames.push(Frame::ResolveErr {
+                stream: s,
+                kind,
+                reason: "lookup failed".into(),
+            });
+        }
+        for frame in frames {
+            let mut buf = encoded(&frame);
+            assert_eq!(Frame::decode(&mut buf).unwrap(), Some(frame));
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn v3_wire_layout_is_pinned() {
+        let err = encoded(&Frame::OpenErr {
+            stream: StreamId(1),
+            kind: OpenErrKind::TimedOut,
+            reason: "x".into(),
+        });
+        assert_eq!(&err[..], &[0, 0, 0, 1, 3, 0, 0, 0, 2, 2, b'x'][..]);
+        let resolve = encoded(&Frame::Resolve { stream: StreamId(1), host: "h".into() });
+        assert_eq!(&resolve[..], &[0, 0, 0, 1, 8, 0, 0, 0, 1, b'h'][..]);
+        assert_eq!(&encoded(&Frame::Resolved { stream: StreamId(1) })[..], &[0, 0, 0, 1, 9, 0, 0, 0, 0][..]);
+        let rerr = encoded(&Frame::ResolveErr {
+            stream: StreamId(1),
+            kind: ResolveErrKind::Failed,
+            reason: String::new(),
+        });
+        assert_eq!(&rerr[..], &[0, 0, 0, 1, 10, 0, 0, 0, 1, 1][..]);
+    }
+
+    #[test]
+    fn an_unknown_open_err_kind_is_rejected() {
+        let raw = [header(1, 3, 2), vec![9, b'x']].concat();
+        assert!(Frame::decode(&mut BytesMut::from(&raw[..])).is_err());
+        let raw = [header(1, 10, 2), vec![9, b'x']].concat();
+        assert!(Frame::decode(&mut BytesMut::from(&raw[..])).is_err());
+        // A kind byte is required.
+        assert!(Frame::decode(&mut BytesMut::from(&header(1, 3, 0)[..])).is_err());
+    }
+
+    #[test]
+    fn resolve_hosts_over_max_host_are_rejected() {
+        let long = Frame::Resolve {
+            stream: StreamId(1),
+            host: "a".repeat(MAX_HOST + 1),
+        };
+        assert!(long.encode(&mut BytesMut::new()).is_err());
+        let on_wire = [header(1, 8, 256), vec![b'a'; 256]].concat();
+        assert!(Frame::decode(&mut BytesMut::from(&on_wire[..])).is_err());
+        let resolved_with_payload = [header(1, 9, 1), vec![0]].concat();
+        assert!(Frame::decode(&mut BytesMut::from(&resolved_with_payload[..])).is_err());
     }
 
     #[test]
