@@ -273,7 +273,7 @@ impl Targets {
 }
 
 /// Lowercase with no trailing dot, so `WIKI.Corp.Example.` is `wiki.corp.example`.
-fn normalize(name: &str) -> String {
+pub(crate) fn normalize(name: &str) -> String {
     name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
 
