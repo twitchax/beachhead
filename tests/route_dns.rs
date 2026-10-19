@@ -264,3 +264,43 @@ async fn an_implausible_name_is_nxdomain_without_a_lookup() {
     }
     assert_eq!(f.tunnel.resolves().len(), 0);
 }
+
+#[tokio::test]
+async fn a_failed_lookup_is_not_cached() {
+    let f = corp();
+    f.tunnel.name("flaky.corp.example", Err(ResolveErrKind::Failed));
+
+    let bytes = ask(&f.server, 1, "flaky.corp.example", TYPE::A).await;
+    assert_eq!(Packet::parse(&bytes).unwrap().rcode(), RCODE::ServerFailure);
+
+    f.tunnel.name("flaky.corp.example", Ok(()));
+    let bytes = ask(&f.server, 2, "flaky.corp.example", TYPE::A).await;
+    let reply = Packet::parse(&bytes).unwrap();
+
+    assert_eq!(reply.rcode(), RCODE::NoError);
+    let RData::A(a) = &reply.answers[0].rdata else { panic!("not an A record") };
+    assert_eq!(std::net::Ipv4Addr::from(a.address), names::slot("flaky.corp.example"));
+    assert_eq!(f.tunnel.resolves(), vec!["flaky.corp.example", "flaky.corp.example"]);
+}
+
+#[tokio::test]
+async fn responses_and_multi_question_packets_get_no_answer() {
+    let f = corp();
+    f.tunnel.name("wiki.corp.example", Ok(()));
+
+    let mut response = Packet::new_reply(1);
+    response
+        .questions
+        .push(Question::new(Name::new_unchecked("wiki.corp.example"), QTYPE::TYPE(TYPE::A), QCLASS::CLASS(CLASS::IN), false));
+    let response = Bytes::from(response.build_bytes_vec().unwrap());
+    assert!(f.server.answer(response).await.is_none());
+
+    let mut two = Packet::new_query(2);
+    for name in ["wiki.corp.example", "other.corp.example"] {
+        two.questions.push(Question::new(Name::new_unchecked(name), QTYPE::TYPE(TYPE::A), QCLASS::CLASS(CLASS::IN), false));
+    }
+    let two = Bytes::from(two.build_bytes_vec().unwrap());
+    assert!(f.server.answer(two).await.is_none());
+
+    assert_eq!(f.tunnel.resolves().len(), 0);
+}
