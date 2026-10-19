@@ -13,8 +13,10 @@ use clap::{Args, Parser, Subcommand};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(target_os = "linux")]
+use sshunnel::route;
 use sshunnel::{
-    base::Void,
+    base::{Res, Void},
     forward::{self, Forward},
     relays::Relays,
     session::{Session, SshCommand},
@@ -36,19 +38,48 @@ enum Command {
         /// defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port.
         #[arg(short = 'L', long = "local", value_name = "SPEC", required = true)]
         forwards: Vec<Forward>,
-        /// The ssh program and its leading arguments, split like a shell would.
-        #[arg(long, env = "SSHUNNEL_SSH", default_value = "ssh", value_name = "COMMAND")]
-        ssh_cmd: String,
+        #[command(flatten)]
+        ssh: SshArgs,
         #[command(flatten)]
         relays: RelayArgs,
         /// Where to run the relay, exactly as you'd pass it to ssh (config aliases work).
         destination: String,
+    },
+    /// Route CIDRs and domain patterns through a relay on DESTINATION, over a TUN device (Linux).
+    #[cfg(target_os = "linux")]
+    Route {
+        /// Carve a CIDR or a name out of the targets (repeatable).
+        #[arg(short = 'x', long = "exclude", value_name = "TARGET")]
+        exclude: Vec<String>,
+        #[command(flatten)]
+        ssh: SshArgs,
+        #[command(flatten)]
+        relays: RelayArgs,
+        /// Where to run the relay, exactly as you'd pass it to ssh (config aliases work).
+        destination: String,
+        /// What to route: CIDRs (`10.99.0.0/16`, `fd99::/64`) and domain patterns (`*.corp.example`, `host.corp.example`).
+        #[arg(value_name = "TARGET", required = true)]
+        targets: Vec<String>,
+    },
+    /// The root helper `route` starts through sudo: it sets up sshunnel0 for the client listening on PATH.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Helper {
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
     },
     /// Show the relays this client would push: arch, sha256 and size of exactly what it executes.
     Relays {
         #[command(flatten)]
         relays: RelayArgs,
     },
+}
+
+#[derive(Debug, Args)]
+struct SshArgs {
+    /// The ssh program and its leading arguments, split like a shell would.
+    #[arg(long, env = "SSHUNNEL_SSH", default_value = "ssh", value_name = "COMMAND")]
+    ssh_cmd: String,
 }
 
 #[derive(Debug, Args)]
@@ -71,6 +102,12 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         // `{:#}` prints the whole context chain on one line.
         Err(e) => {
+            // The root helper shares the client's terminal through sudo, and the client prints an
+            // error the helper sent it.
+            #[cfg(target_os = "linux")]
+            if e.is::<sshunnel::route::helper::Reported>() {
+                return ExitCode::FAILURE;
+            }
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
@@ -83,13 +120,35 @@ fn run(cli: Cli) -> Void {
             print_relays(&Relays::load(relays.relay_dir.as_deref())?);
             Ok(())
         }
-        Command::Forward { forwards, ssh_cmd, relays, destination } => {
+        Command::Forward { forwards, ssh, relays, destination } => {
             let relays = Relays::load(relays.relay_dir.as_deref())?;
-            let ssh = SshCommand::parse(&ssh_cmd)?;
-            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().context("starting the runtime")?;
-            runtime.block_on(forward(&forwards, &ssh, &destination, &relays))
+            let ssh = SshCommand::parse(&ssh.ssh_cmd)?;
+            runtime()?.block_on(forward(&forwards, &ssh, &destination, &relays))
+        }
+        #[cfg(target_os = "linux")]
+        Command::Route {
+            exclude,
+            ssh,
+            relays,
+            destination,
+            targets,
+        } => {
+            let relays = Relays::load(relays.relay_dir.as_deref())?;
+            let ssh = SshCommand::parse(&ssh.ssh_cmd)?;
+            let options = route::Options { include: targets, exclude };
+            runtime()?.block_on(route::run(&options, &ssh, &destination, &relays))
+        }
+        #[cfg(target_os = "linux")]
+        Command::Helper { socket } => {
+            // One task waiting on a socket and a few commands: a single thread is plenty for root.
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().context("starting the runtime")?;
+            runtime.block_on(route::helper::serve(&socket))
         }
     }
+}
+
+fn runtime() -> Res<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().context("starting the runtime")
 }
 
 fn print_relays(relays: &Relays) {
@@ -110,8 +169,7 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
     }
 
     let session = Session::connect(ssh, destination, relays).await?;
-    let relay = session.relay();
-    eprintln!("sshunnel: relay {} {} {}", relay.arch(), &relay.sha256()[..12], session.bootstrap());
+    eprintln!("sshunnel: {}", session.describe());
 
     let mut serving = JoinSet::new();
     for (spec, bound) in forwards.iter().zip(listeners) {

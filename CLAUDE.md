@@ -14,6 +14,11 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
 - `.` (`sshunnel`): the client library and a thin binary (`src/bin.rs`) behind the default `cli`
   feature. The binary parses arguments and calls the library; everything testable lives in the
   library. `tests` is the shared fixture factory.
+- `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
+  matching, refusals), `names` (the fake-address map), `stack` (the smoltcp netstack) with `dns`
+  on it, `peers` and `system` (what the machine depends on, and the commands and syscalls behind
+  it), `helper` (the root side, run as the hidden `sshunnel helper` through sudo), and
+  `lifecycle`, which runs them in the spec's order and stops the helper on every exit path.
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.
 - `crates/sshunnel-relay`: the remote binary, pushed over SSH as a static musl build. Every
@@ -32,7 +37,8 @@ name), re-parses the targets and re-runs every refusal as root against its own r
 honors only pins inside a route and works out their gateways itself, and runs iproute2 and
 resolvectl from a fixed `PATH`. It and `route::system` (the system calls behind it) are Linux only.
 In product code, the two TUN ioctls (`route::system`: creating the device, clearing its persist
-flag) and the relay's `getaddrinfo` are the only `unsafe`, each block with a `// SAFETY:` comment.
+flag), registering the device's fd with tokio (`route::device`; tokio offers no safe way) and the
+relay's `getaddrinfo` are the only `unsafe`, each block with a `// SAFETY:` comment.
 
 ## Commands
 

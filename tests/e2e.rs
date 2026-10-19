@@ -199,3 +199,50 @@ async fn e2e_forward_rejects_a_malformed_spec() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("[bind_address:]port:host:hostport"));
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn e2e_route_refuses_before_running_ssh() {
+    let dir = TempDir::new().unwrap();
+    let remote = FakeRemote::new(dir.path(), "sh", &[]).unwrap();
+    let relays = relay_dir(dir.path()).unwrap();
+
+    let out = sshunnel(&dir)
+        .arg("route")
+        .arg("--ssh-cmd")
+        .arg(remote.ssh_path())
+        .arg("--relay-dir")
+        .arg(&relays)
+        .args(["fake-host", "0.0.0.0/0", "*"])
+        .output()
+        .await
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr: {stderr}");
+    // Every problem at once, so one run shows everything to fix.
+    assert!(stderr.contains("'0.0.0.0/0'") && stderr.contains("'*'"), "{stderr}");
+    assert!(remote.last_ssh_args().is_err(), "ssh ran before the targets were checked");
+}
+
+/// The test plays `sshunnel route`'s end of the helper's socket, as the same user.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn e2e_helper_leaves_a_refusal_it_sent_to_the_client() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("helper.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let helper = sshunnel(&dir).env_remove("SUDO_UID").arg("helper").arg("--socket").arg(&socket).stderr(Stdio::piped()).spawn().unwrap();
+
+    let (conn, _) = timeout(Duration::from_secs(10), listener.accept()).await.expect("the helper connects").unwrap();
+    let (reader, mut writer) = conn.into_split();
+    writer.write_all(b"{\"include\":[\"0.0.0.0/0\"],\"exclude\":[],\"pins\":[]}\n").await.unwrap();
+    let mut reply = String::new();
+    BufReader::new(reader).read_line(&mut reply).await.unwrap();
+    let out = timeout(Duration::from_secs(10), helper.wait_with_output()).await.expect("the helper exits").unwrap();
+
+    assert!(reply.contains("Failed") && reply.contains("'0.0.0.0/0'"), "{reply}");
+    assert!(!out.status.success());
+    // The client prints the refusal; the helper shares its terminal (through sudo) and stays quiet.
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}

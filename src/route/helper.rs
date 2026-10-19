@@ -206,7 +206,8 @@ async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, s
 /// # Errors
 ///
 /// Fails when the client can't be reached or isn't the user who ran sudo, when the setup is refused
-/// or fails (after telling the client and undoing what was done), or when a pin can't be deleted.
+/// or fails (after telling the client and undoing what was done; marked [`Reported`] once the
+/// client has it), or when a pin can't be deleted.
 pub async fn serve(socket: &Path) -> Void {
     let uid = served_uid(std::env::var_os("SUDO_UID").as_deref(), rustix::process::getuid().as_raw())?;
     serve_with(socket, uid).await
@@ -226,10 +227,13 @@ async fn serve_with(socket: &Path, uid: u32) -> Void {
     };
     let (applied, warnings) = match setup.and_then(|setup| apply(&setup)) {
         Ok(applied) => applied,
+        // The client prints what it is sent, on the terminal the helper shares through sudo, so
+        // the helper reports an error itself only when the client is gone.
         Err(e) => {
-            // Best effort: the client may be gone, and the error is reported here either way.
-            let _ = send(&mut conn, &Reply::Failed { error: format!("{e:#}") }, None).await;
-            return Err(e);
+            return match send(&mut conn, &Reply::Failed { error: format!("{e:#}") }, None).await {
+                Ok(()) => Err(e.context(Reported)),
+                Err(_) => Err(e),
+            };
         }
     };
 
@@ -243,6 +247,19 @@ async fn serve_with(socket: &Path, uid: u32) -> Void {
     let unpinned = applied.teardown();
     delivered.and(unpinned)
 }
+
+/// Marks the helper's error once the client has it: the client prints it, so `sshunnel helper`
+/// exits non-zero without printing it again.
+#[derive(Debug)]
+pub struct Reported;
+
+impl Display for Reported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("reported to sshunnel route")
+    }
+}
+
+impl std::error::Error for Reported {}
 
 /// The helper serves only the user it acts for: the one who ran sudo, or without sudo its own user
 /// (root, who could do all of this anyway).
@@ -273,12 +290,14 @@ async fn connect_client(socket: &Path, uid: u32) -> Res<UnixStream> {
     Ok(conn)
 }
 
-/// SIGINT, SIGTERM and SIGHUP, which the helper treats like its socket closing: a Ctrl-C reaches it
-/// through sudo too, and it must still delete its pins.
-struct Signals([Signal; 3]);
+/// SIGINT, SIGTERM and SIGHUP, the ways a terminal or a service manager asks sshunnel to stop. The
+/// helper treats them like its socket closing: a Ctrl-C reaches it through sudo too, and it must
+/// still delete its pins. `sshunnel route` tears down on them.
+pub(crate) struct Signals([Signal; 3]);
 
 impl Signals {
-    fn new() -> Res<Self> {
+    /// Handles the signals from now on, in place of their default (killing the process).
+    pub(crate) fn new() -> Res<Self> {
         let handle = |kind: SignalKind, name: &str| signal(kind).with_context(|| format!("handling {name}"));
         Ok(Self([
             handle(SignalKind::interrupt(), "SIGINT")?,
@@ -287,7 +306,8 @@ impl Signals {
         ]))
     }
 
-    async fn recv(&mut self) {
+    /// Resolves at the next signal, or at once for one that arrived since the last call.
+    pub(crate) async fn recv(&mut self) {
         let [interrupt, terminate, hangup] = &mut self.0;
         tokio::select! {
             _ = interrupt.recv() => {}
@@ -803,7 +823,28 @@ mod tests {
         let Reply::Failed { error } = reply else { panic!("a full tunnel was set up") };
         assert!(error.contains("'0.0.0.0/0'"), "{error}");
         assert!(fd.is_none());
-        assert!(helper.await.unwrap().is_err());
+        // The client prints the refusal; the helper's own error says it was delivered.
+        assert!(helper.await.unwrap().unwrap_err().is::<Reported>());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_client_never_got_is_the_helpers_to_report() {
+        let root = TempDir::new().unwrap();
+        let (listener, helper) = serving(&root);
+        let full_tunnel = Setup {
+            include: strings(&["0.0.0.0/0"]),
+            exclude: Vec::new(),
+            pins: Vec::new(),
+        };
+
+        // The client sends its setup and is gone before the helper (on this thread) can answer.
+        let (mut client, _) = listener.accept().await.unwrap();
+        client.write_all(&encode(&full_tunnel).unwrap()).await.unwrap();
+        drop(client);
+
+        let error = helper.await.unwrap().unwrap_err();
+        assert!(!error.is::<Reported>(), "{error:#}");
+        assert!(format!("{error:#}").contains("'0.0.0.0/0'"), "{error:#}");
     }
 
     #[tokio::test]

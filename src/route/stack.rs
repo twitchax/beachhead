@@ -64,8 +64,8 @@ const BACKLOG: usize = 64;
 const BATCH: usize = 64;
 /// Passes per wake before the stack yields to other tasks.
 const PASSES: usize = 4;
-/// The DNS server's port on [`DNS_ADDR`].
-const DNS_PORT: u16 = 53;
+/// The DNS server's port on [`DNS_ADDR`], and the upstreams' it forwards to.
+pub(crate) const DNS_PORT: u16 = 53;
 /// The most an ICMP error may total, quoting as much of its packet as fits (RFC 1812).
 const ICMP4_MAX: usize = 576;
 /// The same for IPv6 (RFC 4443): the minimum IPv6 MTU.

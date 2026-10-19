@@ -1,13 +1,18 @@
 //! `sshunnel route`: a userspace VPN for chosen targets. [`targets`] holds the pure parts (parsing,
-//! matching, refusals) that the client and the root helper both run, so they cannot disagree.
+//! matching, refusals) that the client and the root helper both run, so they cannot disagree; `run`
+//! (Linux only) is the command from start to exit.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use ipnet::{Ipv4Net, Ipv6Net};
 
+#[cfg(target_os = "linux")]
+mod device;
 pub mod dns;
 #[cfg(target_os = "linux")]
 pub mod helper;
+#[cfg(target_os = "linux")]
+mod lifecycle;
 pub mod names;
 #[cfg(target_os = "linux")]
 pub mod peers;
@@ -16,6 +21,9 @@ pub mod stack;
 #[cfg(target_os = "linux")]
 pub mod system;
 pub mod targets;
+
+#[cfg(target_os = "linux")]
+pub use lifecycle::{Options, run};
 
 /// The TUN device's name.
 pub const DEVICE: &str = "sshunnel0";

@@ -6,9 +6,9 @@
 
 A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 
-> **Status: milestone 1.** sshunnel forwards TCP ports (the way `ssh -L` does) through a relay it
-> installs on the remote by itself. Routing a whole subnet over a TUN device comes next, then DNS
-> interception.
+> **Status: milestone 2, in progress.** sshunnel forwards TCP ports (the way `ssh -L` does) and, on
+> Linux, routes subnets and domain names over a TUN device (`sshunnel route`), through a relay it
+> installs on the remote by itself. UDP and ICMP come later.
 
 ## Why
 
@@ -84,6 +84,87 @@ Options:
   -h, --help               Print help
 ```
 
+### Routing subnets and names (Linux)
+
+```text
+$ sshunnel route jump.corp.example 10.99.0.0/16 '*.corp.example' -x 10.99.7.0/24
+sshunnel: relay x86_64 604223ed029f cached in /home/me/.cache/sshunnel
+[sudo] password for me:
+sshunnel: routing 10.99.0.0/16, *.corp.example (except 10.99.7.0/24) through jump.corp.example on sshunnel0
+```
+
+TCP to every address in a CIDR target, and to every name a domain pattern matches, now goes through
+the relay, which dials it on the remote; everything else keeps the machine's normal routes and DNS.
+`*.corp.example` matches `corp.example` and every name under it, and `wiki.corp.example` matches
+that name only. The most specific target wins, and an exclude (`-x`) wins a tie. CIDR excludes
+carve CIDR targets and name excludes carve patterns; they never cross, so a pattern routes a name
+whatever address it has on the remote.
+
+Names resolve on the remote. The relay looks each one up with the remote's own resolver, and a name
+that exists there gets a stable fake address from `198.18.0.0/15`, remembered in
+`~/.local/state/sshunnel/names`; one that doesn't is NXDOMAIN here too. Connections refused or
+unreachable on the remote look the same to the app.
+
+Before ssh even starts, `route` refuses `0.0.0.0/0` and `::/0`, a bare `*`, a target equal to or
+inside a directly connected subnet (a broader one is allowed, and the connected part stays local,
+with a warning), and a target equal to or inside `198.18.0.0/15`, reporting every problem at once.
+
+```text
+$ sshunnel route --help
+Route CIDRs and domain patterns through a relay on DESTINATION, over a TUN device (Linux)
+
+Usage: sshunnel route [OPTIONS] <DESTINATION> <TARGET>...
+
+Arguments:
+  <DESTINATION>  Where to run the relay, exactly as you'd pass it to ssh (config aliases work)
+  <TARGET>...    What to route: CIDRs (`10.99.0.0/16`, `fd99::/64`) and domain patterns (`*.corp.example`, `host.corp.example`)
+
+Options:
+  -x, --exclude <TARGET>   Carve a CIDR or a name out of the targets (repeatable)
+      --ssh-cmd <COMMAND>  The ssh program and its leading arguments, split like a shell would [env: SSHUNNEL_SSH=] [default: ssh]
+      --relay-dir <DIR>    Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay) [env: SSHUNNEL_RELAY_DIR=]
+  -h, --help               Print help
+```
+
+**Privileges.** ssh runs as you. Once the session is up, `route` starts a small root helper through
+`sudo` (or directly, when already root) that creates `sshunnel0`, adds its addresses and routes, and
+configures systemd-resolved for it, then hands the device back and waits for `route` to exit. The
+helper trusts nothing it is sent: it re-checks every target as root and does a fixed set of things
+to its own device. To skip the password prompt, install sshunnel where only root can write, check
+that, and allow the helper alone:
+
+```bash
+sudo install -o root -g root -m 0755 target/dist/sshunnel /usr/local/bin/sshunnel
+namei -l /usr/local/bin/sshunnel          # every line root-owned and writable by root alone
+sudo visudo -f /etc/sudoers.d/sshunnel    # add the line below, with your user name
+```
+
+```text
+me ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *
+```
+
+sudo runs the helper by the binary's real path (symlinks resolved), so that is the path the line
+names. **Never point a `NOPASSWD` line at a binary you can write:** whoever can write it is root,
+since sudo runs whatever they put there. The line lets anything running as you start the helper, so
+it grants exactly what `route` allows: route any range except the default route (`0.0.0.0/0`,
+`::/0`) through `sshunnel0`, keep addresses inside those ranges on their current route, and send
+the matching domains' queries to sshunnel while the device exists. `0.0.0.0/1` plus `128.0.0.0/1`
+is a deliberate full tunnel; the `/0` refusal guards against accidents and is not a security
+boundary.
+
+**systemd-resolved.** Domain patterns need systemd-resolved, and the system has to actually ask it:
+`/etc/resolv.conf` points at its stub (`127.0.0.53`), or `nss-resolve` is on the `hosts:` line of
+`/etc/nsswitch.conf`. Otherwise a run with any pattern fails, CIDR targets included, rather than
+half-working. sshunnel sets only its own link's DNS: a `~domain` routing domain per pattern and no
+default route, so resolved hands it the queries under those domains and nothing else.
+
+**What it leaves behind: nothing.** Ctrl-C, SIGTERM, the session ending and the helper dying all
+end the run. The device takes its addresses, routes and resolver config with it, and the helper
+deletes its pinned routes (the host routes that keep ssh's peer and your DNS servers off the device
+when a target covers them) before `route` returns. Only a SIGKILL of the helper itself can leave a
+pinned route; the next start sweeps it, or `sudo ip route flush proto 222` and
+`sudo ip -6 route flush proto 222` remove it by hand.
+
 ## Performance
 
 `cargo xtask bench` runs both through the same throwaway sshd on loopback (512 MiB per transfer,
@@ -111,6 +192,17 @@ in the [bench log](.prds/PRD-0002.log.md)).
   don't.
 - The memfd fallback is defeated by `vm.memfd_noexec=2` (Linux 6.3+).
 - There are no reverse (`-R`) forwards yet, and a dropped session isn't re-established.
+- `route` carries TCP only; UDP and ICMP to a routed address get ICMP administratively prohibited.
+  One `route` runs at a time.
+- Apps that resolve names themselves bypass domain patterns: a browser using DNS over HTTPS never
+  asks the system resolver. CIDR targets still catch their traffic.
+- Fake addresses only mean something while `route` runs. Answers carry a 5-second TTL, so a cached
+  one fades soon after an exit.
+- `route` adds its routes to the main table and no `ip rule` of its own. Another tool's policy
+  routing (Tailscale's subnet routes, say) can still win a target; `route` warns, naming the
+  device that won, and leaves it be.
+- A target containing `198.18.0.0/15` (such as `128.0.0.0/1`) leaves that range to sshunnel's fake
+  addresses, with a warning.
 
 ## Install
 

@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use sshunnel_mux::base::Res;
 use tokio::time::timeout;
 
-use crate::{route::system::upstream_dns, session::SshCommand};
+use crate::session::SshCommand;
 
 /// How long `ssh -O check` may take; a hung ssh must not stall startup.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -153,25 +153,27 @@ fn parse_master_pid(stderr: &str) -> Option<u32> {
     digits.trim().parse().ok()
 }
 
-/// Every address the machine depends on: the peers of ssh's process tree and of a control master's,
-/// then the upstream DNS servers; and a warning for each thing that looks wrong.
+/// Every address the machine depends on: the peers of ssh's process tree (`ssh_pid`, `None` once
+/// ssh has exited) and of a control master's, then the upstream DNS servers `dns`; and a warning
+/// for each thing that looks wrong. The caller reads `dns` once, so the pins and the DNS server's
+/// forwarder agree.
 ///
 /// # Errors
 ///
-/// Fails when `/proc` or the resolver config can't be read.
-pub async fn pins(ssh: &SshCommand, destination: &str, ssh_pid: u32) -> Res<(Vec<IpAddr>, Vec<String>)> {
-    pins_with(ssh, destination, ssh_pid, upstream_dns().context("reading the upstream DNS servers")?).await
-}
-
-/// [`pins`] with the DNS servers given, so tests need no resolver config.
-async fn pins_with(ssh: &SshCommand, destination: &str, ssh_pid: u32, dns: Vec<IpAddr>) -> Res<(Vec<IpAddr>, Vec<String>)> {
-    let mut pids = process_tree(ssh_pid).context("finding ssh's process tree")?;
+/// Fails when `/proc` can't be read.
+pub async fn pins(ssh: &SshCommand, destination: &str, ssh_pid: Option<u32>, dns: &[IpAddr]) -> Res<(Vec<IpAddr>, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let mut pids = if let Some(pid) = ssh_pid {
+        process_tree(pid).context("finding ssh's process tree")?
+    } else {
+        warnings.push("ssh had already exited, so its TCP peers were not looked up".to_owned());
+        Vec::new()
+    };
     if let Some(master) = control_master(ssh, destination).await {
         pids.extend(process_tree(master).context("finding the control master's process tree")?);
     }
 
     let mut addrs = tcp_peers(&pids).context("reading ssh's TCP peers")?;
-    let mut warnings = Vec::new();
     if addrs.is_empty() {
         warnings.push("found no TCP peer of ssh to keep on its normal route; if the target covers its address, the session will loop".to_owned());
     }
@@ -278,7 +280,7 @@ mod tests {
         // Not ssh: any process holding a socket will do, and `true` never finds a control master.
         let ssh = SshCommand::parse("true").unwrap();
 
-        let (addrs, warnings) = pins_with(&ssh, "corp.example", std::process::id(), dns).await.unwrap();
+        let (addrs, warnings) = pins(&ssh, "corp.example", Some(std::process::id()), &dns).await.unwrap();
 
         assert_eq!(addrs, vec!["127.0.0.1".parse::<IpAddr>().unwrap(), "192.0.2.53".parse().unwrap()]);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -288,7 +290,7 @@ mod tests {
     async fn pins_warn_when_no_peer_is_found() {
         let ssh = SshCommand::parse("true").unwrap();
 
-        let (addrs, warnings) = pins_with(&ssh, "corp.example", u32::MAX, vec!["192.0.2.53".parse().unwrap()]).await.unwrap();
+        let (addrs, warnings) = pins(&ssh, "corp.example", Some(u32::MAX), &["192.0.2.53".parse().unwrap()]).await.unwrap();
 
         assert_eq!(addrs, vec!["192.0.2.53".parse::<IpAddr>().unwrap()]);
         assert_eq!(warnings.len(), 1);
@@ -325,16 +327,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let with_master = fake_ssh(&dir, &format!("Master running (pid={})", std::process::id()), 0);
 
-        let (addrs, warnings) = pins_with(&with_master, "corp.example", ssh_proc.id(), Vec::new()).await.unwrap();
+        let (addrs, warnings) = pins(&with_master, "corp.example", Some(ssh_proc.id()), &[]).await.unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let without = fake_ssh(&dir, "Control socket connect: No such file", 255);
-        let (alone, _) = pins_with(&without, "corp.example", ssh_proc.id(), Vec::new()).await.unwrap();
+        let (alone, _) = pins(&without, "corp.example", Some(ssh_proc.id()), &[]).await.unwrap();
         ssh_proc.kill().unwrap();
         ssh_proc.wait().unwrap();
 
         assert_eq!(addrs, vec![server.ip()]);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(alone, Vec::<IpAddr>::new(), "only the master's tree holds the connection");
+    }
+
+    #[tokio::test]
+    async fn pins_without_ssh_still_cover_the_master_and_dns() {
+        let server = echo_server().await.unwrap();
+        let _conn = TcpStream::connect(server).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let with_master = fake_ssh(&dir, &format!("Master running (pid={})", std::process::id()), 0);
+        let dns: Vec<IpAddr> = vec!["192.0.2.53".parse().unwrap()];
+
+        let (addrs, warnings) = pins(&with_master, "corp.example", None, &dns).await.unwrap();
+
+        assert_eq!(addrs, vec![server.ip(), "192.0.2.53".parse().unwrap()]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("ssh had already exited"), "{warnings:?}");
     }
 }

@@ -166,6 +166,12 @@ impl Session {
         &self.bootstrap
     }
 
+    /// The relay and how it started, for a status line: `relay x86_64 604223ed029f cached in ...`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!("relay {} {} {}", self.relay.arch(), &self.relay.sha256()[..12], self.bootstrap)
+    }
+
     /// Resolves when the connection ends, then stops ssh.
     ///
     /// # Errors
