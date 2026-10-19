@@ -308,9 +308,19 @@ impl Signals {
     }
 
     /// As [`Self::new`], but a SIGHUP ignored at startup stays ignored: handling it would undo
-    /// `nohup`.
+    /// `nohup`. When that can't be read, SIGHUP is handled.
     pub(crate) fn respecting_nohup() -> Res<Self> {
-        Self::handling(!system::sighup_ignored()?)
+        Self::respecting(system::sighup_ignored())
+    }
+
+    /// [`Self::respecting_nohup`] with what reading SIGHUP's disposition found. Failing to read it
+    /// fails safe: handled, a hangup still tears down in order, and the run goes on.
+    fn respecting(ignored: Res<bool>) -> Res<Self> {
+        let ignored = ignored.unwrap_or_else(|e| {
+            tracing::debug!("handling SIGHUP, since whether it was ignored is unknown: {e:#}");
+            false
+        });
+        Self::handling(!ignored)
     }
 
     fn handling(hangup: bool) -> Res<Self> {
@@ -901,6 +911,15 @@ mod tests {
 
         assert!(serve_with(&socket, getuid().as_raw() + 1).await.is_err());
         assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock, "the helper connected to another user's socket");
+    }
+
+    #[tokio::test]
+    async fn sighup_is_handled_unless_it_was_ignored() {
+        assert!(Signals::respecting(Ok(true)).unwrap().hangup.is_none(), "handling SIGHUP would undo nohup");
+        assert!(Signals::respecting(Ok(false)).unwrap().hangup.is_some());
+        // An unreadable or unparseable /proc/self/status must not stop a run: handle it, as before.
+        let unknown = Signals::respecting(Err(anyhow!("/proc/self/status has no SigIgn mask")));
+        assert!(unknown.unwrap().hangup.is_some());
     }
 
     #[tokio::test]
