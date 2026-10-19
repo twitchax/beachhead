@@ -293,4 +293,48 @@ mod tests {
         assert_eq!(addrs, vec!["192.0.2.53".parse::<IpAddr>().unwrap()]);
         assert_eq!(warnings.len(), 1);
     }
+
+    /// An executable stand-in for ssh that prints `stderr` to stderr and exits with `code`.
+    fn fake_ssh(dir: &tempfile::TempDir, stderr: &str, code: i32) -> SshCommand {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.path().join("ssh");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{stderr}' >&2\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SshCommand::parse(path.to_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn control_master_reads_the_pid_ssh_reports() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let found = control_master(&fake_ssh(&dir, "Master running (pid=4242)", 0), "corp.example").await;
+        assert_eq!(found, Some(4242));
+
+        let dir = tempfile::tempdir().unwrap();
+        let failed = control_master(&fake_ssh(&dir, "Master running (pid=4242)", 255), "corp.example").await;
+        assert_eq!(failed, None, "a non-zero exit means no master");
+    }
+
+    #[tokio::test]
+    async fn pins_merge_in_the_control_masters_peers() {
+        let server = echo_server().await.unwrap();
+        // The master is this process: it holds the connection. ssh itself is a bare `sleep`.
+        let _conn = TcpStream::connect(server).await.unwrap();
+        let mut ssh_proc = Command::new("sleep").arg("30").spawn().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let with_master = fake_ssh(&dir, &format!("Master running (pid={})", std::process::id()), 0);
+
+        let (addrs, warnings) = pins_with(&with_master, "corp.example", ssh_proc.id(), Vec::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let without = fake_ssh(&dir, "Control socket connect: No such file", 255);
+        let (alone, _) = pins_with(&without, "corp.example", ssh_proc.id(), Vec::new()).await.unwrap();
+        ssh_proc.kill().unwrap();
+        ssh_proc.wait().unwrap();
+
+        assert_eq!(addrs, vec![server.ip()]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(alone, Vec::<IpAddr>::new(), "only the master's tree holds the connection");
+    }
 }
