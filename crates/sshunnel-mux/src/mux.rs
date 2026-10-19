@@ -131,6 +131,13 @@ impl OpenError {
     }
 }
 
+/// How an open in flight failed. A peer's refusal already names its target (the relay's reasons
+/// say `dialing host:port`); a local failure doesn't, so [`Mux::open`] adds the target to those.
+enum Refusal {
+    Peer(OpenError),
+    Local(String),
+}
+
 /// Why [`Mux::resolve`] failed: the peer's typed answer, or a local failure (kind
 /// [`ResolveErrKind::Failed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,9 +196,12 @@ impl Mux {
 
         match opened_rx.await {
             Ok(Ok(())) => Ok(stream),
-            Ok(Err(e)) => {
+            Ok(Err(refusal)) => {
                 stream.state = State::Finished;
-                Err(e)
+                Err(match refusal {
+                    Refusal::Peer(e) => e,
+                    Refusal::Local(reason) => OpenError::other(format!("{host}:{port}: {reason}")),
+                })
             }
             Err(_) => {
                 stream.state = State::Finished;
@@ -416,7 +426,7 @@ struct Entry {
     /// Wakes a pump whose download is done but whose upload is parked on a local read that the
     /// reset will never end.
     reset: Arc<Notify>,
-    opened: Option<oneshot::Sender<Result<(), OpenError>>>,
+    opened: Option<oneshot::Sender<Result<(), Refusal>>>,
 }
 
 impl Entry {
@@ -424,7 +434,7 @@ impl Entry {
         self.credit.close();
         self.reset.notify_one();
         if let Some(opened) = self.opened.take() {
-            let _ = opened.send(Err(OpenError::other(reason)));
+            let _ = opened.send(Err(Refusal::Local(reason.to_owned())));
         }
         let _ = self.inbound.send(Inbound::Reset(reason.to_owned()));
     }
@@ -437,7 +447,7 @@ impl Shared {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn insert(self: &Arc<Self>, table: &mut Table, id: StreamId, state: State, opened: Option<oneshot::Sender<Result<(), OpenError>>>) -> Stream {
+    fn insert(self: &Arc<Self>, table: &mut Table, id: StreamId, state: State, opened: Option<oneshot::Sender<Result<(), Refusal>>>) -> Stream {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let credit = Arc::new(Semaphore::new(self.peer_window as usize));
         let outstanding = Arc::new(AtomicU32::new(0));
@@ -482,7 +492,7 @@ impl Shared {
                 let entry = self.table().streams.remove(&stream);
                 if let Some(mut entry) = entry {
                     if let Some(opened) = entry.opened.take() {
-                        let _ = opened.send(Err(OpenError { kind, reason: reason.clone() }));
+                        let _ = opened.send(Err(Refusal::Peer(OpenError { kind, reason: reason.clone() })));
                     }
                     entry.abort(&reason);
                 }

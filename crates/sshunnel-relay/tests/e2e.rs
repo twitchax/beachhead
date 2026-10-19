@@ -117,7 +117,7 @@ async fn e2e_stdio_reports_a_refused_dial_with_its_kind() {
 }
 
 #[tokio::test]
-async fn relay_answers_a_resolve() {
+async fn e2e_stdio_answers_a_resolve() {
     let (mux, _child) = connect().await;
     timeout(Duration::from_secs(30), mux.resolve("localhost")).await.unwrap().unwrap();
     let err = timeout(Duration::from_secs(30), mux.resolve("nonexistent.invalid")).await.unwrap().unwrap_err();

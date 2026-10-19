@@ -52,15 +52,15 @@ remote**:
 ```text
 $ sshunnel relays
 relays (embedded):
-  x86_64   sha256 6737b9bb80436f97d393ad8b071b4da29c6583620714c16bfe1fb7c9f7ce1856  616144 bytes
-  aarch64  sha256 db86037d6fa899005278cc8c590d0f2e762cc77e9e454589d9ea5362edbfe403  555984 bytes
+  x86_64   sha256 604223ed029fe70992b2d61cbe9346c823c45b1aa8914d9dc369d034146ef886  618032 bytes
+  aarch64  sha256 8e945bdc13c0a21ad98c41d6fd3e9da84b6ae086780fb1d01f94853029d5ed0b  557744 bytes
 ```
 
 ## Usage
 
 ```text
 $ sshunnel forward -L 8080:server.lan:80 server
-sshunnel: relay x86_64 6737b9bb8043 pushed to /home/me/.cache/sshunnel
+sshunnel: relay x86_64 604223ed029f pushed to /home/me/.cache/sshunnel
 sshunnel: forwarding 127.0.0.1:8080 -> server.lan:80
 sshunnel: forwarding [::1]:8080 -> server.lan:80
 ```

@@ -3,7 +3,7 @@
 //! stdout carries frames and nothing else; anything human-readable goes to stderr, which ssh hands
 //! back to the client's terminal.
 
-use std::{ffi::CString, io::ErrorKind, ptr};
+use std::{ffi::CString, io::ErrorKind, ptr, sync::Arc};
 
 use anyhow::Context as _;
 use bytes::BytesMut;
@@ -14,7 +14,11 @@ use sshunnel_mux::{
     hello::{recv_hello, send_hello},
     pump, start,
 };
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, sync::Semaphore};
+
+/// How many lookups may block at once. Stdio reads and writes share tokio's blocking pool with
+/// `getaddrinfo`, so a slow resolver must not be able to take every thread and stall the pipe.
+const MAX_LOOKUPS: usize = 32;
 
 /// What `--probe` prints: proof the binary executes here, which a `noexec` mount would deny.
 #[must_use]
@@ -48,13 +52,14 @@ pub fn run_stdio() -> Void {
 
 /// Serves each request the client makes: dial a host, or resolve a name.
 pub async fn serve(mut incoming: Incoming) {
+    let lookups = Arc::new(Semaphore::new(MAX_LOOKUPS));
     while let Some(request) = incoming.next().await {
         match request {
             Request::Open(request) => {
                 tokio::spawn(dial(request));
             }
             Request::Resolve(request) => {
-                tokio::spawn(resolve(request));
+                tokio::spawn(resolve(request, Arc::clone(&lookups)));
             }
         }
     }
@@ -86,16 +91,21 @@ pub fn open_err_kind(e: &std::io::Error) -> OpenErrKind {
     }
 }
 
-async fn resolve(request: ResolveRequest) {
+async fn resolve(request: ResolveRequest, permits: Arc<Semaphore>) {
     let host = request.host().to_owned();
+    request.answer(bounded_lookup(&permits, move || lookup(&host)).await);
+}
+
+/// Runs `lookup` on the blocking pool once a permit is free. Waiting happens here, in the
+/// request's own task, never in the serve loop.
+async fn bounded_lookup<F>(permits: &Semaphore, lookup: F) -> Result<(), ResolveError>
+where
+    F: FnOnce() -> Result<(), ResolveError> + Send + 'static,
+{
+    let failed = |reason: String| ResolveError { kind: ResolveErrKind::Failed, reason };
+    let _permit = permits.acquire().await.map_err(|e| failed(format!("the lookup limiter closed: {e}")))?;
     // getaddrinfo blocks, and may for seconds on a slow resolver.
-    let result = tokio::task::spawn_blocking(move || lookup(&host)).await.unwrap_or_else(|e| {
-        Err(ResolveError {
-            kind: ResolveErrKind::Failed,
-            reason: format!("the lookup task failed: {e}"),
-        })
-    });
-    request.answer(result);
+    tokio::task::spawn_blocking(lookup).await.unwrap_or_else(|e| Err(failed(format!("the lookup task failed: {e}"))))
 }
 
 /// Resolves `host` with the platform resolver (musl's `getaddrinfo` in the shipped relay), which
@@ -165,6 +175,43 @@ mod unit {
         assert_eq!(kind(ErrorKind::NetworkUnreachable), OpenErrKind::Unreachable);
         assert_eq!(kind(ErrorKind::TimedOut), OpenErrKind::TimedOut);
         assert_eq!(kind(ErrorKind::PermissionDenied), OpenErrKind::Other);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn permits_bound_concurrent_lookups() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let permits = Arc::new(Semaphore::new(2));
+        let open = Arc::new(AtomicBool::new(false));
+        let (running, peak, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let (permits, open, running, peak, done) = (Arc::clone(&permits), Arc::clone(&open), Arc::clone(&running), Arc::clone(&peak), Arc::clone(&done));
+            tasks.push(tokio::spawn(async move {
+                bounded_lookup(&permits, move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    while !open.load(Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    done.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        // Two lookups hold permits and wait on the gate; the other four must be parked on permits.
+        while running.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(permits.available_permits(), 0);
+        open.store(true, Ordering::SeqCst);
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 6);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 
     #[test]

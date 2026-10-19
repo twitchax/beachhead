@@ -561,6 +561,17 @@ async fn a_resolve_with_a_stale_id_is_reset() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_reset_fails_a_pending_resolve() {
+    let (client, _incoming, mut peer) = client_with_hand_peer();
+    let resolver = tokio::spawn(async move { client.resolve("x").await });
+    let Frame::Resolve { stream, .. } = peer.next().await else { panic!("expected Resolve") };
+    peer.send(Frame::Rst { stream, reason: "bad id".into() }).await;
+    let err = resolver.await.unwrap().unwrap_err();
+    assert_eq!(err.kind, ResolveErrKind::Failed);
+    assert_eq!(err.reason, "bad id");
+}
+
+#[tokio::test(start_paused = true)]
 async fn teardown_fails_a_pending_resolve() {
     let (client, _incoming, mut peer) = client_with_hand_peer();
     let resolver = tokio::spawn(async move { client.resolve("x").await });
@@ -598,7 +609,9 @@ async fn a_teardown_fails_an_open_in_flight() {
     assert!(matches!(peer.next().await, Frame::Open { .. }));
     drop(peer);
     let result = timeout(Duration::from_secs(10), opener).await.expect("the open fails rather than waiting forever").unwrap();
-    assert!(format!("{:#}", result.unwrap_err()).contains("closed"));
+    let err = result.unwrap_err();
+    assert_eq!(err.kind, OpenErrKind::Other);
+    assert!(err.reason.starts_with("x:7: ") && err.reason.contains("closed"), "{err}");
 }
 
 #[tokio::test]
