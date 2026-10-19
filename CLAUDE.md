@@ -63,7 +63,10 @@ cargo xtask bench    # sshunnel -L vs ssh -L through a throwaway sshd (not part 
 - **Errors:** `anyhow` through the `Res` / `Void` aliases, with `.context()` on every `?` that crosses an I/O or parse boundary.
 - **Tests:** unit tests in-module, integration and e2e in `tests/` (one subsystem per file, `e2e_*`
   names for tests that spawn the binary), fixtures from the `tests` factory module. Every
-  behavioral change ships a test.
+  behavioral change ships a test. A test that needs a TUN device or routes opens with
+  `if !netns("<its name>").unwrap() { return; }`: `tests::netns` runs it again as root over
+  throwaway namespaces, in a privileged Docker container where Ubuntu restricts user namespaces
+  (`SSHUNNEL_NETNS=docker` forces that), and `RemoteNs` is the remote's network.
 - **PRDs** live in `.prds/`; reference task IDs in commits, and never mark a UAT verified without a
   real, passing test.
 - **No AI attribution** anywhere: no `Co-Authored-By` trailers, session links or "generated with"

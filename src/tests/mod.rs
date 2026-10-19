@@ -3,29 +3,51 @@
 //! dependencies.
 
 use std::{
+    ffi::OsStr,
     fmt::Write as _,
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::{ExitStatus, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context as _, bail};
-use tokio::{io::AsyncWriteExt as _, net::TcpListener};
+use tokio::{
+    io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+    net::{TcpListener, TcpStream},
+    process::{Child, Command},
+    sync::watch,
+    task::JoinHandle,
+    time::timeout,
+};
 
 use crate::{arch::Arch, base::Res, session::SshCommand};
 
 mod app;
+#[cfg(target_os = "linux")]
+mod netns;
 mod tunnel;
 
 pub use app::{AppConn, AppStack, Connect, Icmp, Sent};
+#[cfg(target_os = "linux")]
+pub use netns::{RemoteNs, netns};
 pub use tunnel::{FakeConn, FakeTunnel, Gate};
 
 /// A stand-in for a remote machine: a fake `ssh` that ignores its options and destination and runs
 /// the remote command here, through a chosen login shell, with `HOME` and every cache candidate
-/// except `/dev/shm` inside `root`. That covers push, exec and cache with no sshd.
+/// except `/dev/shm` inside `root`. That covers push, exec and cache with no sshd. The builders give
+/// the remote side namespaces of its own: a network ([`Self::in_netns`]) or an `/etc/hosts`
+/// ([`Self::with_hosts`]).
 #[derive(Clone, Debug)]
 pub struct FakeRemote {
     root: PathBuf,
     ssh: PathBuf,
+    login_shell: String,
+    exports: String,
+    /// What runs the login shell, word by word: the namespaces to enter first.
+    wrapper: Vec<String>,
+    /// The pid `ssh -O check` reports for a shared-connection master.
+    master: Option<u32>,
 }
 
 impl FakeRemote {
@@ -36,30 +58,92 @@ impl FakeRemote {
     ///
     /// Fails when `root` can't be written or a path would break the script's quoting.
     pub fn new(root: &Path, login_shell: &str, env: &[(&str, &str)]) -> Res<Self> {
-        let home = root.join("home");
-        std::fs::create_dir_all(&home).context("creating the fake home")?;
+        std::fs::create_dir_all(root.join("home")).context("creating the fake home")?;
         std::fs::create_dir_all(root.join("tmp")).context("creating the fake TMPDIR")?;
         let mut exports = String::new();
         for (key, value) in env {
             // Writing to a String can't fail.
             let _ = writeln!(exports, "export {key}={}", quote(value)?);
         }
+        let remote = Self {
+            root: root.to_owned(),
+            ssh: root.join("fake-ssh"),
+            login_shell: login_shell.to_owned(),
+            exports,
+            wrapper: Vec::new(),
+            master: None,
+        };
+        remote.write()?;
+        Ok(remote)
+    }
+
+    /// Runs the remote side in `ns`, the remote's network.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the fake `ssh` can't be rewritten.
+    #[cfg(target_os = "linux")]
+    pub fn in_netns(mut self, ns: &RemoteNs) -> Res<Self> {
+        self.wrapper.push(ns.nsenter());
+        self.write()?;
+        Ok(self)
+    }
+
+    /// Runs the remote side with `hosts` as its `/etc/hosts`, bind-mounted in a mount namespace of
+    /// its own (`unshare -m`, so as root). Its `/etc/nsswitch.conf` names that file alone: the
+    /// remote is this machine, whose resolver `route` may be sending back to the relay.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the files can't be written or a path would break the script's quoting.
+    pub fn with_hosts(mut self, hosts: &str) -> Res<Self> {
+        let hosts_file = self.root.join("hosts");
+        let nsswitch = self.root.join("nsswitch.conf");
+        std::fs::write(&hosts_file, hosts).context("writing the remote's hosts file")?;
+        std::fs::write(&nsswitch, "hosts: files\n").context("writing the remote's nsswitch.conf")?;
+        self.wrapper.push(format!(
+            "unshare -m sh -c {} sh {} {}",
+            quote(r#"mount --bind "$1" /etc/hosts && mount --bind "$2" /etc/nsswitch.conf && shift 2 && exec "$@""#)?,
+            quote(&hosts_file.to_string_lossy())?,
+            quote(&nsswitch.to_string_lossy())?,
+        ));
+        self.write()?;
+        Ok(self)
+    }
+
+    /// Answers `ssh -O check` as a shared-connection master with pid `pid` does, rather than
+    /// running a remote command.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the fake `ssh` can't be rewritten.
+    pub fn with_master(mut self, pid: u32) -> Res<Self> {
+        self.master = Some(pid);
+        self.write()?;
+        Ok(self)
+    }
+
+    fn write(&self) -> Res<()> {
+        let check = self.master.map_or_else(String::new, |pid| {
+            format!("if [ \"$1\" = -O ] && [ \"$2\" = check ]; then echo 'Master running (pid={pid})' >&2; exit 0; fi\n")
+        });
+        let shell = self.wrapper.iter().chain([&self.login_shell]).map(String::as_str).collect::<Vec<_>>().join(" ");
         let script = format!(
             "#!/bin/sh\n\
              # A fake ssh: drop the options and the destination, run the remote command here.\n\
+             {check}\
              for a do last=$a; done\n\
              printf '%s\\n' \"$@\" > {args}\n\
              unset XDG_CACHE_HOME XDG_RUNTIME_DIR BASH_ENV ENV\n\
              export HOME={home} TMPDIR={tmp}\n\
              {exports}\
-             exec {login_shell} -c \"$last\"\n",
-            args = quote(&root.join("ssh-args").to_string_lossy())?,
-            home = quote(&home.to_string_lossy())?,
-            tmp = quote(&root.join("tmp").to_string_lossy())?,
+             exec {shell} -c \"$last\"\n",
+            args = quote(&self.root.join("ssh-args").to_string_lossy())?,
+            home = quote(&self.home().to_string_lossy())?,
+            tmp = quote(&self.root.join("tmp").to_string_lossy())?,
+            exports = self.exports,
         );
-        let ssh = root.join("fake-ssh");
-        write_executable(&ssh, &script)?;
-        Ok(Self { root: root.to_owned(), ssh })
+        write_executable(&self.ssh, &script)
     }
 
     /// The `--ssh-cmd` that reaches this remote.
@@ -234,6 +318,16 @@ pub fn path_with(root: &Path, tools: &[&str]) -> Res<PathBuf> {
 /// Fails when no loopback port can be bound.
 pub async fn echo_server() -> Res<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await.context("binding the echo server")?;
+    echo_on(listener)
+}
+
+/// Echoes every connection `listener` accepts, half-closing after each, on the current runtime;
+/// returns its address.
+///
+/// # Errors
+///
+/// Fails when the listener has no address.
+pub fn echo_on(listener: TcpListener) -> Res<SocketAddr> {
     let addr = listener.local_addr().context("reading the echo server's address")?;
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -246,6 +340,121 @@ pub async fn echo_server() -> Res<SocketAddr> {
         }
     });
     Ok(addr)
+}
+
+/// Sends `data` to the echo server at `addr` and reads until it closes; returns what came back.
+///
+/// # Errors
+///
+/// Fails when the connection fails or the echo takes over 30 s.
+pub async fn round_trip(addr: SocketAddr, data: &[u8]) -> Res<Vec<u8>> {
+    let socket = TcpStream::connect(addr).await.with_context(|| format!("connecting to {addr}"))?;
+    let (mut r, mut w) = socket.into_split();
+    let sent = data.to_vec();
+    let writer = tokio::spawn(async move {
+        w.write_all(&sent).await?;
+        w.shutdown().await
+    });
+    let mut reply = Vec::new();
+    timeout(Duration::from_secs(30), r.read_to_end(&mut reply))
+        .await
+        .with_context(|| format!("the echo from {addr} didn't finish"))?
+        .with_context(|| format!("reading the echo from {addr}"))?;
+    writer.await.context("the writer panicked")?.with_context(|| format!("writing to {addr}"))?;
+    Ok(reply)
+}
+
+/// `sshunnel route` (the binary at `exe`) routing `targets` through the fake `ssh`, as a user
+/// would run it but kept to `dir`: its state and socket dirs there, and none of the variables it
+/// reads from the environment.
+#[must_use]
+pub fn route_command(exe: impl AsRef<OsStr>, dir: &Path, ssh: &Path, relays: &Path, targets: &[&str]) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .current_dir(dir)
+        .env_remove("SSHUNNEL_RELAY_DIR")
+        .env_remove("SSHUNNEL_SSH")
+        .env_remove("RUST_LOG")
+        .env("XDG_STATE_HOME", dir)
+        .env("XDG_RUNTIME_DIR", dir)
+        .arg("route")
+        .arg("--ssh-cmd")
+        .arg(ssh)
+        .arg("--relay-dir")
+        .arg(relays)
+        .arg("fake-host")
+        .args(targets);
+    command
+}
+
+/// A process whose stderr is collected line by line as it arrives, so a test can wait for a line and
+/// still show everything printed when something goes wrong. It is killed on drop.
+pub struct Watched {
+    child: Child,
+    lines: watch::Receiver<Vec<String>>,
+    reader: JoinHandle<()>,
+}
+
+impl Watched {
+    /// Spawns `command` with its stderr piped here.
+    ///
+    /// # Errors
+    ///
+    /// Fails when it can't be spawned.
+    pub fn spawn(mut command: Command) -> Res<Self> {
+        let mut child = command.stderr(Stdio::piped()).kill_on_drop(true).spawn().context("spawning the process")?;
+        let mut stderr = BufReader::new(child.stderr.take().context("the process has no stderr pipe")?).lines();
+        let (seen, lines) = watch::channel(Vec::new());
+        let reader = tokio::spawn(async move {
+            while let Ok(Some(line)) = stderr.next_line().await {
+                seen.send_modify(|lines| lines.push(line));
+            }
+        });
+        Ok(Self { child, lines, reader })
+    }
+
+    /// The process's pid.
+    ///
+    /// # Errors
+    ///
+    /// Fails once it has been waited for.
+    pub fn pid(&self) -> Res<u32> {
+        self.child.id().context("the process has exited")
+    }
+
+    /// Waits up to `within` for a stderr line starting with `prefix`, and returns it.
+    ///
+    /// # Errors
+    ///
+    /// Fails, quoting stderr, when stderr closes or time runs out first.
+    pub async fn line(&mut self, prefix: &str, within: Duration) -> Res<String> {
+        let line = match timeout(within, self.lines.wait_for(|lines| lines.iter().any(|line| line.starts_with(prefix)))).await {
+            Ok(Ok(lines)) => lines.iter().find(|line| line.starts_with(prefix)).cloned(),
+            Ok(Err(_)) | Err(_) => None,
+        };
+        line.with_context(|| format!("no line starting `{prefix}`; stderr:\n{}", self.stderr()))
+    }
+
+    /// Everything on stderr so far.
+    #[must_use]
+    pub fn stderr(&self) -> String {
+        self.lines.borrow().join("\n")
+    }
+
+    /// Waits up to `within` for the process to exit, then for its stderr to close (briefly: a
+    /// process it started may still hold it); returns the exit status and all of stderr.
+    ///
+    /// # Errors
+    ///
+    /// Fails, quoting stderr, when the process is still running after `within`.
+    pub async fn exit(mut self, within: Duration) -> Res<(ExitStatus, String)> {
+        let status = match timeout(within, self.child.wait()).await {
+            Ok(status) => status.context("waiting for the process")?,
+            Err(_) => bail!("still running after {within:?}; stderr:\n{}", self.stderr()),
+        };
+        let _ = timeout(Duration::from_secs(5), &mut self.reader).await;
+        Ok((status, self.stderr()))
+    }
 }
 
 /// Deterministic bytes that differ per `seed`, so a misrouted chunk can't compare equal.

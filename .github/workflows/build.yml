@@ -44,7 +44,19 @@ jobs:
       # The login-shell e2e tests skip a missing shell on a dev box but fail under CI.
       - name: Install login shells
         run: sudo apt-get update && sudo apt-get install -y zsh fish tcsh busybox
+      # The namespace e2e tests run under `unshare -rn`, which Ubuntu's AppArmor blocks by default;
+      # this runner is thrown away after the job.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo make ci
+      # The same suite through the Docker fallback a restricted dev box takes, so it can't rot.
+      - name: Namespace tests in Docker
+        id: route-docker
+        run: SSHUNNEL_NETNS=docker cargo nextest run --workspace --test route
+      # systemd-resolved serves only the host's namespace, so the name tests run as root on the host.
+      - name: Root tests through systemd-resolved
+        id: route-root
+        run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo nextest run --workspace --run-ignored only -E 'test(/^e2e_route_name|^e2e_resolved/)'
 
   codecov:
     name: Code coverage
@@ -64,6 +76,8 @@ jobs:
       - run: cargo binstall cargo-make cargo-nextest cargo-llvm-cov --no-confirm --force
       - name: Install login shells
         run: sudo apt-get update && sudo apt-get install -y zsh fish tcsh busybox
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo make codecov
       - uses: codecov/codecov-action@v5
         with:

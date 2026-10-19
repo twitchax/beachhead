@@ -147,13 +147,23 @@ pub fn create_tun() -> Res<OwnedFd> {
 ///
 /// # Errors
 ///
-/// Fails when the driver refuses, after closing the fd all the same.
+/// Fails when the driver refuses, after closing the fd all the same; a device deleted meanwhile has
+/// nothing to clear.
 pub fn release_tun(tun: OwnedFd) -> Void {
     // SAFETY: TUNSETPERSIST takes its argument by value, an int where 0 clears the flag, and `tun`
     // is an open fd on the device for the whole call.
     let cleared = unsafe { ioctl(&tun, IntegerSetter::<TUNSETPERSIST>::new_usize(0)) };
     drop(tun);
-    cleared.with_context(|| format!("clearing {DEVICE}'s persist flag"))
+    persist_cleared(cleared)
+}
+
+/// What clearing the persist flag came to. EBADFD means the device was deleted under the fd (`ip link
+/// del`), so it is gone and has no flag left to clear.
+fn persist_cleared(cleared: rustix::io::Result<()>) -> Void {
+    match cleared {
+        Ok(()) | Err(Errno::BADFD) => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("clearing {DEVICE}'s persist flag")),
+    }
 }
 
 /// `IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL`, the last so an existing device is EBUSY. 0x9001 overflows a
@@ -482,6 +492,16 @@ mod tests {
         // exclusive flag answers EBUSY first.
         let error = format!("{:#}", create_tun().unwrap_err());
         assert!(error.contains(DEVICE) && (error.contains("Operation not permitted") || error.contains("in use")), "{error}");
+    }
+
+    #[test]
+    fn a_deleted_device_has_no_persist_flag_to_clear() {
+        assert!(persist_cleared(Ok(())).is_ok());
+        // `ip link del sshunnel0` mid-session detaches the fd: the device and its flag are gone.
+        assert!(persist_cleared(Err(Errno::BADFD)).is_ok());
+
+        let error = format!("{:#}", persist_cleared(Err(Errno::PERM)).unwrap_err());
+        assert!(error.contains("persist flag"), "{error}");
     }
 
     #[test]

@@ -45,9 +45,12 @@ pub(crate) fn spawn(tun: OwnedFd, tasks: &mut JoinSet<Void>) -> Res<Packets> {
 /// Hands each packet the device reads to the stack, until the stack is gone.
 async fn read(device: Arc<AsyncFd<OwnedFd>>, to_stack: mpsc::Sender<Bytes>) -> Void {
     let mut buf = vec![0; usize::from(MTU)];
+    // A deleted device polls as an error alone, never as readable, so the read must wake on errors
+    // too to find out (EBADFD).
+    let readable = Interest::READABLE | Interest::ERROR;
     loop {
         let n = device
-            .async_io(Interest::READABLE, |fd| rustix::io::read(fd, &mut buf[..]).map_err(io::Error::from))
+            .async_io(readable, |fd| rustix::io::read(fd, &mut buf[..]).map_err(io::Error::from))
             .await
             .with_context(|| format!("reading from {DEVICE}"))?;
         ensure!(n > 0, "{DEVICE} closed");
@@ -119,6 +122,22 @@ mod tests {
 
         let error = tasks.join_next().await.unwrap().unwrap().unwrap_err();
         assert!(format!("{error:#}").contains(DEVICE), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_device_that_fails_ends_the_reader_with_an_error() {
+        // A deleted TUN device polls as EPOLLERR alone, and reads fail (EBADFD). So does a connected
+        // UDP socket whose datagram drew a port unreachable, its reads failing with ECONNREFUSED.
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let tun = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        tun.connect(closed).unwrap();
+        tun.send(b"anyone?").unwrap();
+        let mut tasks = JoinSet::new();
+        let _packets = spawn(tun.into(), &mut tasks).unwrap();
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), tasks.join_next()).await.expect("the failed device went unnoticed");
+        let error = ended.unwrap().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains(&format!("reading from {DEVICE}")), "{error:#}");
     }
 
     #[tokio::test]

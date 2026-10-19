@@ -231,6 +231,28 @@ cargo xtask bench    # sshunnel -L against ssh -L through a throwaway sshd
 The e2e tests play the remote with a fake `ssh` that runs the bootstrap locally through `sh`, dash,
 bash, busybox, zsh, fish or tcsh. The push, cache and noexec paths all run without an sshd.
 
+`route`'s e2e tests (`tests/route.rs`) need a real TUN device and real routes, so each one runs
+again as root over throwaway user and network namespaces (`unshare -rn`), with the remote's network
+in a second namespace across a veth pair. Nothing on the machine changes, and nothing needs sudo.
+Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; there, each test runs
+in a privileged Docker container instead (Docker without sudo, about half a second a test), built
+from your own Ubuntu release plus iproute2 as `sshunnel-netns:<codename>` on first use, with the
+checkout mounted read-only. With neither, the tests skip with a warning (under `CI`, they fail).
+`SSHUNNEL_NETNS=docker` forces the container. The alternative to Docker is lifting the restriction,
+as CI does on its throwaway runners:
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   # until reboot
+```
+
+That trades back what the restriction protects: any program you run can create user namespaces
+again, and with them reach kernel code that otherwise needs root, a common path for privilege
+escalation exploits.
+
+The name tests (`tests/route_root.rs`) go through the host's own systemd-resolved, which no test
+namespace has, so they run as root on the host and only in CI (`#[ignore]`d, through
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'`). Locally they skip.
+
 ## License
 
 MIT
