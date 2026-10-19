@@ -5,6 +5,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use ipnet::{Ipv4Net, Ipv6Net};
 
+pub mod dns;
 pub mod names;
 pub mod router;
 pub mod stack;

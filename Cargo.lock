@@ -481,6 +481,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "simple-dns"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b6f884fa9a8d48101774bfbd3aeb81e968dd22cffd19a372da69f183db22c1a"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -521,6 +530,7 @@ dependencies = [
  "pretty_assertions",
  "sha2",
  "shlex",
+ "simple-dns",
  "smoltcp",
  "sshunnel-mux",
  "tempfile",
