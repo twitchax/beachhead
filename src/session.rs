@@ -48,7 +48,8 @@ impl SshCommand {
 
 impl SshCommand {
     /// `ssh -O check <destination>` with the user's own arguments, so it sees the same config and
-    /// control path as the session. Output is piped; stdin is closed.
+    /// control path as the session. Output is piped; stdin is closed. Only `route` (Linux) asks.
+    #[cfg(target_os = "linux")]
     pub(crate) fn check_command(&self, destination: &str) -> Command {
         let mut command = Command::new(&self.program);
         command.args(&self.args).args(["-O", "check", destination]).stdin(Stdio::null()).kill_on_drop(true);

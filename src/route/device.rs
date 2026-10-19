@@ -22,7 +22,7 @@ use crate::{
 const QUEUE: usize = 256;
 
 /// Starts the reader and the writer on `tun` in `tasks` and returns the stack's end. A failed read
-/// or write ends its task with the error; the fd closes once both tasks are gone.
+/// or write, or a short write, ends its task with the error; the fd closes once both tasks are gone.
 ///
 /// # Errors
 ///
@@ -61,10 +61,12 @@ async fn read(device: Arc<AsyncFd<OwnedFd>>, to_stack: mpsc::Sender<Bytes>) -> V
 /// Writes each packet the stack sends to the device, until the stack is gone.
 async fn write(device: Arc<AsyncFd<OwnedFd>>, mut from_stack: mpsc::Receiver<Bytes>) -> Void {
     while let Some(packet) = from_stack.recv().await {
-        device
+        let n = device
             .async_io(Interest::WRITABLE, |fd| rustix::io::write(fd, &packet).map_err(io::Error::from))
             .await
             .with_context(|| format!("writing to {DEVICE}"))?;
+        // The device takes a packet whole or not at all; less would be half a packet on the wire.
+        ensure!(n == packet.len(), "writing to {DEVICE}: it took {n} of a {}-byte packet", packet.len());
     }
     Ok(())
 }
@@ -74,7 +76,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use pretty_assertions::assert_eq;
-    use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+    use std::time::Duration;
+
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair, sockopt::set_socket_send_buffer_size};
     use tokio::net::UnixDatagram;
 
     use super::*;
@@ -115,6 +119,22 @@ mod tests {
 
         let error = tasks.join_next().await.unwrap().unwrap().unwrap_err();
         assert!(format!("{error:#}").contains(DEVICE), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_short_write_ends_the_writer_with_an_error() {
+        // A stream with almost no send buffer takes part of a large packet and stops: what a
+        // truncated packet would look like, which a TUN device never does.
+        let (tun, _kernel) = socketpair(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None).unwrap();
+        set_socket_send_buffer_size(&tun, 4096).unwrap();
+        let mut tasks = JoinSet::new();
+        let packets = spawn(tun, &mut tasks).unwrap();
+
+        packets.tx.send(Bytes::from(vec![7; usize::from(MTU)])).await.unwrap();
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), tasks.join_next()).await.expect("the short write went unnoticed");
+        let error = ended.unwrap().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains(&format!("writing to {DEVICE}")), "{error:#}");
     }
 
     #[tokio::test]

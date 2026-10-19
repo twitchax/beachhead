@@ -292,27 +292,49 @@ async fn connect_client(socket: &Path, uid: u32) -> Res<UnixStream> {
 
 /// SIGINT, SIGTERM and SIGHUP, the ways a terminal or a service manager asks sshunnel to stop. The
 /// helper treats them like its socket closing: a Ctrl-C reaches it through sudo too, and it must
-/// still delete its pins. `sshunnel route` tears down on them.
-pub(crate) struct Signals([Signal; 3]);
+/// still delete its pins. `sshunnel route` tears down on them, except a SIGHUP it started out
+/// ignoring.
+pub(crate) struct Signals {
+    interrupt: Signal,
+    terminate: Signal,
+    /// `None` while SIGHUP stays ignored.
+    hangup: Option<Signal>,
+}
 
 impl Signals {
-    /// Handles the signals from now on, in place of their default (killing the process).
+    /// Handles all three from now on, in place of their default (killing the process).
     pub(crate) fn new() -> Res<Self> {
+        Self::handling(true)
+    }
+
+    /// As [`Self::new`], but a SIGHUP ignored at startup stays ignored: handling it would undo
+    /// `nohup`.
+    pub(crate) fn respecting_nohup() -> Res<Self> {
+        Self::handling(!system::sighup_ignored()?)
+    }
+
+    fn handling(hangup: bool) -> Res<Self> {
         let handle = |kind: SignalKind, name: &str| signal(kind).with_context(|| format!("handling {name}"));
-        Ok(Self([
-            handle(SignalKind::interrupt(), "SIGINT")?,
-            handle(SignalKind::terminate(), "SIGTERM")?,
-            handle(SignalKind::hangup(), "SIGHUP")?,
-        ]))
+        Ok(Self {
+            interrupt: handle(SignalKind::interrupt(), "SIGINT")?,
+            terminate: handle(SignalKind::terminate(), "SIGTERM")?,
+            hangup: hangup.then(|| handle(SignalKind::hangup(), "SIGHUP")).transpose()?,
+        })
     }
 
     /// Resolves at the next signal, or at once for one that arrived since the last call.
     pub(crate) async fn recv(&mut self) {
-        let [interrupt, terminate, hangup] = &mut self.0;
+        let Self { interrupt, terminate, hangup } = self;
+        let hangup = async {
+            match hangup {
+                Some(hangup) => drop(hangup.recv().await),
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
-            _ = hangup.recv() => {}
+            () = hangup => {}
         }
     }
 }

@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context as _, bail, ensure};
+use anyhow::{Context as _, bail};
 use ipnet::IpNet;
 use sshunnel_mux::Mux;
 use tokio::task::JoinSet;
@@ -26,7 +26,7 @@ use crate::{
         router::Router,
         stack::{self, DNS_PORT},
         system::{self, Via},
-        targets::Targets,
+        targets::{Snapshot, Targets},
     },
     session::{Session, SshCommand},
 };
@@ -44,8 +44,8 @@ pub struct Options {
     pub exclude: Vec<String>,
 }
 
-/// Routes `options`' targets through a relay on `destination` until Ctrl-C, SIGTERM or SIGHUP, the
-/// session ending, or the root helper dying.
+/// Routes `options`' targets through a relay on `destination` until Ctrl-C, SIGTERM or SIGHUP (unless
+/// ignored at startup, as under `nohup`), the session ending, or the root helper dying.
 ///
 /// # Errors
 ///
@@ -55,7 +55,7 @@ pub struct Options {
 pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays: &Relays) -> Void {
     // First, so a signal during startup ends in an orderly exit rather than killing the client
     // midway (and leaving the helper's socket dir behind).
-    let mut signals = Signals::new()?;
+    let mut signals = Signals::respecting_nohup()?;
     let (targets, warnings, connected) = preflight(options)?;
     let mut warned = Warned::default();
     warned.warn(&warnings);
@@ -103,14 +103,23 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
 fn preflight(options: &Options) -> Res<(Targets, Vec<String>, Vec<IpNet>)> {
     let targets = Targets::parse(&options.include, &options.exclude)?;
     let snapshot = system::snapshot().context("reading the routing tables")?;
-    let warnings = targets.check(&snapshot)?;
-    ensure!(
-        !targets.has_names() || system::resolved_usable()?,
-        "domain patterns need systemd-resolved, and the system resolver doesn't go through it here \
-         (/etc/resolv.conf points elsewhere and nss-resolve isn't in /etc/nsswitch.conf, or resolved isn't running); \
-         route CIDRs only, or switch the resolver to systemd-resolved"
-    );
+    let warnings = checked(&targets, &snapshot, system::resolved_usable)?;
     Ok((targets, warnings, snapshot.connected))
+}
+
+/// The refusals that need the machine, all in one error: `targets` against its connected subnets,
+/// and patterns against its resolver (`resolved_usable`, asked only when there are patterns).
+fn checked(targets: &Targets, snapshot: &Snapshot, resolved_usable: impl FnOnce() -> Res<bool>) -> Res<Vec<String>> {
+    let mut found = targets.findings(snapshot);
+    if targets.has_names() && !resolved_usable()? {
+        found.refusals.push(
+            "domain patterns need systemd-resolved, and the system resolver doesn't go through it here \
+             (/etc/resolv.conf points elsewhere and nss-resolve isn't in /etc/nsswitch.conf, or resolved isn't running); \
+             route CIDRs only, or switch the resolver to systemd-resolved"
+                .to_owned(),
+        );
+    }
+    found.into_result()
 }
 
 /// The addresses to keep on their normal routes, and what looked wrong finding them.
@@ -189,14 +198,17 @@ async fn check_routes(probes: Vec<Probe>) -> Vec<String> {
         .unwrap_or_else(|e| vec![format!("checking the routes failed: {e}")])
 }
 
-/// A warning for each probe that doesn't land on [`DEVICE`]: another tool's policy routing (a rule
-/// ahead of the main table) won it.
+/// A warning for each probe that doesn't land on [`DEVICE`]: a more specific route, or another
+/// tool's policy routing (a rule ahead of the main table), won it.
 fn route_warnings(probes: &[Probe], route_get: impl Fn(IpAddr) -> Res<Via>) -> Vec<String> {
     probes
         .iter()
         .filter_map(|probe| match route_get(probe.addr) {
             Ok(via) if via.dev == DEVICE => None,
-            Ok(via) => Some(format!("{} goes through {}, not {DEVICE}: another tool's policy routing outranks the main table", probe.label, via.dev)),
+            Ok(via) => Some(format!(
+                "{} goes through {}, not {DEVICE}: a more specific route or another tool's policy routing wins it",
+                probe.label, via.dev
+            )),
             Err(e) => Some(format!("could not check where {} goes: {e:#}", probe.label)),
         })
         .collect()
@@ -279,6 +291,26 @@ mod tests {
     }
 
     #[test]
+    fn every_refusal_the_machine_raises_comes_in_one_error() {
+        let connected = Snapshot { connected: vec![net("10.99.0.0/16")] };
+        let both = targets(&["10.99.7.0/24", "*.corp.example"], &[]);
+
+        let error = checked(&both, &connected, || Ok(false)).unwrap_err().to_string();
+
+        assert!(error.contains("'10.99.7.0/24' is inside the connected subnet 10.99.0.0/16"), "{error}");
+        assert!(error.contains("systemd-resolved"), "{error}");
+    }
+
+    #[test]
+    fn the_resolver_matters_only_to_patterns() {
+        let none = Snapshot::default();
+
+        assert!(checked(&targets(&["10.99.0.0/16"], &[]), &none, || panic!("asked about the resolver")).is_ok());
+        assert!(checked(&targets(&["*.corp.example"], &[]), &none, || Ok(true)).is_ok());
+        assert!(checked(&targets(&["*.corp.example"], &[]), &none, || Ok(false)).is_err());
+    }
+
+    #[test]
     fn the_status_line_names_targets_destination_and_device() {
         assert_eq!(
             status_line(&targets(&["10.99.0.0/16", "*.corp.example"], &[]), "corp.example"),
@@ -327,7 +359,10 @@ mod tests {
         let warnings = route_warnings(&probes, route_get);
 
         assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings[0].starts_with("10.98.0.0/16 goes through tailscale0, not sshunnel0"), "{warnings:?}");
+        assert_eq!(
+            warnings[0],
+            "10.98.0.0/16 goes through tailscale0, not sshunnel0: a more specific route or another tool's policy routing wins it"
+        );
         assert!(warnings[1].contains("the fake range 198.18.0.0/15") && warnings[1].contains("unreachable"), "{warnings:?}");
     }
 

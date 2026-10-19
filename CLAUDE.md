@@ -15,10 +15,11 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   feature. The binary parses arguments and calls the library; everything testable lives in the
   library. `tests` is the shared fixture factory.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
-  matching, refusals), `names` (the fake-address map), `stack` (the smoltcp netstack) with `dns`
-  on it, `peers` and `system` (what the machine depends on, and the commands and syscalls behind
-  it), `helper` (the root side, run as the hidden `sshunnel helper` through sudo), and
-  `lifecycle`, which runs them in the spec's order and stops the helper on every exit path.
+  matching, refusals), `names` (the fake-address map), `router` (the per-connection decision,
+  sharing the map), `stack` (the smoltcp netstack) with `dns` on it, `device` (the TUN fd as the
+  stack's packets), `peers` and `system` (what the machine depends on, and the commands and
+  syscalls behind it), `helper` (the root side, run as the hidden `sshunnel helper` through sudo),
+  and `lifecycle`, which runs them in the spec's order and stops the helper on every exit path.
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.
 - `crates/sshunnel-relay`: the remote binary, pushed over SSH as a static musl build. Every

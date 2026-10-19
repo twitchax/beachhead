@@ -128,6 +128,27 @@ pub struct Snapshot {
     pub connected: Vec<IpNet>,
 }
 
+/// Refusals (any one fails the run) and warnings, from [`Targets::findings`].
+#[derive(Debug, Clone, Default)]
+pub struct Findings {
+    pub refusals: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl Findings {
+    /// The warnings, or one error naming every refusal.
+    ///
+    /// # Errors
+    ///
+    /// When there is any refusal.
+    pub fn into_result(self) -> Res<Vec<String>> {
+        if !self.refusals.is_empty() {
+            bail!("refused:\n  {}", self.refusals.join("\n  "));
+        }
+        Ok(self.warnings)
+    }
+}
+
 /// The parsed includes and excludes of one `route` run.
 #[derive(Debug, Clone)]
 pub struct Targets {
@@ -234,12 +255,18 @@ impl Targets {
     /// Warnings: a broader target keeps its connected part local, and a target containing the fake
     /// range leaves that range to sshunnel.
     pub fn check(&self, snapshot: &Snapshot) -> Res<Vec<String>> {
-        let mut refusals = Vec::new();
-        let mut warnings = Vec::new();
+        self.findings(snapshot).into_result()
+    }
+
+    /// What [`Self::check`] finds, before it becomes a result, so a caller can add refusals of its
+    /// own and still report them all in one error.
+    #[must_use]
+    pub fn findings(&self, snapshot: &Snapshot) -> Findings {
+        let mut found = Findings::default();
 
         for connected in &snapshot.connected {
             if overlaps_fake_range(connected) {
-                refusals.push(format!("the fake range {FAKE_RANGE} overlaps the connected subnet {connected}"));
+                found.refusals.push(format!("the fake range {FAKE_RANGE} overlaps the connected subnet {connected}"));
             }
         }
 
@@ -247,21 +274,17 @@ impl Targets {
             let Target::Net(net) = &entry.target else { continue };
             for connected in &snapshot.connected {
                 if connected.contains(net) {
-                    refusals.push(format!("'{}' is inside the connected subnet {connected}", entry.raw));
+                    found.refusals.push(format!("'{}' is inside the connected subnet {connected}", entry.raw));
                 } else if net.contains(connected) {
-                    warnings.push(format!("'{}' contains the connected subnet {connected}, which stays local", entry.raw));
+                    found.warnings.push(format!("'{}' contains the connected subnet {connected}, which stays local", entry.raw));
                 }
             }
             if net.contains(&IpNet::V4(FAKE_RANGE)) {
-                warnings.push(format!("'{}' contains the fake range {FAKE_RANGE}, which stays sshunnel's", entry.raw));
+                found.warnings.push(format!("'{}' contains the fake range {FAKE_RANGE}, which stays sshunnel's", entry.raw));
             }
         }
 
-        if !refusals.is_empty() {
-            bail!("refused:\n  {}", refusals.join("\n  "));
-        }
-
-        Ok(warnings)
+        found
     }
 
     /// The includes and excludes back as strings, for the helper to parse again.

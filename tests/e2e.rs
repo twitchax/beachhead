@@ -246,3 +246,49 @@ async fn e2e_helper_leaves_a_refusal_it_sent_to_the_client() {
     // The client prints the refusal; the helper shares its terminal (through sudo) and stays quiet.
     assert_eq!(String::from_utf8_lossy(&out.stderr), "");
 }
+
+/// `nohup sshunnel route ...` must outlive its terminal: a SIGHUP ignored at startup stays ignored.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn e2e_route_leaves_an_ignored_sighup_ignored() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use sshunnel::tests::shim_dir;
+
+    let dir = TempDir::new().unwrap();
+    let started = dir.path().join("ssh-started");
+    // An ssh that never connects holds the client in its session stage, signals already handled.
+    let shims = shim_dir(dir.path(), &[("ssh", &format!(": > '{}'\nexec sleep 60", started.display()))]).unwrap();
+    let relays = relay_dir(dir.path()).unwrap();
+    let mut nohup = Command::new("sh");
+    nohup.args(["-c", "trap '' HUP && exec \"$0\" \"$@\"", env!("CARGO_BIN_EXE_sshunnel")]);
+    let mut client = isolated(nohup, &dir)
+        .env("XDG_STATE_HOME", dir.path())
+        .arg("route")
+        .arg("--ssh-cmd")
+        .arg(shims.join("ssh"))
+        .arg("--relay-dir")
+        .arg(&relays)
+        .args(["fake-host", "192.0.2.0/24"])
+        .spawn()
+        .unwrap();
+    let pid = client.id().unwrap();
+    let waiting = async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    timeout(Duration::from_secs(10), waiting).await.expect("the client starts ssh");
+
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let ignored = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .map(|mask| u64::from_str_radix(mask.trim(), 16).unwrap())
+        .unwrap();
+    assert_ne!(ignored & 1, 0, "SIGHUP (bit 0) is no longer ignored: SigIgn {ignored:016x}");
+
+    // SIGTERM still ends the run cleanly.
+    kill_process(Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(), Signal::TERM).unwrap();
+    let exited = timeout(Duration::from_secs(10), client.wait()).await.expect("SIGTERM ends the run").unwrap();
+    assert!(exited.success(), "{exited}");
+}

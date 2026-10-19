@@ -147,10 +147,11 @@ sudo runs the helper by the binary's real path (symlinks resolved), so that is t
 names. **Never point a `NOPASSWD` line at a binary you can write:** whoever can write it is root,
 since sudo runs whatever they put there. The line lets anything running as you start the helper, so
 it grants exactly what `route` allows: route any range except the default route (`0.0.0.0/0`,
-`::/0`) through `sshunnel0`, keep addresses inside those ranges on their current route, and send
-the matching domains' queries to sshunnel while the device exists. `0.0.0.0/1` plus `128.0.0.0/1`
-is a deliberate full tunnel; the `/0` refusal guards against accidents and is not a security
-boundary.
+`::/0`) through `sshunnel0`, keep addresses inside those ranges on their current route, and send the
+matching domains' queries to sshunnel while the device exists. That grant is machine-wide: the
+routes and the `~domain` resolver routing apply to every user's traffic and lookups on the host, and
+that traffic goes to a process running as you. `0.0.0.0/1` plus `128.0.0.0/1` is a deliberate full
+tunnel; the `/0` refusal guards against accidents and is not a security boundary.
 
 **systemd-resolved.** Domain patterns need systemd-resolved, and the system has to actually ask it:
 `/etc/resolv.conf` points at its stub (`127.0.0.53`), or `nss-resolve` is on the `hosts:` line of
@@ -158,12 +159,13 @@ boundary.
 half-working. sshunnel sets only its own link's DNS: a `~domain` routing domain per pattern and no
 default route, so resolved hands it the queries under those domains and nothing else.
 
-**What it leaves behind: nothing.** Ctrl-C, SIGTERM, the session ending and the helper dying all
-end the run. The device takes its addresses, routes and resolver config with it, and the helper
-deletes its pinned routes (the host routes that keep ssh's peer and your DNS servers off the device
-when a target covers them) before `route` returns. Only a SIGKILL of the helper itself can leave a
-pinned route; the next start sweeps it, or `sudo ip route flush proto 222` and
-`sudo ip -6 route flush proto 222` remove it by hand.
+**What it leaves behind: nothing.** Ctrl-C, SIGTERM, a closed terminal (unless started under
+`nohup`), the session ending and the helper dying all end the run. The device takes its addresses,
+routes and resolver config with it, and the helper deletes its pinned routes (the host routes that
+keep ssh's peer and your DNS servers off the device when a target covers them) before `route`
+returns. Only the helper dying without its teardown (a SIGKILL, say) can leave a pinned route; the
+next start sweeps it, or `sudo ip route flush proto 222` and `sudo ip -6 route flush proto 222`
+remove it by hand.
 
 ## Performance
 
@@ -198,9 +200,9 @@ in the [bench log](.prds/PRD-0002.log.md)).
   asks the system resolver. CIDR targets still catch their traffic.
 - Fake addresses only mean something while `route` runs. Answers carry a 5-second TTL, so a cached
   one fades soon after an exit.
-- `route` adds its routes to the main table and no `ip rule` of its own. Another tool's policy
-  routing (Tailscale's subnet routes, say) can still win a target; `route` warns, naming the
-  device that won, and leaves it be.
+- `route` adds its routes to the main table and no `ip rule` of its own. A more specific route, or
+  another tool's policy routing (Tailscale's subnet routes, say), can still win a target; `route`
+  warns, naming the device that won, and leaves it be.
 - A target containing `198.18.0.0/15` (such as `128.0.0.0/1`) leaves that range to sshunnel's fake
   addresses, with a warning.
 

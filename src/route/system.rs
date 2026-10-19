@@ -171,6 +171,25 @@ pub fn same_netns_as_init() -> bool {
     matches!((id("/proc/self/ns/net"), id("/proc/1/ns/net")), (Some(own), Some(init)) if own == init)
 }
 
+/// Whether this process ignores SIGHUP, as it does under `nohup`. The kernel's `SigIgn` mask in
+/// `/proc/self/status` says, where `sigaction` would take `unsafe`.
+///
+/// # Errors
+///
+/// Fails when the status file can't be read or has no `SigIgn` mask.
+pub fn sighup_ignored() -> Res<bool> {
+    let status = std::fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
+    ignores(&status, libc::SIGHUP).context("/proc/self/status has no SigIgn mask")
+}
+
+/// Whether the `SigIgn` mask in a `/proc/<pid>/status` has `signal`'s bit (bit n-1 for signal n).
+fn ignores(status: &str, signal: c_int) -> Option<bool> {
+    let mask = status.lines().find_map(|line| line.strip_prefix("SigIgn:"))?;
+    let mask = u64::from_str_radix(mask.trim(), 16).ok()?;
+    let bit = u32::try_from(signal).ok()?.checked_sub(1)?;
+    Some(mask.checked_shr(bit)? & 1 == 1)
+}
+
 /// Runs `program` with `args` and fails, naming the command and quoting its stderr, unless it
 /// succeeds.
 pub(crate) fn run<S: AsRef<OsStr>>(program: &str, args: &[S]) -> Void {
@@ -328,6 +347,17 @@ mod tests {
 
     fn net(s: &str) -> IpNet {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_ignored_signals_mask_parses() {
+        let status = "Name:\tsshunnel\nSigPnd:\t0000000000000000\nSigIgn:\t0000000000001001\nSigCgt:\t0000000180004002\n";
+
+        assert_eq!(ignores(status, libc::SIGHUP), Some(true));
+        assert_eq!(ignores(status, libc::SIGPIPE), Some(true));
+        assert_eq!(ignores(status, libc::SIGINT), Some(false));
+        assert_eq!(ignores("Name:\tsshunnel\n", libc::SIGHUP), None);
+        assert_eq!(ignores("SigIgn:\tnot-hex\n", libc::SIGHUP), None);
     }
 
     fn addr(s: &str) -> IpAddr {
