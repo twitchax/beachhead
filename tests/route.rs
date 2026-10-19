@@ -496,6 +496,8 @@ async fn e2e_route_refuses_a_connected_subnet() {
 
     assert!(!status.success(), "{stderr}");
     assert!(stderr.contains("'172.31.0.0/30' is inside the connected subnet 172.31.0.0/30"), "{stderr}");
+    // Its kernel prefix route is in main too, which makes it no second refusal.
+    assert_eq!(stderr.matches("'172.31.0.0/30'").count(), 1, "{stderr}");
     assert!(world.remote.last_ssh_args().is_err(), "ssh ran before the targets were checked");
     assert_eq!(leftovers(), Vec::<String>::new(), "stderr:\n{stderr}");
 }

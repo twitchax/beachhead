@@ -62,7 +62,7 @@ pub fn netns(test: &str) -> Res<bool> {
 
 /// Why no namespace is to be had, with the reason the container can't stand in.
 fn unavailable(why: &Err) -> String {
-    format!("no network namespaces: `unshare -rn` fails, and the container can't stand in ({why:#})")
+    format!("no network namespaces: `unshare` can't make them here, and the container can't stand in ({why:#})")
 }
 
 /// Fails unless `exe` has exactly one test named `test`.
@@ -80,16 +80,29 @@ fn ensure_listed(exe: &Path, test: &str) -> Void {
 /// stays in the outer network namespace, as a machine's init does, so the helper's check that
 /// patterns run in init's namespace still refuses inside the test's.
 fn rerun(exe: &Path, test: &str) -> Vec<OsString> {
-    let outer = ["unshare", "-rmp", "--fork", "--kill-child", "--mount-proc", "sh", "-c", r#"unshare -n "$@"; exit $?"#, "sh"];
-    let mut command: Vec<OsString> = outer.map(OsString::from).into();
+    let mut command = namespaced();
     command.push(exe.into());
     command.extend(["--exact", test, "--nocapture", "--include-ignored"].map(OsString::from));
     command
 }
 
+/// Whether direct mode works here: the [`rerun`]'s namespaces, running nothing. A host can allow
+/// `unshare -rn` and still refuse a fresh `/proc` in a user namespace (under lxcfs, say).
+fn probe() -> Vec<OsString> {
+    let mut command = namespaced();
+    command.push("true".into());
+    command
+}
+
+/// The [`rerun`]'s namespaces, up to the command to run in them.
+fn namespaced() -> Vec<OsString> {
+    let outer = ["unshare", "-rmp", "--fork", "--kill-child", "--mount-proc", "sh", "-c", r#"unshare -n "$@"; exit $?"#, "sh"];
+    outer.map(OsString::from).into()
+}
+
 /// Where the test runs again.
 enum Runner {
-    /// Here, where `unshare -rn` works.
+    /// Here, where the [`probe`] succeeds.
     Direct,
     /// In a container of this Ubuntu release.
     Docker { codename: String },
@@ -104,7 +117,8 @@ impl Runner {
             Ok(choice) => bail!("{FORCE}={choice}: the one choice is `docker`"),
             Err(_) => {}
         }
-        if succeeds(Command::new("unshare").args(["-rn", "true"])) {
+        let probe = probe();
+        if probe.split_first().is_some_and(|(program, args)| succeeds(Command::new(program).args(args))) {
             return Ok(Ok(Self::Direct));
         }
         Ok(docker_codename().map(|codename| Self::Docker { codename }))
@@ -398,10 +412,21 @@ mod tests {
     }
 
     #[test]
+    fn the_probe_needs_every_namespace_the_rerun_does() {
+        // A host can allow `unshare -rn` and still refuse a fresh /proc in a user namespace (lxcfs).
+        let rerun = rerun(Path::new("/repo/target/debug/deps/route-0123"), "e2e_route_x");
+        let probe = probe();
+        let (command, setup) = probe.split_last().unwrap();
+
+        assert_eq!(command, "true");
+        assert!(rerun.starts_with(setup), "{probe:?} doesn't set up what {rerun:?} needs");
+    }
+
+    #[test]
     fn a_skip_says_why_the_container_cant_stand_in() {
         let skip = unavailable(&anyhow!("`docker info` fails: Docker isn't usable"));
 
-        assert!(skip.contains("unshare -rn") && skip.contains("`docker info` fails"), "{skip}");
+        assert!(skip.contains("`unshare` can't") && skip.contains("`docker info` fails"), "{skip}");
     }
 
     #[test]

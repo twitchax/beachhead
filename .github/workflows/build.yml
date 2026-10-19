@@ -44,8 +44,8 @@ jobs:
       # The login-shell e2e tests skip a missing shell on a dev box but fail under CI.
       - name: Install login shells
         run: sudo apt-get update && sudo apt-get install -y zsh fish tcsh busybox
-      # The namespace e2e tests run under `unshare -rn`, which Ubuntu's AppArmor blocks by default;
-      # this runner is thrown away after the job.
+      # The namespace e2e tests run under `unshare` (user, mount, PID and network namespaces), which
+      # Ubuntu's AppArmor blocks by default; this runner is thrown away after the job.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo make ci

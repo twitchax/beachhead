@@ -166,9 +166,9 @@ default route, so resolved hands it the queries under those domains and nothing 
 `nohup`), the session ending and the helper dying all end the run. The device takes its addresses,
 routes and resolver config with it, and the helper deletes its pinned routes (the host routes that
 keep ssh's peer and your DNS servers off the device when a target covers them; an address with a
-host route of its own already stays off it) before `route` returns. Only the helper dying without its teardown (a SIGKILL, say) can leave a pinned route; the
-next start sweeps it, or `sudo ip route flush proto 222` and `sudo ip -6 route flush proto 222`
-remove it by hand.
+host route of its own already stays off it) before `route` returns. Only the helper dying without
+its teardown (a SIGKILL, say) can leave a pinned route; the next start sweeps it, or
+`sudo ip route flush proto 222` and `sudo ip -6 route flush proto 222` remove it by hand.
 
 ## Performance
 
@@ -236,11 +236,11 @@ bash, busybox, zsh, fish or tcsh. The push, cache and noexec paths all run witho
 
 `route`'s e2e tests (`tests/route.rs`) need a real TUN device and real routes, so each one runs
 again as root over throwaway user, mount, PID and network namespaces (`unshare`), with the remote's
-network in a second namespace across a veth pair. Nothing on the machine changes, and nothing needs sudo.
-Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; there, each test runs
-in a privileged Docker container instead (Docker without sudo, about half a second a test), built
-from your own Ubuntu release plus iproute2 as `sshunnel-netns:<codename>` on first use, with the
-checkout mounted read-only. With neither, the tests skip with a warning (under `CI`, they fail).
+network in a second namespace across a veth pair. Nothing on the machine changes, and nothing needs
+sudo. Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; there, each test
+runs in a privileged Docker container instead (Docker without sudo, about half a second a test),
+built from your own Ubuntu release plus iproute2 as `sshunnel-netns:<codename>` on first use, with
+the checkout mounted read-only. With neither, the tests skip with a warning (under `CI`, they fail).
 `SSHUNNEL_NETNS=docker` forces the container. The alternative to Docker is lifting the restriction,
 as CI does on its throwaway runners:
 

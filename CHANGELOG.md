@@ -26,8 +26,9 @@ why the version moved the way it did.
   domain patterns (`*.corp.example`) through the relay, over a TUN device, `sshunnel0`. Names
   resolve on the remote and get stable fake addresses from `198.18.0.0/15`, and `-x` carves CIDRs
   and names out. Every refusal (`/0`, a bare `*`, a target inside a connected subnet or the fake
-  range, a route the main table already has) is reported before ssh runs. A root helper started through sudo sets the device up, keeps
-  ssh's peers and the DNS servers on their routes, and leaves nothing behind on exit.
+  range, a route the main table already has) is reported before ssh runs. A root helper started
+  through sudo sets the device up, keeps ssh's peers and the DNS servers on their routes, and
+  leaves nothing behind on exit.
 - Protocol v3: `Resolve` / `Resolved` / `ResolveErr` frames, so the relay can resolve a name with
   its own resolver (`getaddrinfo`), and a kind on `OpenErr` (refused, unreachable, timed out,
   other), so a failed dial says why. A cached v2 relay is simply replaced, since the cache is keyed

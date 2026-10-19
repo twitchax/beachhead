@@ -305,8 +305,12 @@ impl Targets {
         }
 
         // The kernel would refuse sshunnel's own route here (EEXIST), and replacing the other one
-        // would leave a trace: its teardown would delete it.
+        // would leave a trace: its teardown would delete it. A route inside a connected subnet is
+        // refused above already (the kernel's prefix route for an address is in main, at metric 0).
         for route in self.routes() {
+            if snapshot.connected.iter().any(|connected| connected.contains(&route)) {
+                continue;
+            }
             if let Some(Taken { route: existing, .. }) = snapshot.taken.iter().find(|taken| taken.net == route) {
                 found.refusals.push(format!("'{route}' already has a route of its own ({existing}); sshunnel can't add an equal one"));
             }
@@ -646,6 +650,24 @@ mod tests {
         assert!(error.contains("'192.168.1.0/25' is inside the connected subnet 192.168.1.0/24"), "{error}");
         // Narrower and broader routes don't collide.
         assert!(targets(&["10.99.0.0/17", "10.98.0.0/15"], &[]).check(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_connected_subnet_once() {
+        // The kernel's prefix route for an address sits in main at metric 0, so it is taken too.
+        let snapshot = Snapshot {
+            connected: vec![net("172.31.0.0/30")],
+            taken: vec![Taken {
+                net: net("172.31.0.0/30"),
+                route: "dev cl0, metric 0".to_owned(),
+            }],
+            ..Snapshot::default()
+        };
+
+        let error = targets(&["172.31.0.0/30"], &[]).check(&snapshot).unwrap_err().to_string();
+
+        assert_eq!(error.matches("'172.31.0.0/30'").count(), 1, "{error}");
+        assert!(error.contains("is inside the connected subnet 172.31.0.0/30"), "{error}");
     }
 
     #[test]

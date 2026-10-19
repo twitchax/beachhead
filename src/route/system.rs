@@ -272,6 +272,8 @@ struct Route {
     metric: Option<u32>,
     /// Absent for TOS 0.
     tos: Option<IgnoredAny>,
+    /// The sources a v6 route is for; absent for every source.
+    from: Option<IgnoredAny>,
 }
 
 impl Route {
@@ -318,9 +320,12 @@ fn add_metric(net: &IpNet) -> u32 {
 ///
 /// - Connected: the on-link unicast routes (no next hop: v4 marks them scope link, v6 marks them no
 ///   scope at all) of the tables `rules` consult.
-/// - Taken: the main table's routes at the metric `ip route add` would use, and (v4) TOS 0, of any
-///   type: the kernel refuses an equal route next to one (EEXIST).
+/// - Taken: the main table's routes at the metric `ip route add` would use, of any type: the
+///   kernel refuses an equal route next to one (EEXIST).
 /// - Hosts: the main table's host routes, at any metric.
+///
+/// Taken and hosts count only routes for every source and TOS: a v6 source route lives in a subtree
+/// of its own, and neither kind carries ordinary traffic.
 fn parse_snapshot(rules: &str, routes: &str) -> Res<Snapshot> {
     let rules: Vec<Rule> = serde_json::from_str(rules).context("parsing `ip -j rule show`")?;
     let routes: Vec<Route> = serde_json::from_str(routes).context("parsing `ip -j route show`")?;
@@ -337,13 +342,14 @@ fn parse_snapshot(rules: &str, routes: &str) -> Res<Snapshot> {
         if on_link && tables.contains(route.table.as_deref().unwrap_or("main")) {
             snapshot.connected.push(route.net()?);
         }
-        if route.table.is_none() {
+        // Only a route for every source and TOS can collide with sshunnel's, or carry ssh's traffic.
+        if route.table.is_none() && route.from.is_none() && route.tos.is_none() {
             let net = route.net()?;
             if net.prefix_len() == net.max_prefix_len() {
                 snapshot.hosts.push(net.addr());
             }
             let metric = route.metric.unwrap_or(0);
-            if route.tos.is_none() && metric == add_metric(&net) {
+            if metric == add_metric(&net) {
                 snapshot.taken.push(Taken { net, route: route.describe(metric) });
             }
         }
@@ -533,6 +539,24 @@ mod tests {
             [taken("2001:db8::53/128", "via fe80::1 dev eth0, metric 1024"), taken("fd99::/64", "via fe80::1 dev eth0, metric 1024"),]
         );
         assert_eq!(v6.hosts, [addr("2001:db8::53")]);
+    }
+
+    #[test]
+    fn snapshot_skips_routes_with_selectors() {
+        // Routes for some sources (v6 `from`) or some TOS only. A v6 source route lives in a subtree
+        // of its own, so an equal route of sshunnel's doesn't collide with it, and neither kind
+        // outranks the device's route for ssh's ordinary traffic.
+        let rules = r#"[{"priority":0,"src":"all","table":"local"},{"priority":32766,"src":"all","table":"main"}]"#;
+        let routes6 = r#"[
+            {"dst":"fd97::/64","from":"2001:db8::/64","gateway":"fd00:1::2","dev":"d0","metric":1024,"flags":[],"pref":"medium"},
+            {"dst":"fd96::5","from":"2001:db8::/64","gateway":"fd00:1::2","dev":"d0","metric":1024,"flags":[],"pref":"medium"}
+        ]"#;
+        let routes4 = r#"[{"dst":"10.98.0.9","tos":"0x10","gateway":"192.0.2.1","dev":"d0","flags":[]}]"#;
+
+        let v6 = parse_snapshot(rules, routes6).unwrap();
+        assert_eq!((v6.taken, v6.hosts), (vec![], vec![]));
+        let v4 = parse_snapshot(rules, routes4).unwrap();
+        assert_eq!((v4.taken, v4.hosts), (vec![], vec![]));
     }
 
     #[test]
