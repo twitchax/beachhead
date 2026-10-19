@@ -13,12 +13,12 @@
 use std::{
     ffi::{OsStr, OsString},
     fmt::{self, Display},
-    fs::DirBuilder,
-    io::{self, ErrorKind, IoSlice, IoSliceMut},
+    fs::{DirBuilder, File},
+    io::{self, ErrorKind, IoSlice, IoSliceMut, Read as _},
     mem::MaybeUninit,
     net::IpAddr,
     os::{
-        fd::{AsFd as _, BorrowedFd, OwnedFd},
+        fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd},
         unix::fs::DirBuilderExt as _,
     },
     path::{Path, PathBuf},
@@ -27,13 +27,16 @@ use std::{
 
 use anyhow::{Context as _, anyhow, bail, ensure};
 use ipnet::IpNet;
-use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, recvmsg, sendmsg, sockopt::socket_peercred};
+use rustix::{
+    fs::{CWD, FileType, Mode, OFlags, fstat, openat},
+    net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, recvmsg, sendmsg, sockopt::socket_peercred},
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader, Interest},
     net::{UnixListener, UnixStream},
     process::{Child, Command},
-    signal::unix::{SignalKind, signal},
+    signal::unix::{Signal, SignalKind, signal},
 };
 
 use crate::{
@@ -47,8 +50,8 @@ use crate::{
 
 /// The longest message either side reads: a setup or a reply, each one JSON line.
 const MAX_MESSAGE: usize = 64 * 1024;
-/// Attempts at a fresh socket directory before giving up.
-const DIR_ATTEMPTS: u32 = 100;
+/// Attempts at a fresh socket directory; a random name collides only by astronomical luck.
+const DIR_ATTEMPTS: u32 = 8;
 
 /// What the client asks for: the targets as the user wrote them, and the addresses the machine
 /// depends on (ssh's peers, its DNS servers), which keep their route where a target covers them.
@@ -205,17 +208,23 @@ async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, s
 /// Fails when the client can't be reached or isn't the user who ran sudo, when the setup is refused
 /// or fails (after telling the client and undoing what was done), or when a pin can't be deleted.
 pub async fn serve(socket: &Path) -> Void {
+    let uid = served_uid(std::env::var_os("SUDO_UID").as_deref(), rustix::process::getuid().as_raw())?;
+    serve_with(socket, uid).await
+}
+
+/// [`serve`] for the user `uid`.
+async fn serve_with(socket: &Path, uid: u32) -> Void {
     // First, so a signal during setup ends in the teardown below instead of killing the helper midway.
-    let mut interrupt = signal(SignalKind::interrupt()).context("handling SIGINT")?;
-    let mut terminate = signal(SignalKind::terminate()).context("handling SIGTERM")?;
-    let mut hangup = signal(SignalKind::hangup()).context("handling SIGHUP")?;
+    let mut signals = Signals::new()?;
+    let mut conn = connect_client(socket, uid).await?;
 
-    let mut conn = UnixStream::connect(socket).await.with_context(|| format!("connecting to {}", socket.display()))?;
-    // Before a byte crosses: a path to someone else's socket is refused unread and unwritten.
-    let peer = socket_peercred(&conn).context("reading the client's credentials")?.uid.as_raw();
-    client_allowed(std::env::var_os("SUDO_UID").as_deref(), rustix::process::getuid().as_raw(), peer)?;
-
-    let (applied, warnings) = match read_setup(&mut conn).await.and_then(|setup| apply(&setup)) {
+    // The handlers replaced the default disposition, so every wait must watch them: a client that
+    // connects and stalls must not leave a root helper deaf to Ctrl-C.
+    let setup = tokio::select! {
+        setup = read_setup(&mut conn) => setup,
+        () = signals.recv() => bail!("stopped by a signal before the setup arrived"),
+    };
+    let (applied, warnings) = match setup.and_then(|setup| apply(&setup)) {
         Ok(applied) => applied,
         Err(e) => {
             // Best effort: the client may be gone, and the error is reported here either way.
@@ -228,9 +237,7 @@ pub async fn serve(socket: &Path) -> Void {
     if delivered.is_ok() {
         tokio::select! {
             () = closed(&mut conn) => {}
-            _ = interrupt.recv() => {}
-            _ = terminate.recv() => {}
-            _ = hangup.recv() => {}
+            () = signals.recv() => {}
         }
     }
     let unpinned = applied.teardown();
@@ -239,13 +246,55 @@ pub async fn serve(socket: &Path) -> Void {
 
 /// The helper serves only the user it acts for: the one who ran sudo, or without sudo its own user
 /// (root, who could do all of this anyway).
-fn client_allowed(sudo_uid: Option<&OsStr>, own: u32, peer: u32) -> Void {
-    let expected = match sudo_uid {
-        Some(uid) => uid.to_str().and_then(|uid| uid.parse().ok()).with_context(|| format!("SUDO_UID is not a uid: '{}'", uid.display()))?,
-        None => own,
-    };
-    ensure!(peer == expected, "the socket belongs to uid {peer}, not to the user the helper serves (uid {expected})");
-    Ok(())
+fn served_uid(sudo_uid: Option<&OsStr>, own: u32) -> Res<u32> {
+    match sudo_uid {
+        Some(uid) => uid.to_str().and_then(|uid| uid.parse().ok()).with_context(|| format!("SUDO_UID is not a uid: '{}'", uid.display())),
+        None => Ok(own),
+    }
+}
+
+/// Connects to the client's socket only if it is a socket `uid` owns. The path is the caller's
+/// choice, so it is opened without following a final symlink and checked through that fd, and the
+/// connect goes through the same fd, so the name can't be swapped in between. A root connect to
+/// anything else could start a socket-activated root service, and its errno would tell the caller
+/// what root sees, so every refusal reads the same.
+async fn connect_client(socket: &Path, uid: u32) -> Res<UnixStream> {
+    let refused = || anyhow!("the helper's socket is not a socket of the user it serves");
+    let path = openat(CWD, socket, OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()).map_err(|_| refused())?;
+    let stat = fstat(&path).map_err(|_| refused())?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Socket || stat.st_uid != uid {
+        return Err(refused());
+    }
+
+    let conn = UnixStream::connect(format!("/proc/self/fd/{}", path.as_raw_fd())).await.map_err(|_| refused())?;
+    // Before a byte crosses: whoever listens there must be that user too.
+    let peer = socket_peercred(&conn).map_err(|_| refused())?.uid.as_raw();
+    ensure!(peer == uid, "the socket belongs to uid {peer}, not to the user the helper serves (uid {uid})");
+    Ok(conn)
+}
+
+/// SIGINT, SIGTERM and SIGHUP, which the helper treats like its socket closing: a Ctrl-C reaches it
+/// through sudo too, and it must still delete its pins.
+struct Signals([Signal; 3]);
+
+impl Signals {
+    fn new() -> Res<Self> {
+        let handle = |kind: SignalKind, name: &str| signal(kind).with_context(|| format!("handling {name}"));
+        Ok(Self([
+            handle(SignalKind::interrupt(), "SIGINT")?,
+            handle(SignalKind::terminate(), "SIGTERM")?,
+            handle(SignalKind::hangup(), "SIGHUP")?,
+        ]))
+    }
+
+    async fn recv(&mut self) {
+        let [interrupt, terminate, hangup] = &mut self.0;
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+    }
 }
 
 /// What the helper holds while the client runs: the device, and the pins it added.
@@ -255,12 +304,13 @@ struct Applied {
 }
 
 impl Applied {
-    /// Deletes the pins, then lets the device go. Holding the device until the pins are gone means
-    /// no new session can start in between and lose a pin of the same address to this one's delete.
+    /// Deletes the pins, then lets the device go, persist flag cleared. Holding the device until the
+    /// pins are gone means no new session can start in between and lose a pin of the same address
+    /// to this one's delete.
     fn teardown(self) -> Void {
         let unpinned = unpin(&self.pins, &mut run_step);
-        drop(self.tun);
-        unpinned
+        let released = system::release_tun(self.tun);
+        unpinned.and(released)
     }
 }
 
@@ -268,7 +318,7 @@ impl Applied {
 /// first and drops the fd, which takes the device and everything on it along.
 fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
     let targets = Targets::parse(&setup.include, &setup.exclude)?;
-    let warnings = targets.check(&system::snapshot()?)?;
+    let mut warnings = targets.check(&system::snapshot()?)?;
     // resolvectl names the link by index, and resolved serves pid 1's namespace: from another one,
     // the config would land on whatever link has the same index there.
     ensure!(
@@ -285,7 +335,9 @@ fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
     }
     // Each pin copies the route its address has before the device has any.
     let vias = honored(&routes, &setup.pins).into_iter().map(|pin| Ok((pin, system::route_get(pin)?))).collect::<Res<Vec<_>>>()?;
-    let pins = execute(&plan(&targets, &routes, &vias), &mut run_step)?;
+    let plan = plan(&targets, &routes, &vias);
+    let pins = execute(&plan.steps, &mut run_step)?;
+    warnings.extend(plan.warnings);
 
     Ok((Applied { tun, pins }, warnings))
 }
@@ -326,28 +378,48 @@ impl Display for Step {
     }
 }
 
+/// What the helper will run, and what it decided along the way that the user should hear.
+struct Plan {
+    steps: Vec<Step>,
+    warnings: Vec<String>,
+}
+
 /// Everything the helper does to the machine, in order: the device's addresses, MTU and link; the
 /// pins, before a route could capture what they keep; the routes; and with names, the resolver's
 /// link config, DNS server last, so resolved never takes the link for a default route.
-fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)]) -> Vec<Step> {
+///
+/// A pin whose address the machine delivers locally needs nothing (the local table outranks main),
+/// and a route that is exactly a pinned host is left out: the pin wins.
+fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)]) -> Plan {
+    let pins: Vec<(IpNet, &Via)> = vias.iter().filter(|(_, via)| via.unicast).map(|(pin, via)| (IpNet::from(*pin), via)).collect();
+    let mut warnings = Vec::new();
+    let mut device_routes = Vec::with_capacity(routes.len());
+    for route in routes {
+        if pins.iter().any(|(host, _)| host == route) {
+            warnings.push(format!("{route} keeps its current route: the machine depends on it (ssh's peer or a DNS server)"));
+        } else {
+            device_routes.push(route);
+        }
+    }
+
     let mut steps = vec![Step::new("ip", ["addr", "add", &format!("{TUN_ADDR}/{}", FAKE_RANGE.prefix_len()), "dev", DEVICE])];
     // Only v6 routes need a v6 source, and adding one where IPv6 is disabled would fail every run.
-    if routes.iter().any(|route| matches!(route, IpNet::V6(_))) {
+    if device_routes.iter().any(|route| matches!(route, IpNet::V6(_))) {
         steps.push(Step::new("ip", ["addr", "add", &TUN_ADDR6.to_string(), "dev", DEVICE]));
     }
     steps.push(Step::new("ip", ["link", "set", "dev", DEVICE, "mtu", &MTU.to_string(), "up"]));
 
     let proto = PIN_PROTO.to_string();
-    for (pin, via) in vias {
-        let host = IpNet::from(*pin).to_string();
+    for (host, via) in &pins {
+        let dst = host.to_string();
         let mut step = match via.gateway {
-            Some(gateway) => Step::new("ip", ["route", "add", &host, "via", &gateway.to_string(), "dev", &via.dev, "proto", &proto]),
-            None => Step::new("ip", ["route", "add", &host, "dev", &via.dev, "proto", &proto]),
+            Some(gateway) => Step::new("ip", ["route", "add", &dst, "via", &gateway.to_string(), "dev", &via.dev, "proto", &proto]),
+            None => Step::new("ip", ["route", "add", &dst, "dev", &via.dev, "proto", &proto]),
         };
-        step.pin = Some(*pin);
+        step.pin = Some(host.addr());
         steps.push(step);
     }
-    for route in routes {
+    for route in device_routes {
         steps.push(Step::new("ip", ["route", "add", &route.to_string(), "dev", DEVICE]));
     }
 
@@ -360,7 +432,7 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)]) -> Vec<Step
         steps.push(domain);
         steps.push(Step::new("resolvectl", ["dns", DEVICE, &DNS_ADDR.to_string()]));
     }
-    steps
+    Plan { steps, warnings }
 }
 
 fn run_step(step: &Step) -> Void {
@@ -478,14 +550,17 @@ fn runtime_dir() -> PathBuf {
 }
 
 /// A fresh directory only its owner can enter, removed with the socket in it on drop. `mkdir`
-/// fails on an existing path, so the directory is always this process's own.
+/// fails on an existing path, so the directory is always this process's own, and its name is
+/// random, so no one can take it first (in a shared `/tmp`) and block the start.
 struct SocketDir(PathBuf);
 
 impl SocketDir {
     fn create(base: &Path) -> Res<Self> {
-        let pid = std::process::id();
-        for attempt in 0..DIR_ATTEMPTS {
-            let path = base.join(format!("sshunnel-{pid}-{attempt}"));
+        let mut urandom = File::open("/dev/urandom").context("opening /dev/urandom")?;
+        for _ in 0..DIR_ATTEMPTS {
+            let mut nonce = [0; 8];
+            urandom.read_exact(&mut nonce).context("reading /dev/urandom")?;
+            let path = base.join(format!("sshunnel-{:016x}", u64::from_ne_bytes(nonce)));
             match DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => return Ok(Self(path)),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
@@ -506,11 +581,15 @@ impl Drop for SocketDir {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::os::unix::fs::MetadataExt as _;
+    use std::{os::unix::fs::MetadataExt as _, time::Duration};
 
     use pretty_assertions::assert_eq;
-    use rustix::io::{FdFlags, fcntl_getfd};
+    use rustix::{
+        io::{FdFlags, fcntl_getfd},
+        process::{Signal, getpid, getuid, kill_process},
+    };
     use tempfile::TempDir;
+    use tokio::task::JoinHandle;
 
     use super::*;
     use crate::tests::shim_dir;
@@ -544,6 +623,29 @@ mod tests {
 
     fn rendered(steps: &[Step]) -> Vec<String> {
         steps.iter().map(ToString::to_string).collect()
+    }
+
+    fn via(dev: &str, gateway: Option<&str>) -> Via {
+        Via {
+            dev: dev.to_owned(),
+            gateway: gateway.map(addr),
+            unicast: true,
+        }
+    }
+
+    /// The test plays the client: it owns a socket in `root`, and the helper serves its uid.
+    fn serving(root: &TempDir) -> (UnixListener, JoinHandle<Void>) {
+        let socket = root.path().join("helper.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let me = getuid().as_raw();
+        (listener, tokio::spawn(async move { serve_with(&socket, me).await }))
+    }
+
+    /// What the helper answers `setup` with, playing the client against [`serving`].
+    async fn reply_to(listener: &UnixListener, setup: &Setup) -> (Reply, Option<OwnedFd>) {
+        let (mut client, _) = listener.accept().await.unwrap();
+        client.write_all(&encode(setup).unwrap()).await.unwrap();
+        receive(&client).await.unwrap()
     }
 
     /// A runner that records each command and fails the ones in `failing`.
@@ -652,13 +754,117 @@ mod tests {
 
     #[test]
     fn the_helper_serves_only_the_user_who_ran_sudo() {
-        assert!(client_allowed(Some(OsStr::new("1000")), 0, 1000).is_ok());
-        assert!(client_allowed(None, 0, 0).is_ok(), "without sudo, root serves root");
+        assert_eq!(served_uid(Some(OsStr::new("1000")), 0).unwrap(), 1000);
+        assert_eq!(served_uid(None, 0).unwrap(), 0, "without sudo, root serves root");
 
-        for (sudo_uid, peer) in [("1000", 0), ("1000", 1001), ("not-a-uid", 1000), ("", 1000)] {
-            assert!(client_allowed(Some(OsStr::new(sudo_uid)), 0, peer).is_err(), "SUDO_UID={sudo_uid} let uid {peer} in");
+        for sudo_uid in ["not-a-uid", "", "-1"] {
+            assert!(served_uid(Some(OsStr::new(sudo_uid)), 0).is_err(), "SUDO_UID={sudo_uid} was taken for a uid");
         }
-        assert!(client_allowed(None, 0, 1000).is_err(), "without sudo, a user's socket was served");
+    }
+
+    #[tokio::test]
+    async fn the_helper_connects_only_to_a_socket_its_user_owns() {
+        let root = TempDir::new().unwrap();
+        let me = getuid().as_raw();
+        let socket = root.path().join("helper.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let link = root.path().join("link.sock");
+        std::os::unix::fs::symlink(&socket, &link).unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "").unwrap();
+
+        // One message whatever went wrong: no errno, so root's view of the path tells the user nothing.
+        let refusals = [
+            connect_client(&link, me).await.unwrap_err().to_string(),
+            connect_client(&file, me).await.unwrap_err().to_string(),
+            connect_client(&root.path().join("missing"), me).await.unwrap_err().to_string(),
+            connect_client(&socket, me + 1).await.unwrap_err().to_string(),
+        ];
+        assert!(refusals.iter().all(|r| *r == refusals[0]), "{refusals:#?}");
+        assert!(!refusals[0].contains("os error"), "{}", refusals[0]);
+
+        let _conn = connect_client(&socket, me).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        assert_eq!(socket_peercred(&accepted).unwrap().uid.as_raw(), me);
+    }
+
+    #[tokio::test]
+    async fn the_helper_refuses_a_default_route_itself() {
+        let root = TempDir::new().unwrap();
+        let (listener, helper) = serving(&root);
+
+        let full_tunnel = Setup {
+            include: strings(&["0.0.0.0/0"]),
+            exclude: Vec::new(),
+            pins: Vec::new(),
+        };
+        let (reply, fd) = reply_to(&listener, &full_tunnel).await;
+
+        let Reply::Failed { error } = reply else { panic!("a full tunnel was set up") };
+        assert!(error.contains("'0.0.0.0/0'"), "{error}");
+        assert!(fd.is_none());
+        assert!(helper.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_helper_checks_targets_before_creating_the_device() {
+        if getuid().is_root() {
+            eprintln!("skipping: as root this would set up {DEVICE}");
+            return;
+        }
+        let root = TempDir::new().unwrap();
+        let (listener, helper) = serving(&root);
+        let cidrs = Setup {
+            include: strings(&["10.99.0.0/16"]),
+            exclude: Vec::new(),
+            pins: vec![addr("10.99.0.5")],
+        };
+
+        let (reply, fd) = reply_to(&listener, &cidrs).await;
+
+        // Past every check, the first thing that needs root fails.
+        let Reply::Failed { error } = reply else { panic!("an unprivileged helper set up {DEVICE}") };
+        assert!(error.contains(DEVICE) && !error.contains("refused"), "{error}");
+        assert!(fd.is_none());
+        assert!(helper.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_helper_serves_no_other_user() {
+        let root = TempDir::new().unwrap();
+        let socket = root.path().join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        assert!(serve_with(&socket, getuid().as_raw() + 1).await.is_err());
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock, "the helper connected to another user's socket");
+    }
+
+    #[tokio::test]
+    async fn a_signal_stops_a_helper_waiting_for_its_setup() {
+        let root = TempDir::new().unwrap();
+        let (listener, helper) = serving(&root);
+        // Connected means its signal handlers are in place; the setup never comes. nextest runs
+        // each test in its own process, so the signal reaches this helper alone.
+        let (_client, _) = listener.accept().await.unwrap();
+
+        kill_process(getpid(), Signal::TERM).unwrap();
+
+        let served = tokio::time::timeout(Duration::from_secs(5), helper).await.expect("the helper ignored SIGTERM").unwrap();
+        assert!(served.is_err());
+    }
+
+    #[test]
+    fn a_squatter_cannot_block_the_socket_dir() {
+        let root = TempDir::new().unwrap();
+        let pid = std::process::id();
+        // Every name a pid-and-counter scheme would try, taken by someone else first.
+        for n in 0..100 {
+            std::fs::create_dir(root.path().join(format!("sshunnel-{pid}-{n}"))).unwrap();
+        }
+
+        let dir = SocketDir::create(root.path()).unwrap();
+        assert!(dir.0.starts_with(root.path()));
     }
 
     #[test]
@@ -672,19 +878,10 @@ mod tests {
     #[test]
     fn the_helper_runs_a_closed_set_of_commands() {
         let targets = Targets::parse(&strings(&["10.99.0.0/16", "fd99::/64", "*.corp.example", "host.other.example"]), &strings(&["10.99.128.0/17"])).unwrap();
-        let vias = [
-            (
-                addr("10.99.0.5"),
-                Via {
-                    dev: "eth0".to_owned(),
-                    gateway: Some(addr("192.0.2.1")),
-                },
-            ),
-            (addr("fd99::5"), Via { dev: "eth0".to_owned(), gateway: None }),
-        ];
+        let vias = [(addr("10.99.0.5"), via("eth0", Some("192.0.2.1"))), (addr("fd99::5"), via("eth0", None))];
 
         assert_eq!(
-            rendered(&plan(&targets, &targets.routes(), &vias)),
+            rendered(&plan(&targets, &targets.routes(), &vias).steps),
             [
                 "ip addr add 198.18.0.1/15 dev sshunnel0",
                 "ip addr add fd73:7368::1/64 dev sshunnel0",
@@ -707,7 +904,7 @@ mod tests {
         let targets = Targets::parse(&strings(&["10.99.0.0/16"]), &[]).unwrap();
 
         assert_eq!(
-            rendered(&plan(&targets, &targets.routes(), &[])),
+            rendered(&plan(&targets, &targets.routes(), &[]).steps),
             [
                 "ip addr add 198.18.0.1/15 dev sshunnel0",
                 "ip link set dev sshunnel0 mtu 65535 up",
@@ -717,19 +914,41 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_on_a_local_route_is_left_alone() {
+        // A resolver on 127.0.0.1: the local table outranks any route sshunnel adds to main.
+        let targets = Targets::parse(&strings(&["0.0.0.0/1", "128.0.0.0/1"]), &[]).unwrap();
+        let local = Via { unicast: false, ..via("lo", None) };
+
+        let plan = plan(&targets, &targets.routes(), &[(addr("127.0.0.1"), local)]);
+
+        assert!(rendered(&plan.steps).iter().all(|step| !step.contains("proto 222")), "{:#?}", rendered(&plan.steps));
+        assert!(rendered(&plan.steps).contains(&"ip route add 0.0.0.0/1 dev sshunnel0".to_owned()));
+    }
+
+    #[test]
+    fn a_target_that_is_a_pin_keeps_its_route() {
+        let targets = Targets::parse(&strings(&["10.99.0.5", "10.98.0.0/16"]), &[]).unwrap();
+
+        let plan = plan(&targets, &targets.routes(), &[(addr("10.99.0.5"), via("eth0", Some("192.0.2.1")))]);
+
+        assert_eq!(
+            rendered(&plan.steps),
+            [
+                "ip addr add 198.18.0.1/15 dev sshunnel0",
+                "ip link set dev sshunnel0 mtu 65535 up",
+                "ip route add 10.99.0.5/32 via 192.0.2.1 dev eth0 proto 222",
+                "ip route add 10.98.0.0/16 dev sshunnel0",
+            ]
+        );
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("10.99.0.5"), "{:?}", plan.warnings);
+    }
+
+    #[test]
     fn a_failed_setup_deletes_the_pins_it_added() {
         let targets = Targets::parse(&strings(&["10.99.0.0/16", "fd99::/64"]), &[]).unwrap();
-        let vias = [
-            (
-                addr("10.99.0.5"),
-                Via {
-                    dev: "eth0".to_owned(),
-                    gateway: Some(addr("192.0.2.1")),
-                },
-            ),
-            (addr("fd99::5"), Via { dev: "eth0".to_owned(), gateway: None }),
-        ];
-        let steps = plan(&targets, &targets.routes(), &vias);
+        let vias = [(addr("10.99.0.5"), via("eth0", Some("192.0.2.1"))), (addr("fd99::5"), via("eth0", None))];
+        let steps = plan(&targets, &targets.routes(), &vias).steps;
         let mut log = Vec::new();
 
         let error = execute(&steps, &mut recorder(&mut log, &["ip route add fd99::/64 dev sshunnel0"])).unwrap_err();

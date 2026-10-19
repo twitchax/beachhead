@@ -2,8 +2,10 @@
 //! resolvectl, `/proc`, and the TUN ioctl. Every command's output goes through a pure parser, so
 //! the logic is tested without privileges.
 //!
-//! Commands run with a cleared environment and a fixed `PATH`. sudo keeps the caller's `PATH` unless
-//! the system sets `secure_path`, and the helper must never run an `ip` the caller chose.
+//! Commands run with a cleared environment, a fixed `PATH` and their own process group. sudo keeps
+//! the caller's `PATH` unless the system sets `secure_path`, and the helper must never run an `ip`
+//! the caller chose; and a terminal's Ctrl-C, which the helper handles, must not kill a command
+//! halfway through teardown.
 
 use std::{
     collections::HashSet,
@@ -14,7 +16,7 @@ use std::{
     os::{
         fd::OwnedFd,
         raw::{c_char, c_int, c_short},
-        unix::fs::MetadataExt as _,
+        unix::{fs::MetadataExt as _, process::CommandExt as _},
     },
     process::{Command, Output, Stdio},
 };
@@ -23,7 +25,7 @@ use anyhow::{Context as _, anyhow, bail, ensure};
 use ipnet::IpNet;
 use rustix::{
     io::Errno,
-    ioctl::{Opcode, Updater, ioctl, opcode},
+    ioctl::{IntegerSetter, Opcode, Updater, ioctl, opcode},
 };
 use serde::{Deserialize, de::IgnoredAny};
 
@@ -32,13 +34,16 @@ use crate::{
     route::{DEVICE, DNS_ADDR, PIN_PROTO, targets::Snapshot},
 };
 
-/// Root-owned directories only, wherever the system keeps iproute2 and resolvectl.
-const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin";
+/// Wherever distributions keep iproute2 and resolvectl, and nothing a user might own: `/usr/local`
+/// is often user-writable (`npm -g`), and neither tool lives there.
+const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin";
 /// systemd-resolved's stub listener.
 const RESOLVED_STUB: &str = "127.0.0.53";
 /// `_IOW('T', 202, int)` from `<linux/if_tun.h>`: the size says `int`, but the driver reads and
 /// writes back a whole `ifreq`.
 const TUNSETIFF: Opcode = opcode::write::<c_int>(b'T', 202);
+/// `_IOW('T', 203, int)`, whose int travels by value.
+const TUNSETPERSIST: Opcode = opcode::write::<c_int>(b'T', 203);
 
 const _: () = assert!(DEVICE.len() < libc::IFNAMSIZ, "the device name must fit an ifreq with its NUL");
 
@@ -63,13 +68,16 @@ pub struct Via {
     pub dev: String,
     /// `None` when the address is on-link.
     pub gateway: Option<IpAddr>,
+    /// `false` when the kernel delivers the address some other way (it's one of this machine's):
+    /// the local table outranks main, so no route sshunnel adds can capture it.
+    pub unicast: bool,
 }
 
 /// The route the kernel picks for `addr`, rules included.
 ///
 /// # Errors
 ///
-/// Fails when nothing routes `addr`, or its route isn't a plain unicast one.
+/// Fails when nothing routes `addr`, or its gateway is of the other address family.
 pub fn route_get(addr: IpAddr) -> Res<Via> {
     parse_route_get(&output("ip", &["-j", "route", "get", &addr.to_string()])?).with_context(|| format!("finding the route to {addr}"))
 }
@@ -104,12 +112,13 @@ pub fn upstream_dns() -> Res<Vec<IpAddr>> {
 }
 
 /// Creates [`DEVICE`]: a non-persistent TUN device without packet info, which vanishes, with its
-/// addresses, routes and resolver config, when the last fd on it closes.
+/// addresses, routes and resolver config, when the last fd on it closes. It must be new: an
+/// existing one, leftover or made persistent, is never attached to and configured.
 ///
 /// # Errors
 ///
-/// "Another sshunnel route is running" when the device exists and is in use; otherwise whatever the
-/// driver says (without root, `EPERM`).
+/// "Another sshunnel route is running" when the device exists; otherwise whatever the driver says
+/// (without root, `EPERM`).
 pub fn create_tun() -> Res<OwnedFd> {
     let device = OpenOptions::new().read(true).write(true).open("/dev/net/tun").context("opening /dev/net/tun")?;
 
@@ -117,10 +126,9 @@ pub fn create_tun() -> Res<OwnedFd> {
     for (slot, byte) in name.iter_mut().zip(DEVICE.bytes()) {
         *slot = c_char::from_ne_bytes([byte]);
     }
-    let flags = c_short::try_from(libc::IFF_TUN | libc::IFF_NO_PI).context("TUN flags overflow a short")?;
     let mut request = libc::ifreq {
         ifr_name: name,
-        ifr_ifru: libc::__c_anonymous_ifr_ifru { ifru_flags: flags },
+        ifr_ifru: libc::__c_anonymous_ifr_ifru { ifru_flags: tun_flags()? },
     };
 
     // SAFETY: TUNSETIFF takes a pointer to a `struct ifreq`, which `libc::ifreq` mirrors, and may
@@ -129,9 +137,30 @@ pub fn create_tun() -> Res<OwnedFd> {
     let attached = unsafe { ioctl(&device, Updater::<TUNSETIFF, libc::ifreq>::new(&mut request)) };
     match attached {
         Ok(()) => Ok(device.into()),
-        Err(Errno::BUSY) => bail!("another sshunnel route is running ({DEVICE} is in use)"),
+        Err(Errno::BUSY) => bail!("another sshunnel route is running, or a leftover {DEVICE} is in use (`ip link del {DEVICE}` removes one)"),
         Err(e) => Err(e).with_context(|| format!("creating the TUN device {DEVICE}")),
     }
+}
+
+/// Clears the device's persist flag, then closes this fd on it. A client holding the other fd can
+/// set the flag without any capability; cleared here, the device still goes when that fd closes.
+///
+/// # Errors
+///
+/// Fails when the driver refuses, after closing the fd all the same.
+pub fn release_tun(tun: OwnedFd) -> Void {
+    // SAFETY: TUNSETPERSIST takes its argument by value, an int where 0 clears the flag, and `tun`
+    // is an open fd on the device for the whole call.
+    let cleared = unsafe { ioctl(&tun, IntegerSetter::<TUNSETPERSIST>::new_usize(0)) };
+    drop(tun);
+    cleared.with_context(|| format!("clearing {DEVICE}'s persist flag"))
+}
+
+/// `IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL`, the last so an existing device is EBUSY. 0x9001 overflows a
+/// signed short, so the bits go through `u16`.
+fn tun_flags() -> Res<c_short> {
+    let bits = u16::try_from(libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_TUN_EXCL).context("TUN flags overflow 16 bits")?;
+    Ok(c_short::from_ne_bytes(bits.to_ne_bytes()))
 }
 
 /// Whether this process shares the network namespace of pid 1, whose links systemd-resolved
@@ -148,11 +177,11 @@ pub(crate) fn run<S: AsRef<OsStr>>(program: &str, args: &[S]) -> Void {
     checked(program, args).map(drop)
 }
 
-/// `program` with `args` and nothing else from this process: no environment but [`SYSTEM_PATH`],
-/// and no stdin.
+/// `program` with `args` and nothing else from this process: no environment but [`SYSTEM_PATH`], no
+/// stdin, and a process group of its own, out of reach of the terminal's Ctrl-C.
 fn tool<S: AsRef<OsStr>>(program: &str, args: &[S]) -> Command {
     let mut command = Command::new(program);
-    command.args(args).env_clear().env("PATH", SYSTEM_PATH).stdin(Stdio::null());
+    command.args(args).env_clear().env("PATH", SYSTEM_PATH).stdin(Stdio::null()).process_group(0);
     command
 }
 
@@ -252,11 +281,13 @@ fn parse_route_get(json: &str) -> Res<Via> {
     let got: Vec<Got> = serde_json::from_str(json).context("parsing `ip -j route get`")?;
     let [got] = <[Got; 1]>::try_from(got).map_err(|routes| anyhow!("expected one route, got {}", routes.len()))?;
 
-    if let Some(kind) = got.kind.filter(|kind| kind != "unicast") {
-        bail!("the route is {kind}, not unicast");
-    }
-    ensure!(got.via.is_none(), "the route's gateway is of the other address family, which can't be pinned");
-    Ok(Via { dev: got.dev, gateway: got.gateway })
+    let unicast = got.kind.as_deref().is_none_or(|kind| kind == "unicast");
+    ensure!(!unicast || got.via.is_none(), "the route's gateway is of the other address family, which can't be pinned");
+    Ok(Via {
+        dev: got.dev,
+        gateway: got.gateway,
+        unicast,
+    })
 }
 
 /// The `nameserver` addresses in a resolv.conf.
@@ -361,30 +392,24 @@ mod tests {
 
     #[test]
     fn route_get_parses_ip_json() {
-        let via = parse_route_get(r#"[{"dst":"192.0.2.77","gateway":"192.0.2.1","dev":"eth0","prefsrc":"192.0.2.10","flags":[],"uid":1000,"cache":[]}]"#).unwrap();
-        assert_eq!(
-            via,
-            Via {
-                dev: "eth0".to_owned(),
-                gateway: Some(addr("192.0.2.1"))
-            }
-        );
+        let via = |dev: &str, gateway: Option<&str>, unicast: bool| Via {
+            dev: dev.to_owned(),
+            gateway: gateway.map(addr),
+            unicast,
+        };
+
+        let routed = parse_route_get(r#"[{"dst":"192.0.2.77","gateway":"192.0.2.1","dev":"eth0","prefsrc":"192.0.2.10","flags":[],"uid":1000,"cache":[]}]"#).unwrap();
+        assert_eq!(routed, via("eth0", Some("192.0.2.1"), true));
 
         let on_link = parse_route_get(r#"[{"dst":"192.0.2.5","dev":"eth0","prefsrc":"192.0.2.10","flags":[],"uid":1000,"cache":[]}]"#).unwrap();
-        assert_eq!(on_link, Via { dev: "eth0".to_owned(), gateway: None });
+        assert_eq!(on_link, via("eth0", None, true));
 
         let v6 = parse_route_get(r#"[{"dst":"2001:db8::1","from":"::","gateway":"fe80::1","dev":"eth0","protocol":"ra","metric":100,"flags":[],"pref":"high"}]"#).unwrap();
-        assert_eq!(
-            v6,
-            Via {
-                dev: "eth0".to_owned(),
-                gateway: Some(addr("fe80::1"))
-            }
-        );
+        assert_eq!(v6, via("eth0", Some("fe80::1"), true));
 
-        // Pinning copies a unicast route; anything else has no next hop to copy.
-        let local = parse_route_get(r#"[{"type":"local","dst":"127.0.0.1","dev":"lo","prefsrc":"127.0.0.1","flags":[],"uid":1000,"cache":["local"]}]"#);
-        assert!(local.unwrap_err().to_string().contains("local"));
+        // The machine's own address: the local table delivers it, so there is nothing to pin.
+        let local = parse_route_get(r#"[{"type":"local","dst":"127.0.0.1","dev":"lo","prefsrc":"127.0.0.1","flags":[],"uid":1000,"cache":["local"]}]"#).unwrap();
+        assert_eq!(local, via("lo", None, false));
         let other_family = parse_route_get(r#"[{"dst":"192.0.2.9","via":{"family":"inet6","host":"fe80::1"},"dev":"eth0","flags":[]}]"#);
         assert!(other_family.is_err());
         assert!(parse_route_get("[]").is_err());
@@ -423,8 +448,29 @@ mod tests {
             return;
         }
         // The driver checks the request and the name before the capability, so EPERM (not ENOTTY
-        // or EINVAL) means the opcode and the `ifreq` were understood.
+        // or EINVAL) means the opcode and the `ifreq` were understood; with a session running, the
+        // exclusive flag answers EBUSY first.
         let error = format!("{:#}", create_tun().unwrap_err());
-        assert!(error.contains(DEVICE) && error.contains("Operation not permitted"), "{error}");
+        assert!(error.contains(DEVICE) && (error.contains("Operation not permitted") || error.contains("in use")), "{error}");
+    }
+
+    #[test]
+    fn the_device_is_created_exclusively() {
+        // IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL: an existing sshunnel0, leftover or made persistent by
+        // a client, is EBUSY rather than attached to and configured.
+        assert_eq!(tun_flags().unwrap().to_ne_bytes(), 0x9001_u16.to_ne_bytes());
+    }
+
+    #[test]
+    fn system_commands_run_in_their_own_process_group() {
+        // A terminal's Ctrl-C goes to its foreground process group; a command leading its own group
+        // (pgid == pid) never sees it, so a second Ctrl-C can't cut teardown's `ip route del` short.
+        run("sh", &["-c", "read -r pid comm state ppid pgrp rest < /proc/$$/stat && [ \"$pid\" = \"$pgrp\" ]"]).unwrap();
+    }
+
+    #[test]
+    fn the_system_path_leaves_out_usr_local() {
+        // /usr/local is often user-writable (`npm -g`), and an `ip` planted there would run as root.
+        assert!(SYSTEM_PATH.split(':').all(|dir| !dir.starts_with("/usr/local")), "{SYSTEM_PATH}");
     }
 }
