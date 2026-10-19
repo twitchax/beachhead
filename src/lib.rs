@@ -2,7 +2,8 @@
 //!
 //! [`session::Session`] runs the system `ssh` with the [`bootstrap`] script, which finds or
 //! receives the relay and execs it; the mux from `sshunnel-mux` then carries streams over that
-//! one session. [`forward`] turns local TCP listeners into streams.
+//! one session. [`tunnel::Tunnel`] is the seam between that transport and its users; [`forward`]
+//! turns local TCP listeners into streams through it.
 
 pub mod arch;
 pub mod base;
@@ -11,3 +12,4 @@ pub mod forward;
 pub mod relays;
 pub mod session;
 pub mod tests;
+pub mod tunnel;

@@ -10,13 +10,11 @@ use std::{
 };
 
 use anyhow::{Context as _, anyhow, bail};
-use sshunnel_mux::{
-    Mux,
-    base::{Err, Res, Void},
-    pump,
-};
+use sshunnel_mux::base::{Err, Res, Void};
 use tokio::net::TcpListener;
 use tracing::{debug, warn};
+
+use crate::tunnel::{Conn as _, Tunnel};
 
 /// One `-L [bind_address:]port:host:hostport` spec.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +138,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(1);
 /// None: like `ssh -L`, it outlives a failed accept (EMFILE once the process is out of
 /// descriptors) by logging it and retrying after a backoff, and a failed connection is logged and
 /// dropped.
-pub async fn serve(mux: Mux, listener: TcpListener, host: Arc<str>, port: u16) -> Void {
+pub async fn serve<T: Tunnel>(tunnel: T, listener: TcpListener, host: Arc<str>, port: u16) -> Void {
     let mut backoff = MIN_BACKOFF;
     loop {
         let (socket, peer) = match listener.accept().await {
@@ -157,12 +155,12 @@ pub async fn serve(mux: Mux, listener: TcpListener, host: Arc<str>, port: u16) -
                 continue;
             }
         };
-        let (mux, host) = (mux.clone(), Arc::clone(&host));
+        let (tunnel, host) = (tunnel.clone(), Arc::clone(&host));
         tokio::spawn(async move {
             // Frames already batch; Nagle would only add latency on top.
             let _ = socket.set_nodelay(true);
-            match mux.open(&host, port).await {
-                Ok(stream) => match pump(stream, socket).await {
+            match tunnel.open(&host, port).await {
+                Ok(conn) => match conn.pump(socket).await {
                     Ok(traffic) => debug!(%peer, sent = traffic.sent, received = traffic.received, "connection closed"),
                     Err(e) => debug!(%peer, "connection failed: {e:#}"),
                 },
