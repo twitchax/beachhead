@@ -10,6 +10,7 @@ pub mod base;
 pub mod bootstrap;
 pub mod forward;
 pub mod relays;
+pub mod route;
 pub mod session;
 pub mod tests;
 pub mod tunnel;

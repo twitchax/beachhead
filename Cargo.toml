@@ -48,6 +48,7 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 anyhow.workspace = true
 sshunnel-mux.workspace = true
 bytes.workspace = true
+ipnet = "2"
 sha2 = "0.11"
 shlex = "2"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time"] }
