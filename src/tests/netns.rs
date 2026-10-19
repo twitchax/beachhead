@@ -1,7 +1,7 @@
-//! The namespace harness for `route`'s e2e tests. [`netns`] runs a test again as root over a fresh
-//! user and network namespace, where it can create a TUN device and routes without touching the
-//! machine, and [`RemoteNs`] is a second network namespace, joined to the first by a veth pair, that
-//! plays the remote's network.
+//! The namespace harness for `route`'s e2e tests. [`netns`] runs a test again as root over fresh
+//! user, mount, PID and network namespaces, where it can create a TUN device, routes and bind mounts
+//! without touching the machine, and [`RemoteNs`] is a second network namespace, joined to the first
+//! by a veth pair, that plays the remote's network.
 //!
 //! Ubuntu (23.10 on) restricts unprivileged user namespaces through `AppArmor`. There, the test
 //! runs again in a privileged Docker container built from the host's own Ubuntu release, so the
@@ -10,29 +10,29 @@
 use std::{
     ffi::OsString,
     fs::File,
-    io::{BufRead as _, BufReader, Write as _},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    io::{self, BufRead as _, BufReader, Write as _},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
     os::fd::AsFd as _,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, anyhow, bail, ensure};
 use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
 
-use crate::base::{Res, Void};
+use crate::base::{Err, Res, Void};
 
 /// Set for the test run again inside: there, [`netns`] lets the body run.
 const INSIDE: &str = "SSHUNNEL_IN_NETNS";
 /// `docker` forces the container even where user namespaces work, so CI keeps that path from rotting.
 const FORCE: &str = "SSHUNNEL_NETNS";
-/// Under nextest's 120 s kill (`.config/nextest.toml`), so a container never outlives its test: a
-/// killed `docker run` leaves its container running.
+/// How long a test has, from entering [`netns`], to finish in its container: under nextest's 120 s
+/// kill (`.config/nextest.toml`), since a killed `docker run` leaves its container running.
 const CONTAINER_TIMEOUT: Duration = Duration::from_secs(110);
 
 /// Whether to run the test's body here. Outside, runs the test named `test` again as root over fresh
-/// namespaces (directly under `unshare -rn`, else in a container), returns `false` once it passed,
+/// namespaces (directly with `unshare`, else in a container), returns `false` once it passed,
 /// and prints a skip where neither works. Inside, returns `true`. Each test opens with
 /// `if !netns("its_name").unwrap() { return; }`.
 ///
@@ -41,19 +41,28 @@ const CONTAINER_TIMEOUT: Duration = Duration::from_secs(110);
 /// Fails when the test fails in its namespaces, when `test` names no test (the run again would run
 /// nothing and pass), and when no namespace is available under `CI`.
 pub fn netns(test: &str) -> Res<bool> {
+    let entered = Instant::now();
     if std::env::var_os(INSIDE).is_some() {
         return Ok(true);
     }
     let exe = std::env::current_exe().context("locating the test executable")?;
     ensure_listed(&exe, test)?;
-    let Some(runner) = Runner::pick()? else {
-        ensure!(std::env::var_os("CI").is_none(), "no network namespaces on this CI runner: `unshare -rn` fails and Docker isn't usable");
-        eprintln!("skipped: no network namespaces (`unshare -rn` fails, and Docker isn't usable)");
-        return Ok(false);
+    let runner = match Runner::pick()? {
+        Ok(runner) => runner,
+        Err(why) => {
+            ensure!(std::env::var_os("CI").is_none(), "on this CI runner, {}", unavailable(&why));
+            eprintln!("skipped: {}", unavailable(&why));
+            return Ok(false);
+        }
     };
-    let status = runner.command(&exe, test)?.status().context("running the test in its namespaces")?;
+    let status = runner.command(&exe, test, entered)?.status().context("running the test in its namespaces")?;
     ensure!(status.success(), "{test} failed in its namespaces ({status})");
     Ok(false)
+}
+
+/// Why no namespace is to be had, with the reason the container can't stand in.
+fn unavailable(why: &Err) -> String {
+    format!("no network namespaces: `unshare -rn` fails, and the container can't stand in ({why:#})")
 }
 
 /// Fails unless `exe` has exactly one test named `test`.
@@ -65,18 +74,22 @@ fn ensure_listed(exe: &Path, test: &str) -> Void {
     Ok(())
 }
 
-/// The command that runs `test` alone, inside a fresh user and network namespace, with its output
-/// passed through.
+/// The command that runs `test` alone (ignored or not), with its output passed through, as root in
+/// fresh user, mount, PID and network namespaces. The PID namespace takes every process the test
+/// leaves behind down with it, even one in a process group of its own. Its PID 1 is a shell that
+/// stays in the outer network namespace, as a machine's init does, so the helper's check that
+/// patterns run in init's namespace still refuses inside the test's.
 fn rerun(exe: &Path, test: &str) -> Vec<OsString> {
-    let mut command: Vec<OsString> = ["unshare", "-rn"].map(OsString::from).into();
+    let outer = ["unshare", "-rmp", "--fork", "--kill-child", "--mount-proc", "sh", "-c", r#"unshare -n "$@"; exit $?"#, "sh"];
+    let mut command: Vec<OsString> = outer.map(OsString::from).into();
     command.push(exe.into());
-    command.extend(["--exact", test, "--nocapture"].map(OsString::from));
+    command.extend(["--exact", test, "--nocapture", "--include-ignored"].map(OsString::from));
     command
 }
 
 /// Where the test runs again.
 enum Runner {
-    /// Here, under `unshare -rn`.
+    /// Here, where `unshare -rn` works.
     Direct,
     /// In a container of this Ubuntu release.
     Docker { codename: String },
@@ -84,21 +97,22 @@ enum Runner {
 
 impl Runner {
     /// The container when [`FORCE`]d; else here, where user namespaces work; else the container,
-    /// where it can run; else `None`.
-    fn pick() -> Res<Option<Self>> {
+    /// where it can run. The inner `Err` says why the container can't.
+    fn pick() -> Res<Result<Self, Err>> {
         match std::env::var(FORCE) {
-            Ok(choice) if choice == "docker" => return docker_codename().map(|codename| Some(Self::Docker { codename })),
+            Ok(choice) if choice == "docker" => return docker_codename().map(|codename| Ok(Self::Docker { codename })),
             Ok(choice) => bail!("{FORCE}={choice}: the one choice is `docker`"),
             Err(_) => {}
         }
         if succeeds(Command::new("unshare").args(["-rn", "true"])) {
-            return Ok(Some(Self::Direct));
+            return Ok(Ok(Self::Direct));
         }
-        Ok(docker_codename().ok().map(|codename| Self::Docker { codename }))
+        Ok(docker_codename().map(|codename| Self::Docker { codename }))
     }
 
-    /// The [`rerun`] of `test` in `exe`, where this runner runs it, with [`INSIDE`] set.
-    fn command(&self, exe: &Path, test: &str) -> Res<Command> {
+    /// The [`rerun`] of `test` in `exe`, where this runner runs it, with [`INSIDE`] set. A container
+    /// gets what is left of [`CONTAINER_TIMEOUT`] since `entered`, after any image build.
+    fn command(&self, exe: &Path, test: &str, entered: Instant) -> Res<Command> {
         let inner = rerun(exe, test);
         match self {
             Self::Direct => {
@@ -109,10 +123,14 @@ impl Runner {
             }
             Self::Docker { codename } => {
                 let image = image(codename)?;
+                let limit = CONTAINER_TIMEOUT
+                    .checked_sub(entered.elapsed())
+                    .filter(|left| left.as_secs() > 0)
+                    .context("building the image took the test's whole time")?;
                 let mounts = [PathBuf::from(env!("CARGO_MANIFEST_DIR")), target_dir(exe)?];
                 let workdir = std::env::current_dir().context("reading the working directory")?;
                 let mut command = Command::new("docker");
-                command.args(docker_run(&image, &mounts, &workdir, &inner)?);
+                command.args(docker_run(&image, &mounts, &workdir, limit, &inner)?);
                 Ok(command)
             }
         }
@@ -173,8 +191,9 @@ fn image(codename: &str) -> Res<String> {
 }
 
 /// `docker run`'s arguments: `inner` as root in a privileged container with no network, `mounts`
-/// read-only at their own paths (so nothing root-owned lands in the tree), and a time limit.
-fn docker_run(image: &str, mounts: &[PathBuf], workdir: &Path, inner: &[OsString]) -> Res<Vec<OsString>> {
+/// read-only at their own paths (so nothing root-owned lands in the tree), and `limit` (whole
+/// seconds) to live.
+fn docker_run(image: &str, mounts: &[PathBuf], workdir: &Path, limit: Duration, inner: &[OsString]) -> Res<Vec<OsString>> {
     // Root: in a privileged container, any other user hits the same AppArmor restriction.
     let mut args: Vec<OsString> = ["run", "--rm", "--init", "--privileged", "--network", "none"].map(OsString::from).into();
     for mount in mounts {
@@ -185,7 +204,7 @@ fn docker_run(image: &str, mounts: &[PathBuf], workdir: &Path, inner: &[OsString
     args.extend(["--workdir".into(), workdir.into()]);
     args.extend(["--env".into(), format!("{INSIDE}=1").into()]);
     args.extend(["--env", "CI", image, "timeout"].map(OsString::from));
-    args.push(CONTAINER_TIMEOUT.as_secs().to_string().into());
+    args.push(limit.as_secs().to_string().into());
     args.extend(inner.iter().cloned());
     Ok(args)
 }
@@ -288,19 +307,32 @@ impl RemoteNs {
         run(Command::new("nsenter").arg(self.net()).args(command))
     }
 
-    /// A listener bound to `addr` in the remote's namespace. Only the thread that binds it enters
-    /// the namespace; the socket stays there after.
+    /// A listener bound to `addr` in the remote's namespace.
     ///
     /// # Errors
     ///
     /// Fails when the namespace can't be entered or `addr` can't be bound there.
     pub fn listen(&self, addr: SocketAddr) -> Res<TcpListener> {
+        self.bind(addr, TcpListener::bind)
+    }
+
+    /// A UDP socket bound to `addr` in the remote's namespace.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the namespace can't be entered or `addr` can't be bound there.
+    pub fn udp(&self, addr: SocketAddr) -> Res<UdpSocket> {
+        self.bind(addr, UdpSocket::bind)
+    }
+
+    /// `bind(addr)` on a thread that enters the remote's namespace first; the socket stays there.
+    fn bind<T: Send>(&self, addr: SocketAddr, bind: fn(SocketAddr) -> io::Result<T>) -> Res<T> {
         let ns = File::open(self.net_path()).context("opening the remote's namespace")?;
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     move_into_link_name_space(ns.as_fd(), Some(LinkNameSpaceType::Network)).context("entering the remote's namespace")?;
-                    TcpListener::bind(addr).with_context(|| format!("binding {addr} in the remote's namespace"))
+                    bind(addr).with_context(|| format!("binding {addr} in the remote's namespace"))
                 })
                 .join()
                 .map_err(|_| anyhow!("binding {addr} in the remote's namespace panicked"))?
@@ -346,8 +378,30 @@ mod tests {
     fn the_rerun_is_one_test_in_fresh_namespaces() {
         assert_eq!(
             rerun(Path::new("/repo/target/debug/deps/route-0123"), "e2e_route_x"),
-            strings(&["unshare", "-rn", "/repo/target/debug/deps/route-0123", "--exact", "e2e_route_x", "--nocapture"])
+            strings(&[
+                "unshare",
+                "-rmp",
+                "--fork",
+                "--kill-child",
+                "--mount-proc",
+                "sh",
+                "-c",
+                r#"unshare -n "$@"; exit $?"#,
+                "sh",
+                "/repo/target/debug/deps/route-0123",
+                "--exact",
+                "e2e_route_x",
+                "--nocapture",
+                "--include-ignored",
+            ])
         );
+    }
+
+    #[test]
+    fn a_skip_says_why_the_container_cant_stand_in() {
+        let skip = unavailable(&anyhow!("`docker info` fails: Docker isn't usable"));
+
+        assert!(skip.contains("unshare -rn") && skip.contains("`docker info` fails"), "{skip}");
     }
 
     #[test]
@@ -372,7 +426,7 @@ mod tests {
         let inner = rerun(Path::new("/repo/target/debug/deps/route-0123"), "e2e_route_x");
         let mounts = [PathBuf::from("/repo"), PathBuf::from("/repo/target")];
 
-        let args = docker_run("sshunnel-netns:noble", &mounts, Path::new("/repo"), &inner).unwrap();
+        let args = docker_run("sshunnel-netns:noble", &mounts, Path::new("/repo"), Duration::from_secs(95), &inner).unwrap();
 
         let mut expected = strings(&[
             "run",
@@ -393,17 +447,24 @@ mod tests {
             "CI",
             "sshunnel-netns:noble",
             "timeout",
-            "110",
+            "95",
         ]);
         expected.extend(inner);
         assert_eq!(args, expected);
 
         // `--volume` splits on colons.
-        assert!(docker_run("sshunnel-netns:noble", &[PathBuf::from("/a:b")], Path::new("/repo"), &[]).is_err());
+        assert!(docker_run("sshunnel-netns:noble", &[PathBuf::from("/a:b")], Path::new("/repo"), CONTAINER_TIMEOUT, &[]).is_err());
     }
 
     #[test]
     fn the_container_outlives_no_test() {
-        assert!(CONTAINER_TIMEOUT < Duration::from_mins(2), "nextest kills a test after four 30 s periods");
+        // nextest kills a test after `terminate-after` slow periods; the container must end first.
+        let config = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".config/nextest.toml")).unwrap();
+        let slow = config.lines().find_map(|line| line.strip_prefix("slow-timeout = ")).expect("nextest.toml sets a slow-timeout");
+        let field = |name: &str| slow.split(name).nth(1).and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty()));
+        let period: u64 = field("period").unwrap().parse().unwrap();
+        let after: u32 = field("terminate-after").unwrap().parse().unwrap();
+
+        assert!(CONTAINER_TIMEOUT < Duration::from_secs(period) * after, "nextest kills a test at {period} s x {after}");
     }
 }

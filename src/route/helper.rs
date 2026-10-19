@@ -370,7 +370,8 @@ impl Applied {
 /// first and drops the fd, which takes the device and everything on it along.
 fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
     let targets = Targets::parse(&setup.include, &setup.exclude)?;
-    let mut warnings = targets.check(&system::snapshot()?)?;
+    let snapshot = system::snapshot()?;
+    let mut warnings = targets.check(&snapshot)?;
     // resolvectl names the link by index, and resolved serves pid 1's namespace: from another one,
     // the config would land on whatever link has the same index there.
     ensure!(
@@ -386,7 +387,10 @@ fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
         system::run("ip", &[family, "route", "flush", "proto", &proto])?;
     }
     // Each pin copies the route its address has before the device has any.
-    let vias = honored(&routes, &setup.pins).into_iter().map(|pin| Ok((pin, system::route_get(pin)?))).collect::<Res<Vec<_>>>()?;
+    let vias = honored(&routes, &setup.pins, &snapshot.hosts)
+        .into_iter()
+        .map(|pin| Ok((pin, system::route_get(pin)?)))
+        .collect::<Res<Vec<_>>>()?;
     let plan = plan(&targets, &routes, &vias);
     let pins = execute(&plan.steps, &mut run_step)?;
     warnings.extend(plan.warnings);
@@ -395,9 +399,14 @@ fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
 }
 
 /// The pins a route would capture, each once. A pin outside every route needs nothing, and is never
-/// routed: pins can't add host routes of their own.
-fn honored(routes: &[IpNet], pins: &[IpAddr]) -> Vec<IpAddr> {
-    let mut honored: Vec<IpAddr> = pins.iter().copied().filter(|pin| routes.iter().any(|route| route.contains(pin))).collect();
+/// routed: pins can't add host routes of their own. Nor does one with a host route of its own in
+/// `hosts` (the main table's), which outranks every route but one to that very host.
+fn honored(routes: &[IpNet], pins: &[IpAddr], hosts: &[IpAddr]) -> Vec<IpAddr> {
+    let captured = |pin: &IpAddr| {
+        let host = IpNet::from(*pin);
+        routes.contains(&host) || (!hosts.contains(pin) && routes.iter().any(|route| route.contains(pin)))
+    };
+    let mut honored: Vec<IpAddr> = pins.iter().copied().filter(captured).collect();
     honored.sort_unstable();
     honored.dedup();
     honored
@@ -954,7 +963,19 @@ mod tests {
         let routes = [net("10.99.0.0/17"), net("fd99::/64")];
         let pins = ["192.0.2.7", "10.99.0.5", "10.99.200.1", "10.99.0.5", "fd99::5", "198.18.0.9"].map(addr);
 
-        assert_eq!(honored(&routes, &pins), vec![addr("10.99.0.5"), addr("fd99::5")]);
+        assert_eq!(honored(&routes, &pins, &[]), vec![addr("10.99.0.5"), addr("fd99::5")]);
+    }
+
+    #[test]
+    fn pins_with_a_host_route_of_their_own_are_left_alone() {
+        // That host route outranks every route sshunnel adds, so the address keeps it untouched, and
+        // a pin would collide with it (EEXIST at metric 0).
+        let routes = [net("10.98.0.0/16"), net("10.99.0.5/32")];
+        let pins = ["10.98.0.2", "10.98.0.3", "10.99.0.5"].map(addr);
+        let hosts = ["10.98.0.2", "10.99.0.5"].map(addr);
+
+        // Unless a target is that very host: its route would compete, so the pin still goes in.
+        assert_eq!(honored(&routes, &pins, &hosts), [addr("10.98.0.3"), addr("10.99.0.5")]);
     }
 
     #[test]

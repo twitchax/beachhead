@@ -91,9 +91,10 @@ async fn e2e_route_name_connects_by_name() {
 
     // A name the remote doesn't know doesn't resolve here either.
     assert_eq!(getent("ahostsv4", "nonexistent.corp.example"), None);
-    // AAAA is NODATA: an IPv6 lookup finds the A record alone, v4-mapped.
-    let v6 = getent("ahostsv6", "wiki.corp.example").unwrap_or_default();
-    assert!(v6.iter().all(|addr| matches!(addr, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some())), "{v6:?}");
+    // AAAA is NODATA: an IPv6 lookup (glibc's ahostsv6 asks with AI_V4MAPPED) finds the A record
+    // alone, v4-mapped. A failed lookup would mean NXDOMAIN or SERVFAIL instead.
+    let v6 = getent("ahostsv6", "wiki.corp.example").expect("an IPv6 lookup finds the A record, v4-mapped");
+    assert!(!v6.is_empty() && v6.iter().all(|addr| matches!(addr, IpAddr::V6(_)) && is_fake(addr)), "{v6:?}");
     stop(route).await;
 }
 

@@ -31,7 +31,10 @@ use serde::{Deserialize, de::IgnoredAny};
 
 use crate::{
     base::{Res, Void},
-    route::{DEVICE, DNS_ADDR, PIN_PROTO, targets::Snapshot},
+    route::{
+        DEVICE, DNS_ADDR, PIN_PROTO,
+        targets::{Snapshot, Taken},
+    },
 };
 
 /// Wherever distributions keep iproute2 and resolvectl, and nothing a user might own: `/usr/local`
@@ -53,13 +56,16 @@ const _: () = assert!(DEVICE.len() < libc::IFNAMSIZ, "the device name must fit a
 ///
 /// Fails when `ip` can't run or prints something unexpected.
 pub fn snapshot() -> Res<Snapshot> {
-    let mut connected = Vec::new();
+    let mut snapshot = Snapshot::default();
     for family in ["-4", "-6"] {
         let rules = output("ip", &["-j", family, "rule", "show"])?;
         let routes = output("ip", &["-j", family, "route", "show", "table", "all"])?;
-        connected.extend(parse_snapshot(&rules, &routes)?.connected);
+        let Snapshot { connected, taken, hosts } = parse_snapshot(&rules, &routes)?;
+        snapshot.connected.extend(connected);
+        snapshot.taken.extend(taken);
+        snapshot.hosts.extend(hosts);
     }
-    Ok(Snapshot { connected })
+    Ok(snapshot)
 }
 
 /// Where the machine sends traffic for one address right now: the route a pin copies.
@@ -258,42 +264,97 @@ struct Route {
     table: Option<String>,
     dev: Option<String>,
     protocol: Option<String>,
-    gateway: Option<IgnoredAny>,
+    gateway: Option<String>,
     /// A gateway of the other family (`via inet6 ...`).
     via: Option<IgnoredAny>,
     nexthops: Option<IgnoredAny>,
+    /// Absent for a v4 route at metric 0.
+    metric: Option<u32>,
+    /// Absent for TOS 0.
+    tos: Option<IgnoredAny>,
 }
 
 impl Route {
     fn is_unicast(&self) -> bool {
         self.kind.as_deref().is_none_or(|kind| kind == "unicast")
     }
+
+    /// The destination, which `ip` prints without a prefix for a host route.
+    fn net(&self) -> Res<IpNet> {
+        let net = self.dst.parse::<IpNet>().or_else(|_| self.dst.parse::<IpAddr>().map(IpNet::from));
+        net.with_context(|| format!("unexpected route destination '{}'", self.dst))
+    }
+
+    /// How it routes, for a refusal: `via 192.0.2.1 dev eth0, metric 0`.
+    fn describe(&self, metric: u32) -> String {
+        let how: Vec<String> = [
+            self.kind.clone().filter(|_| !self.is_unicast()),
+            self.gateway.as_ref().map(|gateway| format!("via {gateway}")),
+            self.nexthops.as_ref().map(|_| "via several next hops".to_owned()),
+            self.dev.as_ref().map(|dev| format!("dev {dev}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if how.is_empty() {
+            format!("metric {metric}")
+        } else {
+            format!("{}, metric {metric}", how.join(" "))
+        }
+    }
 }
 
-/// The on-link unicast routes (no next hop: v4 marks them scope link, v6 marks them no scope at
-/// all) of the tables `rules` consult, from `ip -j rule show` and `ip -j route show table all` for
-/// one family. sshunnel's own device and its pinned routes are not connected subnets.
+/// The metric `ip route add` gives a route that names none: 0 for IPv4; for IPv6 the kernel's 1024,
+/// which a 0 also means.
+fn add_metric(net: &IpNet) -> u32 {
+    match net {
+        IpNet::V4(_) => 0,
+        IpNet::V6(_) => 1024,
+    }
+}
+
+/// The routing state the checks need, for one family, from `ip -j rule show` and `ip -j route show
+/// table all`. sshunnel's own device and pinned routes count for none of it.
+///
+/// - Connected: the on-link unicast routes (no next hop: v4 marks them scope link, v6 marks them no
+///   scope at all) of the tables `rules` consult.
+/// - Taken: the main table's routes at the metric `ip route add` would use, and (v4) TOS 0, of any
+///   type: the kernel refuses an equal route next to one (EEXIST).
+/// - Hosts: the main table's host routes, at any metric.
 fn parse_snapshot(rules: &str, routes: &str) -> Res<Snapshot> {
     let rules: Vec<Rule> = serde_json::from_str(rules).context("parsing `ip -j rule show`")?;
     let routes: Vec<Route> = serde_json::from_str(routes).context("parsing `ip -j route show`")?;
     let tables: HashSet<String> = rules.into_iter().filter_map(|rule| rule.table).collect();
     let pin_proto = PIN_PROTO.to_string();
 
-    let mut connected = Vec::new();
+    let mut snapshot = Snapshot::default();
     for route in routes {
-        let on_link = route.is_unicast() && route.gateway.is_none() && route.via.is_none() && route.nexthops.is_none();
-        let consulted = tables.contains(route.table.as_deref().unwrap_or("main"));
         let ours = route.dev.as_deref() == Some(DEVICE) || route.protocol.as_deref() == Some(&pin_proto);
-        if !on_link || !consulted || ours || route.dst == "default" {
+        if ours || route.dst == "default" {
             continue;
         }
-        let net = route.dst.parse::<IpNet>().or_else(|_| route.dst.parse::<IpAddr>().map(IpNet::from));
-        connected.push(net.with_context(|| format!("unexpected route destination '{}'", route.dst))?);
+        let on_link = route.is_unicast() && route.gateway.is_none() && route.via.is_none() && route.nexthops.is_none();
+        if on_link && tables.contains(route.table.as_deref().unwrap_or("main")) {
+            snapshot.connected.push(route.net()?);
+        }
+        if route.table.is_none() {
+            let net = route.net()?;
+            if net.prefix_len() == net.max_prefix_len() {
+                snapshot.hosts.push(net.addr());
+            }
+            let metric = route.metric.unwrap_or(0);
+            if route.tos.is_none() && metric == add_metric(&net) {
+                snapshot.taken.push(Taken { net, route: route.describe(metric) });
+            }
+        }
     }
 
-    connected.sort_unstable();
-    connected.dedup();
-    Ok(Snapshot { connected })
+    snapshot.connected.sort_unstable();
+    snapshot.connected.dedup();
+    snapshot.taken.sort_unstable_by_key(|taken| taken.net);
+    snapshot.hosts.sort_unstable();
+    snapshot.hosts.dedup();
+    Ok(snapshot)
 }
 
 #[derive(Deserialize)]
@@ -423,6 +484,55 @@ mod tests {
         // A connected route that can't be read fails the check rather than slipping past it.
         assert!(parse_snapshot(RULES6, r#"[{"dst":"not-an-address","dev":"eth0","scope":"link"}]"#).is_err());
         assert!(parse_snapshot("not json", "[]").is_err());
+    }
+
+    #[test]
+    fn snapshot_finds_taken_destinations_and_host_routes() {
+        let rules = r#"[{"priority":0,"src":"all","table":"local"},{"priority":32766,"src":"all","table":"main"}]"#;
+        let routes = r#"[
+            {"dst":"default","gateway":"192.0.2.1","dev":"eth0","protocol":"dhcp","metric":100,"flags":[]},
+            {"dst":"10.99.0.0/16","gateway":"192.0.2.1","dev":"eth0","flags":[]},
+            {"dst":"10.98.0.0/16","gateway":"192.0.2.1","dev":"eth0","metric":100,"flags":[]},
+            {"dst":"10.97.0.0/16","tos":"0x10","gateway":"192.0.2.1","dev":"eth0","flags":[]},
+            {"type":"unreachable","dst":"10.66.0.0/16","flags":[]},
+            {"dst":"10.98.0.2","gateway":"192.0.2.1","dev":"eth0","flags":[]},
+            {"dst":"10.88.0.5","dev":"eth0","metric":100,"scope":"link","flags":[]},
+            {"dst":"10.77.0.0/16","gateway":"192.0.2.1","dev":"eth0","table":"52","flags":[]},
+            {"dst":"198.51.100.7","gateway":"192.0.2.1","dev":"eth0","protocol":"222","flags":[]},
+            {"dst":"10.96.0.0/16","dev":"sshunnel0","scope":"link","flags":[]},
+            {"type":"local","dst":"192.0.2.10","dev":"eth0","table":"local","protocol":"kernel","scope":"host","prefsrc":"192.0.2.10","flags":[]}
+        ]"#;
+        let routes6 = r#"[
+            {"dst":"fd99::/64","gateway":"fe80::1","dev":"eth0","metric":1024,"flags":[],"pref":"medium"},
+            {"dst":"fd98::/64","gateway":"fe80::1","dev":"eth0","protocol":"ra","metric":100,"flags":[],"pref":"medium"},
+            {"dst":"2001:db8::53","gateway":"fe80::1","dev":"eth0","metric":1024,"flags":[],"pref":"medium"}
+        ]"#;
+        let taken = |net: &str, route: &str| Taken {
+            net: self::net(net),
+            route: route.to_owned(),
+        };
+
+        // Only the main table's routes at the metric `ip route add` uses (v4: 0 and TOS 0), and
+        // never sshunnel's own device or pins.
+        let v4 = parse_snapshot(rules, routes).unwrap();
+        assert_eq!(
+            v4.taken,
+            [
+                taken("10.66.0.0/16", "unreachable, metric 0"),
+                taken("10.98.0.2/32", "via 192.0.2.1 dev eth0, metric 0"),
+                taken("10.99.0.0/16", "via 192.0.2.1 dev eth0, metric 0"),
+            ]
+        );
+        // A host route at any metric outranks the routes sshunnel adds.
+        assert_eq!(v4.hosts, [addr("10.88.0.5"), addr("10.98.0.2")]);
+
+        // v6: the kernel's default metric, 1024.
+        let v6 = parse_snapshot(rules, routes6).unwrap();
+        assert_eq!(
+            v6.taken,
+            [taken("2001:db8::53/128", "via fe80::1 dev eth0, metric 1024"), taken("fd99::/64", "via fe80::1 dev eth0, metric 1024"),]
+        );
+        assert_eq!(v6.hosts, [addr("2001:db8::53")]);
     }
 
     #[test]

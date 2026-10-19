@@ -7,12 +7,13 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context as _, bail};
 use ipnet::IpNet;
 use sshunnel_mux::Mux;
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, time::timeout};
 use tracing::warn;
 
 use crate::{
@@ -146,22 +147,39 @@ fn start(tasks: &mut JoinSet<Void>, helper: &mut Helper, mux: &Mux, router: &Arc
 }
 
 /// Runs until a signal (a clean exit), or the session, the helper or a netstack task ends (an
-/// error).
+/// error, unless a signal follows at once: see [`SIGNAL_GRACE`]).
 async fn wait(signals: &mut Signals, session: Session, helper: &mut Helper, tasks: &mut JoinSet<Void>) -> Void {
-    tokio::select! {
-        // A Ctrl-C reaches the helper too, which then exits: the signal is the reason.
-        biased;
-        () = signals.recv() => Ok(()),
-        closed = session.closed() => {
-            closed?;
-            bail!("the ssh session ended")
-        }
-        () = helper.closed() => bail!("the root helper exited"),
-        Some(done) = tasks.join_next() => {
-            done.context("a netstack task panicked")??;
-            bail!("the netstack stopped")
+    let ended = async {
+        tokio::select! {
+            // A Ctrl-C reaches the helper too, which then exits: the signal is the reason.
+            biased;
+            () = signals.recv() => Ok(()),
+            closed = session.closed() => {
+                closed?;
+                bail!("the ssh session ended")
+            }
+            () = helper.closed() => bail!("the root helper exited"),
+            Some(done) = tasks.join_next() => {
+                done.context("a netstack task panicked")??;
+                bail!("the netstack stopped")
+            }
         }
     }
+    .await;
+    unless_signalled(signals.recv(), ended).await
+}
+
+/// How long an end other than a signal waits for one. A terminal's Ctrl-C (or a service manager
+/// stopping the whole group) reaches ssh and the helper in the same kill, and either can exit before
+/// this process's handler has run: an end followed at once by a signal is the signal's doing.
+const SIGNAL_GRACE: Duration = Duration::from_millis(250);
+
+/// `ended`, unless it is an error and `signal` resolves within [`SIGNAL_GRACE`]: then a clean exit.
+async fn unless_signalled(signal: impl Future<Output = ()>, ended: Void) -> Void {
+    if ended.is_err() && timeout(SIGNAL_GRACE, signal).await.is_ok() {
+        return Ok(());
+    }
+    ended
 }
 
 /// An address to look up once the routes are in, and how a warning names it.
@@ -292,7 +310,10 @@ mod tests {
 
     #[test]
     fn every_refusal_the_machine_raises_comes_in_one_error() {
-        let connected = Snapshot { connected: vec![net("10.99.0.0/16")] };
+        let connected = Snapshot {
+            connected: vec![net("10.99.0.0/16")],
+            ..Snapshot::default()
+        };
         let both = targets(&["10.99.7.0/24", "*.corp.example"], &[]);
 
         let error = checked(&both, &connected, || Ok(false)).unwrap_err().to_string();
@@ -334,6 +355,13 @@ mod tests {
     }
 
     #[test]
+    fn each_target_is_probed_on_its_own() {
+        let routes = targets(&["10.98.0.0/16", "10.99.0.0/16"], &[]).routes();
+
+        assert_eq!(probes(&routes, false, &[], &[]), [probe("10.98.0.0", "10.98.0.0/16"), probe("10.99.0.0", "10.99.0.0/16")]);
+    }
+
+    #[test]
     fn addresses_that_keep_their_route_are_not_probed() {
         // A pinned peer that is a whole target, and a target whose start is a connected subnet.
         let routes = [net("192.0.2.7/32"), net("10.0.0.0/8"), net("10.99.0.0/16")];
@@ -364,6 +392,26 @@ mod tests {
             "10.98.0.0/16 goes through tailscale0, not sshunnel0: a more specific route or another tool's policy routing wins it"
         );
         assert!(warnings[1].contains("the fake range 198.18.0.0/15") && warnings[1].contains("unreachable"), "{warnings:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_end_just_before_a_signal_is_the_signals() {
+        let ended = || Err(anyhow!("the ssh session ended"));
+
+        // ssh died of the same Ctrl-C, a moment before this process's handler ran.
+        let signal = tokio::time::sleep(Duration::from_millis(50));
+        assert!(unless_signalled(signal, ended()).await.is_ok());
+
+        // No signal: the end is the reason, once the grace has passed.
+        let started = tokio::time::Instant::now();
+        let error = unless_signalled(std::future::pending(), ended()).await.unwrap_err();
+        assert_eq!(error.to_string(), "the ssh session ended");
+        assert_eq!(started.elapsed(), SIGNAL_GRACE);
+
+        // A clean end doesn't wait.
+        let started = tokio::time::Instant::now();
+        assert!(unless_signalled(std::future::pending(), Ok(())).await.is_ok());
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[test]

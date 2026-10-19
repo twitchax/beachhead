@@ -21,7 +21,11 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{arch::Arch, base::Res, session::SshCommand};
+use crate::{
+    arch::Arch,
+    base::{Res, Void},
+    session::SshCommand,
+};
 
 mod app;
 #[cfg(target_os = "linux")]
@@ -37,8 +41,8 @@ pub use tunnel::{FakeConn, FakeTunnel, Gate};
 /// the remote command here, through a chosen login shell, with `HOME` and every cache candidate
 /// except `/dev/shm` inside `root`. That covers push, exec and cache with no sshd. The builders give
 /// the remote side namespaces of its own: a network ([`Self::in_netns`]) or an `/etc/hosts`
-/// ([`Self::with_hosts`]).
-#[derive(Clone, Debug)]
+/// ([`Self::with_hosts`]). Not `Clone`: each builder rewrites the one fake `ssh` in `root`.
+#[derive(Debug)]
 pub struct FakeRemote {
     root: PathBuf,
     ssh: PathBuf,
@@ -123,7 +127,7 @@ impl FakeRemote {
         Ok(self)
     }
 
-    fn write(&self) -> Res<()> {
+    fn write(&self) -> Void {
         let check = self.master.map_or_else(String::new, |pid| {
             format!("if [ \"$1\" = -O ] && [ \"$2\" = check ]; then echo 'Master running (pid={pid})' >&2; exit 0; fi\n")
         });

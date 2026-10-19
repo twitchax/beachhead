@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::Command as StdCommand,
@@ -17,13 +17,13 @@ use std::{
 use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use sshunnel::{
-    route::peers::process_tree,
+    route::{peers::process_tree, system::same_netns_as_init},
     tests::{FakeRemote, RemoteNs, Watched, echo_on, netns, pattern, relay_dir, round_trip, route_command, shim_dir},
 };
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     process::Command,
     time::timeout,
 };
@@ -202,12 +202,14 @@ async fn e2e_route_teardown_after_a_clean_exit() {
     let world = World::new();
     let peer = world.listen(SocketAddr::new(RemoteNs::PEER.into(), 2222));
     let ssh = world.ssh_holding(peer.local_addr().unwrap());
-    let route = started(world.route(&ssh, &["10.98.0.0/16", "fd99::/64"])).await;
+    let route = started(world.route(&ssh, &["10.99.0.0/16", "fd99::/64", "10.98.0.0/16"])).await;
 
+    // Adjacent targets stay routes of their own, so the 10.98 one beats the metric-100 route here.
     let during = leftovers();
-    for expected in ["10.98.0.0/16 dev sshunnel0", "fd99::/64 dev sshunnel0", PIN] {
+    for expected in ["10.99.0.0/16 dev sshunnel0", "10.98.0.0/16 dev sshunnel0", "fd99::/64 dev sshunnel0", PIN] {
         assert!(during.iter().any(|line| line.starts_with(expected)), "no `{expected}` in {during:#?}");
     }
+    assert!(!route.stderr().contains("goes through"), "{}", route.stderr());
     stop(route).await;
 }
 
@@ -408,12 +410,116 @@ async fn e2e_route_pins_a_shared_connection_master() {
         .spawn()
         .unwrap();
     let (mut conn, _) = timeout(WITHIN, peer.accept()).await.expect("the master connected").unwrap();
-    let remote = world.remote.clone().with_master(master.id().unwrap()).unwrap();
+    let remote = FakeRemote::new(&world.dir.path().join("mastered"), "sh", &[])
+        .unwrap()
+        .in_netns(&world.ns)
+        .unwrap()
+        .with_master(master.id().unwrap())
+        .unwrap();
     let route = started(world.route(remote.ssh_path(), &["10.98.0.0/16"])).await;
 
     assert_eq!(pins(), [PIN]);
     still_echoes(&mut conn).await;
     stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_pins_nothing_for_a_peer_with_a_host_route() {
+    if !netns("e2e_route_pins_nothing_for_a_peer_with_a_host_route").unwrap() {
+        return;
+    }
+    let world = World::new();
+    // A host route of the peer's own, as OpenVPN adds for its server, outranks any target's route.
+    ip(&["route", "add", "10.98.0.2/32", "via", "172.31.0.2"]);
+    let peer = world.listen(SocketAddr::new(RemoteNs::PEER.into(), 2222));
+    let ssh = world.ssh_holding(peer.local_addr().unwrap());
+    let route = started(world.route(&ssh, &["10.98.0.0/16"])).await;
+    let (mut conn, _) = timeout(WITHIN, peer.accept()).await.expect("ssh connected to its peer").unwrap();
+
+    assert_eq!(pins(), Vec::<String>::new());
+    still_echoes(&mut conn).await;
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_pins_an_upstream_dns_server() {
+    if !netns("e2e_route_pins_an_upstream_dns_server").unwrap() {
+        return;
+    }
+    let world = World::new();
+    // The machine's DNS server is on the remote's network, inside the target.
+    let server = world.ns.udp(SocketAddr::new(RemoteNs::PEER.into(), 53)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let server = UdpSocket::from_std(server).unwrap();
+    tokio::spawn(async move {
+        let mut query = [0; 512];
+        while let Ok((n, from)) = server.recv_from(&mut query).await {
+            let _ = server.send_to(&query[..n], from).await;
+        }
+    });
+    use_dns_server(world.dir.path(), RemoteNs::PEER);
+    let route = world.start(&["10.98.0.0/16"]).await;
+
+    assert_eq!(pins(), [PIN]);
+    // A query still reaches the server, where the device would answer administratively prohibited.
+    let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    client.connect((RemoteNs::PEER, 53)).await.unwrap();
+    client.send(b"a query").await.unwrap();
+    let mut answer = [0; 16];
+    let n = timeout(WITHIN, client.recv(&mut answer)).await.expect("the DNS server answers").unwrap();
+    assert_eq!(&answer[..n], b"a query");
+    stop(route).await;
+}
+
+/// Points both files `route` reads its DNS servers from at `server`, by bind mounts in the test's
+/// own mount namespace (see `tests::netns`).
+fn use_dns_server(dir: &Path, server: Ipv4Addr) {
+    let conf = dir.join("resolv.conf");
+    std::fs::write(&conf, format!("nameserver {server}\n")).unwrap();
+    for file in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
+        if Path::new(file).exists() {
+            let mounted = StdCommand::new("mount").arg("--bind").arg(&conf).arg(file).status().unwrap();
+            assert!(mounted.success(), "bind-mounting over {file}: {mounted}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_refuses_a_connected_subnet() {
+    if !netns("e2e_route_refuses_a_connected_subnet").unwrap() {
+        return;
+    }
+    let world = World::new();
+
+    let route = Watched::spawn(world.route(world.remote.ssh_path(), &["172.31.0.0/30"])).unwrap();
+    let (status, stderr) = route.exit(WITHIN).await.unwrap();
+
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains("'172.31.0.0/30' is inside the connected subnet 172.31.0.0/30"), "{stderr}");
+    assert!(world.remote.last_ssh_args().is_err(), "ssh ran before the targets were checked");
+    assert_eq!(leftovers(), Vec::<String>::new(), "stderr:\n{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_refuses_a_destination_with_a_route_of_its_own() {
+    if !netns("e2e_route_refuses_a_destination_with_a_route_of_its_own").unwrap() {
+        return;
+    }
+    let world = World::new();
+    // Each at the metric sshunnel's own route would get (0 for v4, 1024 for v6), so `ip route add`
+    // would fail on it.
+    ip(&["route", "add", "10.97.0.0/16", "via", "172.31.0.2"]);
+    ip(&["-6", "route", "add", "unreachable", "fd97::/64"]);
+
+    let route = Watched::spawn(world.route(world.remote.ssh_path(), &["10.97.0.0/16", "fd97::/64"])).unwrap();
+    let (status, stderr) = route.exit(WITHIN).await.unwrap();
+
+    // Both at once, before ssh runs.
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains("'10.97.0.0/16' already has a route of its own (via 172.31.0.2 dev cl0, metric 0)"), "{stderr}");
+    assert!(stderr.contains("'fd97::/64' already has a route of its own (unreachable"), "{stderr}");
+    assert!(world.remote.last_ssh_args().is_err(), "ssh ran before the targets were checked");
+    assert_eq!(leftovers(), Vec::<String>::new(), "stderr:\n{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -441,6 +547,9 @@ async fn e2e_route_patterns_need_the_init_netns() {
     if !netns("e2e_route_patterns_need_the_init_netns").unwrap() {
         return;
     }
+    // The helper's check holds only while pid 1 lives outside the test's namespace, as the
+    // machine's init does (see `tests::netns`).
+    assert!(!same_netns_as_init(), "the test's network namespace passes for init's");
     let world = World::new();
 
     // resolved serves only the host's namespace: the client's check refuses (resolved doesn't
@@ -459,7 +568,8 @@ async fn e2e_route_warns_when_another_rule_wins() {
         return;
     }
     let world = World::new();
-    // Another tool's policy routing, Tailscale-style: a rule ahead of main sends the range to its table.
+    // Another tool's policy routing, Tailscale-style: a rule ahead of main sends the range to its
+    // own table.
     ip(&["route", "add", "10.99.0.0/16", "via", "172.31.0.2", "table", "52"]);
     ip(&["rule", "add", "to", "10.99.0.0/16", "lookup", "52", "priority", "100"]);
 

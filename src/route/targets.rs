@@ -122,10 +122,25 @@ struct Entry {
     raw: String,
 }
 
-/// The directly connected subnets, read once from the machine (or built by a test).
+/// What the checks need from the routing tables, read once from the machine (or built by a test).
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
+    /// The directly connected subnets, from every table a rule consults.
     pub connected: Vec<IpNet>,
+    /// Destinations the main table already routes at the metric sshunnel's own routes get.
+    pub taken: Vec<Taken>,
+    /// Addresses with a host route of their own in the main table, which outranks every route
+    /// sshunnel adds but one to that very host.
+    pub hosts: Vec<IpAddr>,
+}
+
+/// A main-table route that an equal one of sshunnel's would collide with: the kernel takes one
+/// route per destination and metric (and, for IPv4, TOS) in a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Taken {
+    pub net: IpNet,
+    /// How it routes, for the refusal: `via 192.0.2.1 dev eth0, metric 0`.
+    pub route: String,
 }
 
 /// Refusals (any one fails the run) and warnings, from [`Targets::findings`].
@@ -192,7 +207,9 @@ impl Targets {
         Ok(Self { include, exclude })
     }
 
-    /// The CIDR includes minus the CIDR excludes inside them and minus the fake range, aggregated.
+    /// The CIDR includes minus the CIDR excludes inside them and minus the fake range, sorted, each
+    /// once. Nothing merges, not even nested or adjacent targets: each target's route must beat an
+    /// equal one elsewhere on its own, which a merged, broader route would lose on prefix length.
     #[must_use]
     pub fn routes(&self) -> Vec<IpNet> {
         // The fake range belongs to sshunnel, so it is always a hole in what a wider include routes.
@@ -208,7 +225,9 @@ impl Targets {
             routed.extend(pieces);
         }
 
-        IpNet::aggregate(&routed)
+        routed.sort_unstable();
+        routed.dedup();
+        routed
     }
 
     /// Whether traffic to `addr` goes through the tunnel: the most specific CIDR rule wins, an
@@ -247,8 +266,9 @@ impl Targets {
     ///
     /// # Errors
     ///
-    /// Every refusal at once: a target equal to or inside a connected subnet, or the fake range
-    /// overlapping one.
+    /// Every refusal at once: a target equal to or inside a connected subnet, the fake range
+    /// overlapping one, or a route sshunnel would add that the main table already has at the same
+    /// metric.
     ///
     /// # Returns
     ///
@@ -281,6 +301,14 @@ impl Targets {
             }
             if net.contains(&IpNet::V4(FAKE_RANGE)) {
                 found.warnings.push(format!("'{}' contains the fake range {FAKE_RANGE}, which stays sshunnel's", entry.raw));
+            }
+        }
+
+        // The kernel would refuse sshunnel's own route here (EEXIST), and replacing the other one
+        // would leave a trace: its teardown would delete it.
+        for route in self.routes() {
+            if let Some(Taken { route: existing, .. }) = snapshot.taken.iter().find(|taken| taken.net == route) {
+                found.refusals.push(format!("'{route}' already has a route of its own ({existing}); sshunnel can't add an equal one"));
             }
         }
 
@@ -387,6 +415,7 @@ mod tests {
     fn snapshot(connected: &[&str]) -> Snapshot {
         Snapshot {
             connected: connected.iter().map(|s| net(s)).collect(),
+            ..Snapshot::default()
         }
     }
 
@@ -477,6 +506,16 @@ mod tests {
         .collect();
 
         assert_eq!(t.routes(), expected);
+    }
+
+    #[test]
+    fn each_target_keeps_a_route_of_its_own() {
+        // Merged into 10.98.0.0/15, an existing 10.99.0.0/16 elsewhere would win on prefix length.
+        assert_eq!(targets(&["10.99.0.0/16", "10.98.0.0/16"], &[]).routes(), [net("10.98.0.0/16"), net("10.99.0.0/16")]);
+        // A nested target too: its /16 beats an equal /16 elsewhere, which the /8 alone would not.
+        assert_eq!(targets(&["10.99.0.0/16", "10.0.0.0/8"], &[]).routes(), [net("10.0.0.0/8"), net("10.99.0.0/16")]);
+        // The same route twice is one route.
+        assert_eq!(targets(&["10.99.0.0/16", "10.99.7.7/16"], &[]).routes(), [net("10.99.0.0/16")]);
     }
 
     #[test]
@@ -576,6 +615,37 @@ mod tests {
 
         assert!(t.check(&Snapshot::default()).is_ok());
         assert!(t.routes_addr(addr("10.0.0.1")) && t.routes_addr(addr("200.0.0.1")));
+    }
+
+    #[test]
+    fn refuses_a_route_the_main_table_already_has() {
+        let snapshot = Snapshot {
+            connected: vec![net("192.168.1.0/24")],
+            taken: vec![
+                Taken {
+                    net: net("10.99.0.0/16"),
+                    route: "via 192.0.2.1 dev eth0, metric 0".to_owned(),
+                },
+                Taken {
+                    net: net("10.0.0.0/16"),
+                    route: "unreachable, metric 0".to_owned(),
+                },
+            ],
+            ..Snapshot::default()
+        };
+
+        // A target, and a piece that carving `10.1.0.0/16` out of `10.0.0.0/8` leaves.
+        let error = targets(&["10.99.0.0/16", "10.0.0.0/8", "192.168.1.0/25"], &["10.1.0.0/16"]).check(&snapshot).unwrap_err().to_string();
+
+        assert!(
+            error.contains("'10.99.0.0/16' already has a route of its own (via 192.0.2.1 dev eth0, metric 0); sshunnel can't add an equal one"),
+            "{error}"
+        );
+        assert!(error.contains("'10.0.0.0/16' already has a route of its own (unreachable, metric 0)"), "{error}");
+        // In the same error as every other refusal.
+        assert!(error.contains("'192.168.1.0/25' is inside the connected subnet 192.168.1.0/24"), "{error}");
+        // Narrower and broader routes don't collide.
+        assert!(targets(&["10.99.0.0/17", "10.98.0.0/15"], &[]).check(&snapshot).is_ok());
     }
 
     #[test]
