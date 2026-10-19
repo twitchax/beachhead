@@ -6,9 +6,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use ipnet::{Ipv4Net, Ipv6Net};
 
 pub mod dns;
+#[cfg(target_os = "linux")]
+pub mod helper;
 pub mod names;
 pub mod router;
 pub mod stack;
+#[cfg(target_os = "linux")]
+pub mod system;
 pub mod targets;
 
 /// The TUN device's name.

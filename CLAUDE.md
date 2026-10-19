@@ -25,6 +25,14 @@ channels bounded by credit, so the ssh pipe always drains. `route::stack` (the T
 the same shape: **its packet loop never waits on one connection**. Each smoltcp socket bridges to
 its relay stream through a bounded pipe, so a slow stream closes only that socket's window.
 
+`route::helper` is the privilege boundary, not the client. `sshunnel route` starts it through sudo,
+and with a `NOPASSWD` sudoers line anything running as the user can too, so it trusts nothing the
+client sends: it re-parses the targets and re-runs every refusal as root against its own route
+snapshot, honors only pins inside a route and works out their gateways itself, and runs iproute2
+and resolvectl from a fixed `PATH`. It and `route::system` (the system calls behind it) are Linux
+only. In product code, the TUN ioctl (`route::system`) and the relay's `getaddrinfo` are the only
+`unsafe`, each block with a `// SAFETY:` comment.
+
 ## Commands
 
 ```bash
