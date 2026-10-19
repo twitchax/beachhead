@@ -137,7 +137,8 @@ pub struct Targets {
 
 impl Targets {
     /// Parses the targets and applies the refusals that don't depend on the machine: `/0`s, a
-    /// bare `*`, and anything overlapping the fake range.
+    /// bare `*`, and anything equal to or inside the fake range. A target that merely contains
+    /// the fake range is allowed; [`Self::check`] warns and the range is carved out of the routes.
     ///
     /// # Errors
     ///
@@ -170,10 +171,11 @@ impl Targets {
         Ok(Self { include, exclude })
     }
 
-    /// The CIDR includes minus the CIDR excludes inside them, aggregated.
+    /// The CIDR includes minus the CIDR excludes inside them and minus the fake range, aggregated.
     #[must_use]
     pub fn routes(&self) -> Vec<IpNet> {
-        let excludes: Vec<IpNet> = nets(&self.exclude).collect();
+        // The fake range belongs to sshunnel, so it is always a hole in what a wider include routes.
+        let excludes: Vec<IpNet> = nets(&self.exclude).chain([IpNet::V4(FAKE_RANGE)]).collect();
         let mut routed = Vec::new();
 
         for include in nets(&self.include) {
@@ -189,9 +191,12 @@ impl Targets {
     }
 
     /// Whether traffic to `addr` goes through the tunnel: the most specific CIDR rule wins, an
-    /// exclude on a tie.
+    /// exclude on a tie. The fake range is never routed by address.
     #[must_use]
     pub fn routes_addr(&self, addr: IpAddr) -> bool {
+        if matches!(addr, IpAddr::V4(v4) if FAKE_RANGE.contains(&v4)) {
+            return false;
+        }
         let best = |entries: &[Entry]| nets(entries).filter(|n| n.contains(&addr)).map(|n| n.prefix_len()).max();
         wins(best(&self.include), best(&self.exclude))
     }
@@ -226,7 +231,8 @@ impl Targets {
     ///
     /// # Returns
     ///
-    /// Warnings: a broader target keeps its connected part local.
+    /// Warnings: a broader target keeps its connected part local, and a target containing the fake
+    /// range leaves that range to sshunnel.
     pub fn check(&self, snapshot: &Snapshot) -> Res<Vec<String>> {
         let mut refusals = Vec::new();
         let mut warnings = Vec::new();
@@ -245,6 +251,9 @@ impl Targets {
                 } else if net.contains(connected) {
                     warnings.push(format!("'{}' contains the connected subnet {connected}, which stays local", entry.raw));
                 }
+            }
+            if net.contains(&IpNet::V4(FAKE_RANGE)) {
+                warnings.push(format!("'{}' contains the fake range {FAKE_RANGE}, which stays sshunnel's", entry.raw));
             }
         }
 
@@ -303,7 +312,7 @@ fn refusal_for(target: &Target) -> Option<String> {
     if net.prefix_len() == 0 {
         return Some("a full tunnel is not supported".to_owned());
     }
-    overlaps_fake_range(net).then(|| format!("overlaps the fake range {FAKE_RANGE}"))
+    IpNet::V4(FAKE_RANGE).contains(net).then(|| format!("is the fake range {FAKE_RANGE} or inside it"))
 }
 
 /// `net` minus `hole`: halves `net` until each half is disjoint from or inside the hole.
@@ -505,7 +514,7 @@ mod tests {
 
     #[test]
     fn refuses_a_target_overlapping_the_fake_range() {
-        for target in ["198.18.5.0/24", "198.0.0.0/8"] {
+        for target in ["198.18.5.0/24", "198.18.0.0/15"] {
             let error = Targets::parse(&strings(&[target]), &[]).unwrap_err().to_string();
             assert!(error.contains(&format!("'{target}'")), "{error}");
         }
@@ -523,5 +532,49 @@ mod tests {
         let error = Targets::parse(&strings(&["0.0.0.0/0", "*"]), &[]).unwrap_err().to_string();
 
         assert!(error.contains("'0.0.0.0/0'") && error.contains("'*'"), "{error}");
+    }
+
+    #[test]
+    fn a_target_containing_the_fake_range_is_carved_and_warned() {
+        let t = targets(&["128.0.0.0/1"], &[]);
+
+        assert!(t.routes().iter().all(|r| !r.contains(&net("198.18.0.0/15")) && !net("198.18.0.0/15").contains(r)));
+        assert!(!t.routes_addr(addr("198.18.1.1")));
+        assert!(t.routes_addr(addr("128.0.0.1")));
+
+        let warnings = t.check(&Snapshot::default()).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("'128.0.0.0/1'") && warnings[0].contains("198.18.0.0/15"), "{warnings:?}");
+    }
+
+    #[test]
+    fn half_ranges_cover_everything_but_the_default_route() {
+        let t = targets(&["0.0.0.0/1", "128.0.0.0/1"], &[]);
+
+        assert!(t.check(&Snapshot::default()).is_ok());
+        assert!(t.routes_addr(addr("10.0.0.1")) && t.routes_addr(addr("200.0.0.1")));
+    }
+
+    #[test]
+    fn refuses_every_snapshot_problem_at_once() {
+        let connected = snapshot(&["192.168.1.0/24", "198.18.0.0/16"]);
+        let error = targets(&["192.168.1.0/25"], &[]).check(&connected).unwrap_err().to_string();
+
+        assert!(error.contains("'192.168.1.0/25'") && error.contains("198.18.0.0/16"), "{error}");
+    }
+
+    #[test]
+    fn bare_addresses_are_host_targets() {
+        assert_eq!("10.99.0.5".parse::<Target>().unwrap(), Target::Net(net("10.99.0.5/32")));
+        assert_eq!("fd99::5".parse::<Target>().unwrap(), Target::Net(net("fd99::5/128")));
+    }
+
+    #[test]
+    fn an_excluded_v6_range_is_carved_out_of_routes() {
+        let t = targets(&["fd99::/64"], &["fd99::/65"]);
+
+        assert_eq!(t.routes(), vec![net("fd99:0:0:0:8000::/65")]);
+        assert!(t.routes_addr(addr("fd99::8000:0:0:1")));
+        assert!(!t.routes_addr(addr("fd99::1")));
     }
 }
