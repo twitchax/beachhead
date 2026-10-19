@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     fmt::Write as _,
     fs,
     net::Ipv4Addr,
@@ -101,16 +102,27 @@ impl FakeMap {
         }
 
         let start = slot_index(&name);
-        let addr = (0..SLOTS).map(|i| slot_addr((start + i) % SLOTS)).find(|a| !self.by_addr.contains_key(a));
-        let Some(addr) = addr else {
-            // Every slot is taken by a name used within 30 days; the hash slot is the least bad answer.
-            tracing::warn!(name, "the fake address range is exhausted");
-            return slot_addr(start);
-        };
+        let free = (0..SLOTS).map(|i| slot_addr((start + i) % SLOTS)).find(|a| !self.by_addr.contains_key(a));
+        let addr = free.unwrap_or_else(|| self.evict_least_recently_used());
 
         self.by_addr.insert(addr, name.clone());
         self.by_name.insert(name, Entry { addr, last_used: today });
         self.dirty = true;
+        addr
+    }
+
+    /// Frees the address of the stalest entry (the lowest address among ties, to stay deterministic)
+    /// and returns it. Only reached when every slot is owned, so a name never shares an address.
+    fn evict_least_recently_used(&mut self) -> Ipv4Addr {
+        let (name, addr) = self
+            .by_name
+            .iter()
+            .map(|(name, e)| (name, e.addr, e.last_used))
+            .min_by_key(|&(_, addr, last_used)| (last_used, addr))
+            .map_or_else(|| (String::new(), slot_addr(0)), |(name, addr, _)| (name.clone(), addr));
+        tracing::warn!(name, %addr, "the fake address range is exhausted; evicting the least recently used name");
+        self.by_name.remove(&name);
+        self.by_addr.remove(&addr);
         addr
     }
 
@@ -159,10 +171,15 @@ pub fn slot(name: &str) -> Ipv4Addr {
 /// # Errors
 /// Fails when neither `XDG_STATE_HOME` nor `HOME` is set.
 pub fn state_path() -> Res<PathBuf> {
-    let base = if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+    state_path_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// An empty variable counts as unset, per the XDG base directory spec.
+fn state_path_from(xdg_state_home: Option<OsString>, home: Option<OsString>) -> Res<PathBuf> {
+    let base = if let Some(dir) = xdg_state_home.filter(|v| !v.is_empty()) {
         PathBuf::from(dir)
     } else {
-        let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).context("neither XDG_STATE_HOME nor HOME is set")?;
+        let home = home.filter(|v| !v.is_empty()).context("neither XDG_STATE_HOME nor HOME is set")?;
         PathBuf::from(home).join(".local/state")
     };
     Ok(base.join("sshunnel").join("names"))
@@ -365,9 +382,49 @@ mod tests {
     }
 
     #[test]
-    fn fake_address_state_path_honors_xdg_state_home() {
-        // Only the pure join is asserted; the environment is process-wide, so it is not mutated here.
-        let path = state_path().unwrap();
-        assert!(path.ends_with("sshunnel/names"));
+    fn fake_address_exhaustion_evicts_the_least_recently_used() {
+        let dir = TempDir::new().unwrap();
+        let mut map = map_in(&dir, 0);
+        for i in 0..SLOTS {
+            let name = format!("full{i}.corp.example");
+            let addr = slot_addr(i);
+            // Slot 7 is the stalest; every other entry was used more recently.
+            let last_used = if i == 7 { 1 } else { 100 };
+            map.by_addr.insert(addr, name.clone());
+            map.by_name.insert(name, Entry { addr, last_used });
+        }
+
+        let addr = map.address("newcomer.corp.example", 200);
+        assert_eq!(addr, slot_addr(7));
+        assert_eq!(map.name(addr), Some("newcomer.corp.example"));
+        assert!(!map.by_name.contains_key("full7.corp.example"));
+        assert_eq!(map.by_name.len(), map.by_addr.len());
+        // No other name lost its address, and the newcomer keeps this one.
+        assert_eq!(map.address("full8.corp.example", 200), slot_addr(8));
+        assert_eq!(map.address("newcomer.corp.example", 200), addr);
+    }
+
+    #[test]
+    fn fake_address_state_path_uses_xdg_state_home() {
+        let path = state_path_from(Some("/x/state".into()), Some("/home/u".into())).unwrap();
+        assert_eq!(path, PathBuf::from("/x/state/sshunnel/names"));
+    }
+
+    #[test]
+    fn fake_address_state_path_defaults_under_home() {
+        let path = state_path_from(None, Some("/home/u".into())).unwrap();
+        assert_eq!(path, PathBuf::from("/home/u/.local/state/sshunnel/names"));
+    }
+
+    #[test]
+    fn fake_address_state_path_treats_an_empty_xdg_as_unset() {
+        let path = state_path_from(Some(OsString::new()), Some("/home/u".into())).unwrap();
+        assert_eq!(path, PathBuf::from("/home/u/.local/state/sshunnel/names"));
+    }
+
+    #[test]
+    fn fake_address_state_path_needs_xdg_or_home() {
+        assert!(state_path_from(None, None).is_err());
+        assert!(state_path_from(Some(OsString::new()), Some(OsString::new())).is_err());
     }
 }
