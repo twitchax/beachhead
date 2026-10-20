@@ -6,7 +6,7 @@
 
 A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 
-> **Status: milestone 2, in progress.** sshunnel forwards TCP ports (the way `ssh -L` does) and, on
+> **Status: milestone 2 done.** sshunnel forwards TCP ports (the way `ssh -L` does) and, on
 > Linux, routes subnets and domain names over a TUN device (`sshunnel route`), through a relay it
 > installs on the remote by itself. UDP and ICMP come later.
 
