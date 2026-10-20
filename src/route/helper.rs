@@ -170,9 +170,14 @@ fn command_with(sudo: &OsStr, exe: &Path, socket: &Path, euid: u32) -> Vec<OsStr
 /// The process that becomes the helper. It never inherits `SUDO_UID`: sudo sets its own, and a
 /// client already root (run as `sudo sshunnel route`) starts the helper directly, which must then
 /// serve root rather than the user who ran that sudo.
+///
+/// Nor does it get the terminal as stdin. sudo (under `use_pty`, and sudo-rs) puts a terminal on
+/// the command's stdin into raw mode for as long as the command runs, so a Ctrl-C would reach the
+/// helper alone, as a byte, rather than every process in the foreground group. sudo asks for a
+/// password on `/dev/tty`, not stdin.
 fn helper_process(program: &Path, args: &[OsString]) -> Command {
     let mut process = Command::new(program);
-    process.args(args).env_remove("SUDO_UID").stdout(Stdio::null());
+    process.args(args).env_remove("SUDO_UID").stdin(Stdio::null()).stdout(Stdio::null());
     process
 }
 
@@ -771,6 +776,26 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("sudo") && error.contains("exit status: 1"), "{error}");
         assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0, "the socket dir is left behind");
+    }
+
+    #[tokio::test]
+    async fn sudo_never_gets_the_terminal_as_stdin() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        let seen = root.path().join("stdin");
+        let sudo = shim_dir(root.path(), &[("sudo", &format!("readlink /proc/self/fd/0 > '{}'\nexit 1", seen.display()))])
+            .unwrap()
+            .join("sudo");
+        // Stands in for the terminal `route` runs on: nextest gives a test /dev/null already, which
+        // would hide an inherited stdin. nextest runs each test in its own process.
+        rustix::stdio::dup2_stdin(File::create(root.path().join("terminal")).unwrap()).unwrap();
+
+        let started = Helper::start_with(&setup(), &runtime, |socket| command_with(sudo.as_os_str(), Path::new("sshunnel"), socket, 1000)).await;
+
+        assert!(started.is_err(), "the shim never starts a helper");
+        // With the terminal as stdin, sudo would put it in raw mode for the whole session (under
+        // `use_pty`), and a Ctrl-C would reach the helper alone.
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "/dev/null\n");
     }
 
     #[tokio::test]
