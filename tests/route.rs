@@ -201,8 +201,9 @@ async fn e2e_route_teardown_after_a_clean_exit() {
     let route = started(world.route(&ssh, &["10.99.0.0/16", "fd99::/64", "10.98.0.0/16"])).await;
 
     // Adjacent targets stay routes of their own, so the 10.98 one beats the metric-100 route here.
+    // The v6 one is at metric 1 (the space rules out 1024).
     let during = leftovers();
-    for expected in ["10.99.0.0/16 dev sshunnel0", "10.98.0.0/16 dev sshunnel0", "fd99::/64 dev sshunnel0", PIN] {
+    for expected in ["10.99.0.0/16 dev sshunnel0", "10.98.0.0/16 dev sshunnel0", "fd99::/64 dev sshunnel0 metric 1 ", PIN] {
         assert!(during.iter().any(|line| line.starts_with(expected)), "no `{expected}` in {during:#?}");
     }
     assert!(!route.stderr().contains("goes through"), "{}", route.stderr());
@@ -539,18 +540,21 @@ async fn e2e_route_refuses_a_destination_with_a_route_of_its_own() {
         return;
     }
     let world = World::new();
-    // Each at the metric sshunnel's own route would get (0 for v4, 1024 for v6), so `ip route add`
-    // would fail on it.
+    // Each at the metric sshunnel's own route would get (0 for v4, 1 for v6), so `ip route add`
+    // would fail on it. One at the kernel's v6 default, 1024, is no collision: sshunnel's wins.
     ip(&["route", "add", "10.97.0.0/16", "via", "172.31.0.2"]);
-    ip(&["-6", "route", "add", "unreachable", "fd97::/64"]);
+    ip(&["-6", "route", "add", "unreachable", "fd97::/64", "metric", "1"]);
+    ip(&["-6", "route", "add", "unreachable", "fd96::/64"]);
 
-    let route = Watched::spawn(world.route(world.remote.ssh_path(), &["10.97.0.0/16", "fd97::/64"])).unwrap();
+    let route = Watched::spawn(world.route(world.remote.ssh_path(), &["10.97.0.0/16", "fd97::/64", "fd96::/64"])).unwrap();
     let (status, stderr) = route.exit(WITHIN).await.unwrap();
 
     // Both at once, before ssh runs.
     assert!(!status.success(), "{stderr}");
     assert!(stderr.contains("'10.97.0.0/16' already has a route of its own (via 172.31.0.2 dev cl0, metric 0)"), "{stderr}");
-    assert!(stderr.contains("'fd97::/64' already has a route of its own (unreachable"), "{stderr}");
+    let fd97 = stderr.lines().find(|line| line.contains("'fd97::/64' already has a route of its own (unreachable"));
+    assert!(fd97.is_some_and(|line| line.contains(", metric 1)")), "{stderr}");
+    assert!(!stderr.contains("'fd96::/64'"), "{stderr}");
     assert!(world.remote.last_ssh_args().is_err(), "ssh ran before the targets were checked");
     assert_eq!(leftovers(), Vec::<String>::new(), "stderr:\n{stderr}");
 }

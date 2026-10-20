@@ -307,12 +307,14 @@ impl Route {
     }
 }
 
-/// The metric `ip route add` gives a route that names none: 0 for IPv4; for IPv6 the kernel's 1024,
-/// which a 0 also means.
-fn add_metric(net: &IpNet) -> u32 {
+/// The metric sshunnel adds its device routes at: for IPv4, 0, what `ip route add` gives a route
+/// that names none; for IPv6, 1, named explicitly, since there 0 means the kernel's default of
+/// 1024. Either way they win a tie with an equal route at the kernel's default, and an equal route
+/// at this metric is taken.
+pub(crate) fn add_metric(net: &IpNet) -> u32 {
     match net {
         IpNet::V4(_) => 0,
-        IpNet::V6(_) => 1024,
+        IpNet::V6(_) => 1,
     }
 }
 
@@ -321,8 +323,8 @@ fn add_metric(net: &IpNet) -> u32 {
 ///
 /// - Connected: the on-link unicast routes (no next hop: v4 marks them scope link, v6 marks them no
 ///   scope at all) of the tables `rules` consult.
-/// - Taken: the main table's routes at the metric `ip route add` would use, of any type: the
-///   kernel refuses an equal route next to one (EEXIST).
+/// - Taken: the main table's routes at the metric sshunnel's own get ([`add_metric`]), of any type:
+///   the kernel refuses an equal route next to one (EEXIST).
 /// - Hosts: the main table's host routes, at any metric.
 ///
 /// Taken and hosts count only routes for every source and TOS: a v6 source route lives in a subtree
@@ -510,7 +512,8 @@ mod tests {
             {"type":"local","dst":"192.0.2.10","dev":"eth0","table":"local","protocol":"kernel","scope":"host","prefsrc":"192.0.2.10","flags":[]}
         ]"#;
         let routes6 = r#"[
-            {"dst":"fd99::/64","gateway":"fe80::1","dev":"eth0","metric":1024,"flags":[],"pref":"medium"},
+            {"dst":"fd99::/64","gateway":"fe80::1","dev":"eth0","metric":1,"flags":[],"pref":"medium"},
+            {"dst":"fd97::/64","gateway":"fe80::1","dev":"eth0","metric":1024,"flags":[],"pref":"medium"},
             {"dst":"fd98::/64","gateway":"fe80::1","dev":"eth0","protocol":"ra","metric":100,"flags":[],"pref":"medium"},
             {"dst":"2001:db8::53","gateway":"fe80::1","dev":"eth0","metric":1024,"flags":[],"pref":"medium"}
         ]"#;
@@ -533,12 +536,10 @@ mod tests {
         // A host route at any metric outranks the routes sshunnel adds.
         assert_eq!(v4.hosts, [addr("10.88.0.5"), addr("10.98.0.2")]);
 
-        // v6: the kernel's default metric, 1024.
+        // v6: metric 1, which sshunnel's device routes name (0 would mean the kernel's 1024), so
+        // they win ties at 1024 the way v4's win ties at 0's neighbors.
         let v6 = parse_snapshot(rules, routes6).unwrap();
-        assert_eq!(
-            v6.taken,
-            [taken("2001:db8::53/128", "via fe80::1 dev eth0, metric 1024"), taken("fd99::/64", "via fe80::1 dev eth0, metric 1024"),]
-        );
+        assert_eq!(v6.taken, [taken("fd99::/64", "via fe80::1 dev eth0, metric 1")]);
         assert_eq!(v6.hosts, [addr("2001:db8::53")]);
     }
 

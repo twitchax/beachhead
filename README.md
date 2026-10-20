@@ -109,9 +109,10 @@ Before ssh even starts, `route` refuses `0.0.0.0/0` and `::/0`, a bare `*`, a ta
 inside a directly connected subnet (a broader one is allowed, and the connected part stays local,
 with a warning), a target equal to or inside `198.18.0.0/15`, a connected subnet overlapping
 `198.18.0.0/15` (whatever the targets), and a route the main table already has at the metric
-sshunnel's own would get (0 for IPv4, 1024 for IPv6; the kernel won't hold two), reporting every
-problem at once. Each target gets a route of its own, never merged with its neighbors, so each
-competes with the machine's routes on its own prefix.
+sshunnel's own would get (0 for IPv4, 1 for IPv6, so either wins a tie with a route at the kernel's
+default; the kernel won't hold two at the same metric), reporting every problem at once. Each
+target gets a route of its own, never merged with its neighbors, so each competes with the
+machine's routes on its own prefix.
 
 ```text
 $ sshunnel route --help

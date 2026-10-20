@@ -511,7 +511,13 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)]) -> Plan {
         steps.push(step);
     }
     for route in device_routes {
-        steps.push(Step::new("ip", ["route", "add", &route.to_string(), "dev", DEVICE]));
+        let mut step = Step::new("ip", ["route", "add", &route.to_string(), "dev", DEVICE]);
+        // The metric the refusals checked for; v6 has to name it, since a 0 there means 1024.
+        let metric = system::add_metric(route);
+        if metric != 0 {
+            step.args.extend(["metric".to_owned(), metric.to_string()]);
+        }
+        steps.push(step);
     }
 
     if targets.has_names() {
@@ -1051,7 +1057,7 @@ mod tests {
                 "ip route add 10.99.0.5/32 via 192.0.2.1 dev eth0 proto 222",
                 "ip route add fd99::5/128 dev eth0 proto 222",
                 "ip route add 10.99.0.0/17 dev sshunnel0",
-                "ip route add fd99::/64 dev sshunnel0",
+                "ip route add fd99::/64 dev sshunnel0 metric 1",
                 "resolvectl default-route sshunnel0 false",
                 "resolvectl dnssec sshunnel0 no",
                 "resolvectl dnsovertls sshunnel0 no",
@@ -1113,12 +1119,16 @@ mod tests {
         let steps = plan(&targets, &targets.routes(), &vias).steps;
         let mut log = Vec::new();
 
-        let error = execute(&steps, &mut recorder(&mut log, &["ip route add fd99::/64 dev sshunnel0"])).unwrap_err();
+        let error = execute(&steps, &mut recorder(&mut log, &["ip route add fd99::/64 dev sshunnel0 metric 1"])).unwrap_err();
 
         assert_eq!(format!("{error:#}"), "RTNETLINK answers: File exists");
         assert_eq!(
             &log[log.len() - 3..],
-            ["ip route add fd99::/64 dev sshunnel0", "ip route del fd99::5/128 proto 222", "ip route del 10.99.0.5/32 proto 222"]
+            [
+                "ip route add fd99::/64 dev sshunnel0 metric 1",
+                "ip route del fd99::5/128 proto 222",
+                "ip route del 10.99.0.5/32 proto 222"
+            ]
         );
     }
 
