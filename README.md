@@ -222,6 +222,10 @@ in the [PRD log](.prds/PRD-0004.log.md).
   asks the system resolver. CIDR targets still catch their traffic.
 - Fake addresses only mean something while `route` runs. Answers carry a 5-second TTL, so a cached
   one fades soon after an exit.
+- Names under a pattern's domain that `route` doesn't send through the relay (an excluded name, or
+  `a.host.corp.example` under the exact `host.corp.example`) go to your normal DNS servers over UDP
+  only. An answer too large for UDP comes back truncated, and the lookup fails rather than retrying
+  over TCP.
 - `route` adds its routes to the main table and no `ip rule` of its own. A more specific route, or
   another tool's policy routing (Tailscale's subnet routes, say), can still win a target; `route`
   warns, naming the device that won, and leaves it be.

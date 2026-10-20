@@ -35,8 +35,10 @@ pub const TTL: Duration = Duration::from_secs(5);
 pub const CACHE: Duration = Duration::from_secs(60);
 /// How long each upstream gets to answer a forwarded query.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
-/// Large enough for any answer the stack would deliver in one UDP datagram from an EDNS upstream.
-const UPSTREAM_BUF: usize = 4096;
+/// The largest DNS message UDP can carry, so no upstream answer is cut short. Forwarding is UDP
+/// only: an answer too large for it comes back truncated (TC), and the resolver's retry over TCP
+/// fails.
+const UPSTREAM_BUF: usize = 65535;
 /// The zone negative answers claim to come from; `.invalid` can never exist, so it can't clash.
 const SOA_ZONE: &str = "sshunnel.invalid";
 const MAX_NAME: usize = 253;

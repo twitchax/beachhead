@@ -205,6 +205,20 @@ async fn an_excluded_name_is_answered_by_the_upstream() {
     assert_eq!(f.tunnel.resolves().len(), 0);
 }
 
+/// An answer past 4 KiB, as large TXT answers and names with many records get.
+static LARGE: [u8; 6000] = [0x2a; 6000];
+
+#[tokio::test]
+async fn a_large_upstream_answer_is_relayed_whole() {
+    let (upstream, _queries) = stub(&LARGE).await;
+    let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream]);
+
+    let answer = f.server.answer(query(0xbeef, "private.corp.example", TYPE::TXT)).await.unwrap();
+
+    assert_eq!(answer.len(), LARGE.len());
+    assert!(answer[2..] == LARGE[2..], "the answer changed on the way");
+}
+
 #[tokio::test]
 async fn an_unmatched_name_under_an_exact_target_goes_upstream() {
     let (upstream, _queries) = stub(CANNED).await;
