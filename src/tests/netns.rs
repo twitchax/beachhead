@@ -1,7 +1,8 @@
 //! The namespace harness for `route`'s e2e tests. [`netns`] runs a test again as root over fresh
 //! user, mount, PID and network namespaces, where it can create a TUN device, routes and bind mounts
 //! without touching the machine, and [`RemoteNs`] is a second network namespace, joined to the first
-//! by a veth pair, that plays the remote's network.
+//! by a veth pair, that plays the remote's network. [`Namespaces`] makes the same choice for a
+//! command that isn't a test: the route bench's client side.
 //!
 //! Ubuntu (23.10 on) restricts unprivileged user namespaces through `AppArmor`. There, the test
 //! runs again in a privileged Docker container built from the host's own Ubuntu release, so the
@@ -9,6 +10,7 @@
 
 use std::{
     ffi::OsString,
+    fmt,
     fs::File,
     io::{self, BufRead as _, BufReader, Write as _},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
@@ -21,7 +23,12 @@ use std::{
 use anyhow::{Context as _, anyhow, bail, ensure};
 use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
 
-use crate::base::{Err, Res, Void};
+use sha2::{Digest as _, Sha256};
+
+use crate::{
+    base::{Err, Res, Void},
+    relays::hex,
+};
 
 /// Set for the test run again inside: there, [`netns`] lets the body run.
 const INSIDE: &str = "SSHUNNEL_IN_NETNS";
@@ -104,16 +111,16 @@ fn namespaced() -> Vec<OsString> {
 enum Runner {
     /// Here, where the [`probe`] succeeds.
     Direct,
-    /// In a container of this Ubuntu release.
-    Docker { codename: String },
+    /// In a container of this Ubuntu release, from `image`.
+    Docker { image: String },
 }
 
 impl Runner {
     /// The container when [`FORCE`]d; else here, where user namespaces work; else the container,
-    /// where it can run. The inner `Err` says why the container can't.
+    /// where it can run, with its image built. The inner `Err` says why the container can't.
     fn pick() -> Res<Result<Self, Err>> {
         match std::env::var(FORCE) {
-            Ok(choice) if choice == "docker" => return docker_codename().map(|codename| Ok(Self::Docker { codename })),
+            Ok(choice) if choice == "docker" => return Ok(Ok(Self::Docker { image: image(&docker_codename()?)? })),
             Ok(choice) => bail!("{FORCE}={choice}: the one choice is `docker`"),
             Err(_) => {}
         }
@@ -121,13 +128,26 @@ impl Runner {
         if probe.split_first().is_some_and(|(program, args)| succeeds(Command::new(program).args(args))) {
             return Ok(Ok(Self::Direct));
         }
-        Ok(docker_codename().map(|codename| Self::Docker { codename }))
+        match docker_codename() {
+            Ok(codename) => Ok(Ok(Self::Docker { image: image(&codename)? })),
+            Err(why) => Ok(Err(why)),
+        }
     }
 
-    /// The [`rerun`] of `test` in `exe`, where this runner runs it, with [`INSIDE`] set. A container
-    /// gets what is left of [`CONTAINER_TIMEOUT`] since `entered`, after any image build.
+    /// The [`rerun`] of `test` in `exe`, where this runner runs it. A container gets what is left
+    /// of [`CONTAINER_TIMEOUT`] since `entered`, after any image build.
     fn command(&self, exe: &Path, test: &str, entered: Instant) -> Res<Command> {
-        let inner = rerun(exe, test);
+        let limit = CONTAINER_TIMEOUT
+            .checked_sub(entered.elapsed())
+            .filter(|left| left.as_secs() > 0)
+            .context("building the image took the test's whole time")?;
+        let mounts = [PathBuf::from(env!("CARGO_MANIFEST_DIR")), target_dir(exe)?];
+        self.wrap(&rerun(exe, test), &mounts, limit)
+    }
+
+    /// `inner` (a program and its arguments) where this runner runs it, with [`INSIDE`] set: here,
+    /// or in the container with `mounts` read-only at their own paths and `limit` to live.
+    fn wrap(&self, inner: &[OsString], mounts: &[PathBuf], limit: Duration) -> Res<Command> {
         match self {
             Self::Direct => {
                 let (program, args) = inner.split_first().context("the command is empty")?;
@@ -135,18 +155,57 @@ impl Runner {
                 command.args(args).env(INSIDE, "1");
                 Ok(command)
             }
-            Self::Docker { codename } => {
-                let image = image(codename)?;
-                let limit = CONTAINER_TIMEOUT
-                    .checked_sub(entered.elapsed())
-                    .filter(|left| left.as_secs() > 0)
-                    .context("building the image took the test's whole time")?;
-                let mounts = [PathBuf::from(env!("CARGO_MANIFEST_DIR")), target_dir(exe)?];
+            Self::Docker { image } => {
                 let workdir = std::env::current_dir().context("reading the working directory")?;
                 let mut command = Command::new("docker");
-                command.args(docker_run(&image, &mounts, &workdir, limit, &inner)?);
+                command.args(docker_run(image, mounts, &workdir, limit, inner)?);
                 Ok(command)
             }
+        }
+    }
+}
+
+/// Where a command that isn't a test runs as root over fresh namespaces: here or in the container,
+/// by [`netns`]'s own choice. The route bench's client side runs in them.
+pub struct Namespaces(Runner);
+
+impl Namespaces {
+    /// [`netns`]'s choice for this host, with the container's image built if it picks that.
+    ///
+    /// # Errors
+    ///
+    /// Fails, saying why, where neither works.
+    pub fn pick() -> Res<Self> {
+        Runner::pick()?.map(Self).map_err(|why| anyhow!(unavailable(&why)))
+    }
+
+    /// `program` (a program and its arguments) as root over fresh mount, PID and network
+    /// namespaces. Here, that is the user namespace [`netns`] reruns a test in, where this user is
+    /// root. In the container, it is the container's own root, with `mounts` read-only at their own
+    /// paths and `limit` to live: a user namespace of its own would map only that root, leaving the
+    /// files this user owns in the mounts unreadable.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `program` is empty or a mount can't be passed to Docker.
+    pub fn command(&self, program: &[OsString], mounts: &[PathBuf], limit: Duration) -> Res<Command> {
+        ensure!(!program.is_empty(), "no command to run in the namespaces");
+        match self.0 {
+            Runner::Direct => {
+                let mut inner = namespaced();
+                inner.extend_from_slice(program);
+                self.0.wrap(&inner, mounts, limit)
+            }
+            Runner::Docker { .. } => self.0.wrap(program, mounts, limit),
+        }
+    }
+}
+
+impl fmt::Display for Namespaces {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Runner::Direct => f.write_str("user namespaces (unshare)"),
+            Runner::Docker { image } => write!(f, "a privileged Docker container ({image})"),
         }
     }
 }
@@ -166,16 +225,24 @@ fn ubuntu_codename(os_release: &str) -> Option<&str> {
     Some(value.trim().trim_matches('"')).filter(|codename| !codename.is_empty())
 }
 
-/// The image's tag, one per Ubuntu release.
+/// The image's tag, one per Ubuntu release and [`dockerfile`].
 fn image_tag(codename: &str) -> String {
-    format!("sshunnel-netns:{codename}")
+    tag_for(codename, &dockerfile(codename))
 }
 
-/// The image: the host's Ubuntu release plus iproute2, so its glibc is the host's.
+/// A tag naming `dockerfile`'s hash, so a changed image definition is built afresh: [`image`]
+/// builds only when the tag is missing.
+fn tag_for(codename: &str, dockerfile: &str) -> String {
+    let hash = hex(&Sha256::digest(dockerfile));
+    format!("sshunnel-netns:{codename}-{}", &hash[..12])
+}
+
+/// The image: the host's Ubuntu release, so its glibc is the host's, plus iproute2 for the tests and
+/// an ssh client for the route bench's client side.
 fn dockerfile(codename: &str) -> String {
     format!(
         "FROM ubuntu:{codename}\n\
-         RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*\n"
+         RUN apt-get update && apt-get install -y --no-install-recommends iproute2 openssh-client && rm -rf /var/lib/apt/lists/*\n"
     )
 }
 
@@ -380,6 +447,8 @@ impl Drop for RemoteNs {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::ffi::OsStr;
+
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -441,9 +510,63 @@ mod tests {
         assert_eq!(ubuntu_codename(debian), None);
         assert_eq!(ubuntu_codename("UBUNTU_CODENAME=\n"), None);
 
-        assert_eq!(image_tag("noble"), "sshunnel-netns:noble");
         let dockerfile = dockerfile("noble");
         assert!(dockerfile.starts_with("FROM ubuntu:noble\n") && dockerfile.contains("iproute2"), "{dockerfile}");
+        assert!(dockerfile.contains("openssh-client"), "the route bench runs ssh in the container: {dockerfile}");
+    }
+
+    #[test]
+    fn the_image_tag_follows_the_dockerfile() {
+        // `image` builds only on a missing tag, so a changed Dockerfile under the same tag would
+        // leave every machine that built the old one running it.
+        let tag = image_tag("noble");
+
+        assert_eq!(tag, tag_for("noble", &dockerfile("noble")));
+        assert!(tag.starts_with("sshunnel-netns:noble-"), "{tag}");
+        assert_ne!(tag_for("noble", "FROM ubuntu:noble\n"), tag_for("noble", "FROM ubuntu:noble\nRUN true\n"));
+    }
+
+    #[test]
+    fn a_command_runs_where_its_runner_runs_it() {
+        let inner = strings(&["/repo/target/debug/xtask", "bench-client"]);
+        let mounts = [PathBuf::from("/repo/target")];
+
+        let direct = Runner::Direct.wrap(&inner, &mounts, Duration::from_secs(60)).unwrap();
+        assert_eq!(direct.get_program(), "/repo/target/debug/xtask");
+        assert_eq!(direct.get_args().collect::<Vec<_>>(), ["bench-client"]);
+        assert_eq!(direct.get_envs().collect::<Vec<_>>(), [(OsStr::new(INSIDE), Some(OsStr::new("1")))]);
+
+        let image = "sshunnel-netns:noble-0123456789ab";
+        let docker = Runner::Docker { image: image.to_owned() }.wrap(&inner, &mounts, Duration::from_secs(60)).unwrap();
+        let workdir = std::env::current_dir().unwrap();
+        assert_eq!(docker.get_program(), "docker");
+        assert_eq!(docker.get_args().collect::<Vec<_>>(), docker_run(image, &mounts, &workdir, Duration::from_secs(60), &inner).unwrap());
+    }
+
+    #[test]
+    fn namespaces_run_a_command_here_as_the_rerun_does_and_in_the_container_as_its_root() {
+        let program = strings(&["/repo/target/debug/xtask", "bench-client"]);
+        let mounts = [PathBuf::from("/repo/target")];
+        let argv = |command: &Command| -> Vec<OsString> { std::iter::once(command.get_program()).chain(command.get_args()).map(OsStr::to_owned).collect() };
+
+        // Here: the rerun's own namespaces (the probe checks those), then the program.
+        let direct = Namespaces(Runner::Direct);
+        let mut expected = namespaced();
+        expected.extend(program.clone());
+        assert_eq!(argv(&direct.command(&program, &mounts, Duration::from_secs(60)).unwrap()), expected);
+        assert!(direct.command(&[], &mounts, Duration::from_secs(60)).is_err(), "nothing to run");
+        assert_eq!(direct.to_string(), "user namespaces (unshare)");
+
+        // In the container, the program itself as the container's root: in a user namespace of its
+        // own, the files this user owns in the mounts would have an unmapped owner.
+        let image = "sshunnel-netns:noble-0123456789ab";
+        let docker = Namespaces(Runner::Docker { image: image.to_owned() });
+        let workdir = std::env::current_dir().unwrap();
+        let mut expected = vec![OsString::from("docker")];
+        expected.extend(docker_run(image, &mounts, &workdir, Duration::from_secs(60), &program).unwrap());
+        assert_eq!(argv(&docker.command(&program, &mounts, Duration::from_secs(60)).unwrap()), expected);
+        assert!(docker.command(&[], &mounts, Duration::from_secs(60)).is_err(), "nothing to run");
+        assert_eq!(docker.to_string(), "a privileged Docker container (sshunnel-netns:noble-0123456789ab)");
     }
 
     #[test]

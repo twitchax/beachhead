@@ -19,9 +19,12 @@ tasks:
                            (every arch unless --arch narrows it)
   dist [--target TRIPLE]   build the release client with target/relay embedded into target/dist;
                            without --target, also check its `relays` output against SHA256SUMS
-  bench [--mib N] [--runs N]
+  bench [--mib N] [--runs N] [--route]
                            relay + dist, then compare `sshunnel forward -L` with `ssh -L` through
-                           a throwaway non-root sshd (default 512 MiB per transfer, best of 3)";
+                           a throwaway non-root sshd (default 512 MiB per transfer, best of 3);
+                           --route compares `sshunnel route` with `sshunnel forward -L` instead,
+                           one stream each way, from network namespaces (Linux, needs Docker
+                           where user namespaces are restricted)";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,8 +37,14 @@ fn main() -> Result<()> {
             let host = Arch::from_name(std::env::consts::ARCH).context("no relay arch for this host")?;
             relay(&[host])?;
             dist(None)?;
-            bench::run(&target_dir().join("dist").join("sshunnel"), &options)
+            bench::run(&target_dir().join("dist").join("sshunnel"), &target_dir(), &options)
         }
+        // Hidden: ssh's ProxyCommand and the client side, both in the route bench's namespaces.
+        "bridge" => match rest {
+            [socket] => bench::bridge_stdio(Path::new(socket)),
+            _ => bail!("usage: cargo xtask bridge <socket>"),
+        },
+        "bench-client" => bench::client(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
@@ -143,13 +152,14 @@ fn arches(args: &[String]) -> Result<Vec<Arch>> {
 }
 
 fn bench_options(args: &[String]) -> Result<bench::Options> {
-    let mut options = bench::Options { mib: 512, runs: 3 };
+    let mut options = bench::Options { mib: 512, runs: 3, route: false };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let mut value = || -> Result<usize> { args.next().with_context(|| format!("{arg} needs a value"))?.parse().with_context(|| format!("{arg} needs a number")) };
         match arg.as_str() {
             "--mib" => options.mib = value()?.max(8),
             "--runs" => options.runs = value()?.max(1),
+            "--route" => options.route = true,
             other => bail!("unexpected argument `{other}`\n\n{USAGE}"),
         }
     }
@@ -230,6 +240,15 @@ mod unit {
         let mut lying = elf(1);
         lying[0x38..0x3A].copy_from_slice(&9u16.to_le_bytes());
         assert!(is_static_elf(&lying).is_err(), "nine headers claimed, one present");
+    }
+
+    #[test]
+    fn bench_flags_parse() {
+        let plain = bench_options(&[]).unwrap();
+        assert_eq!((plain.mib, plain.runs, plain.route), (512, 3, false));
+        let route = bench_options(&["--route".into(), "--mib".into(), "64".into()]).unwrap();
+        assert_eq!((route.mib, route.runs, route.route), (64, 3, true));
+        assert!(bench_options(&["--routes".into()]).is_err());
     }
 
     #[test]

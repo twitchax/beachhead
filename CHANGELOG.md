@@ -22,6 +22,9 @@ why the version moved the way it did.
 - `sshunnel relays`: the arch, sha256 and size of each relay the client would execute.
 - `cargo xtask relay`, `dist` and `bench`: build the relays and `SHA256SUMS`, build a client with
   them embedded, and compare throughput against `ssh -L`.
+- `cargo xtask bench --route`: `sshunnel route` against `sshunnel forward -L`, one stream each way,
+  with the client side in network namespaces (a privileged Docker container where Ubuntu restricts
+  user namespaces), marking a ratio under 0.90.
 - `sshunnel route <destination> <target>...` (Linux): routes TCP to CIDRs and to names matching
   domain patterns (`*.corp.example`) through the relay, over a TUN device, `sshunnel0`. Names
   resolve on the remote and get stable fake addresses from `198.18.0.0/15`, and `-x` carves CIDRs

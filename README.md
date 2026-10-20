@@ -186,6 +186,19 @@ rather than any real link. A single stream's throughput tracks window ÷ round t
 window held one stream to roughly half of `ssh -L`, which is why the default is 1 MiB (the sweep is
 in the [bench log](.prds/PRD-0002.log.md)).
 
+`cargo xtask bench --route` puts `route` against `forward -L`, one stream each way, both from a
+network namespace of their own and through the same sshd, to this host's own address. Three runs
+(512 MiB per transfer, best of three interleaved rounds each) on a 64-core x86_64 Linux machine:
+
+| | upload | download |
+|---|---|---|
+| `sshunnel forward -L` | 456 to 492 MiB/s | 433 to 456 MiB/s |
+| `sshunnel route` | 485 to 511 MiB/s | 374 to 428 MiB/s |
+| route / forward | 1.01 to 1.07 | 0.82 to 0.98 |
+
+Upload keeps pace. Download averages about 86% of forward mode's across every round, under the
+milestone's 90% bar; the profile and the options are in the [PRD log](.prds/PRD-0004.log.md).
+
 ## Caveats
 
 - Remotes must be Linux on x86_64 or aarch64, with a POSIX `sh`, `uname`, `ls`, `head -c` and
@@ -229,6 +242,7 @@ cargo make ci        # fmt-check + clippy (-D warnings) + nextest: the gate CI r
 cargo make uat       # ci + the #[ignore]d slow suites
 cargo make codecov   # coverage.lcov
 cargo xtask bench    # sshunnel -L against ssh -L through a throwaway sshd
+cargo xtask bench --route   # sshunnel route against sshunnel -L, from network namespaces
 ```
 
 The e2e tests play the remote with a fake `ssh` that runs the bootstrap locally through `sh`, dash,
@@ -239,8 +253,9 @@ again as root over throwaway user, mount, PID and network namespaces (`unshare`)
 network in a second namespace across a veth pair. Nothing on the machine changes, and nothing needs
 sudo. Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; there, each test
 runs in a privileged Docker container instead (Docker without sudo, about half a second a test),
-built from your own Ubuntu release plus iproute2 as `sshunnel-netns:<codename>` on first use, with
-the checkout mounted read-only. With neither, the tests skip with a warning (under `CI`, they fail).
+built from your own Ubuntu release plus iproute2 and an ssh client as
+`sshunnel-netns:<codename>-<hash>` (the hash is the Dockerfile's) on first use, with the checkout
+mounted read-only. `cargo xtask bench --route` runs its client side the same way. With neither, the tests skip with a warning (under `CI`, they fail).
 `SSHUNNEL_NETNS=docker` forces the container. The alternative to Docker is lifting the restriction,
 as CI does on its throwaway runners:
 

@@ -51,6 +51,7 @@ cargo make codecov   # coverage.lcov
 cargo xtask relay    # static musl relays + SHA256SUMS into target/relay
 cargo xtask dist     # release client with target/relay embedded, hashes checked
 cargo xtask bench    # sshunnel -L vs ssh -L through a throwaway sshd (not part of ci)
+cargo xtask bench --route  # sshunnel route vs sshunnel -L, one stream each way, from namespaces
 ```
 
 ## Conventions

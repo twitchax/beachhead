@@ -34,7 +34,7 @@ mod tunnel;
 
 pub use app::{AppConn, AppStack, Connect, Icmp, Sent};
 #[cfg(target_os = "linux")]
-pub use netns::{RemoteNs, netns};
+pub use netns::{Namespaces, RemoteNs, netns};
 pub use tunnel::{FakeConn, FakeTunnel, Gate};
 
 /// A stand-in for a remote machine: a fake `ssh` that ignores its options and destination and runs
