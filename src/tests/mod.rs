@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, bail, ensure};
+use anyhow::{Context as _, bail};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::{TcpListener, TcpStream},
@@ -32,6 +32,7 @@ use {
         DEVICE, PIN_PROTO,
         helper::{self, Helper, Setup},
     },
+    anyhow::ensure,
     rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair},
     std::os::fd::OwnedFd,
     tokio::net::UnixDatagram,
