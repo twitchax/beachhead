@@ -162,7 +162,14 @@ fn number<T: std::str::FromStr>(arg: &str) -> Result<T> {
 /// `route / forward`, marked when it falls below [`BAR`].
 fn ratio(route: f64, forward: f64) -> String {
     let ratio = route / forward;
-    if ratio < BAR { format!("{ratio:.3} < {BAR:.2}") } else { format!("{ratio:.3}") }
+    if below_bar(ratio) { format!("{ratio:.3} < {BAR:.2}") } else { format!("{ratio:.3}") }
+}
+
+/// Whether a route / forward ratio misses [`BAR`]: the one check behind both the table's mark and
+/// the verdict. A NaN (both modes moved nothing) compares false against anything, so it is named
+/// rather than let through.
+fn below_bar(ratio: f64) -> bool {
+    ratio.is_nan() || ratio < BAR
 }
 
 /// The middle of `rates`, or the mean of the middle two when there are an even number.
@@ -184,7 +191,7 @@ fn verdict(route: [f64; 2], forward: [f64; 2]) -> Result<()> {
         .into_iter()
         .zip(route.into_iter().zip(forward))
         .map(|(direction, (route, forward))| (direction, route / forward))
-        .filter(|&(_, ratio)| ratio < BAR)
+        .filter(|&(_, ratio)| below_bar(ratio))
         .map(|(direction, ratio)| format!("{direction} {ratio:.3}"))
         .collect();
     ensure!(missed.is_empty(), "route mode's median is under {BAR:.2} of forward mode's: {}", missed.join(", "));
@@ -473,5 +480,17 @@ mod unit {
         assert_eq!(ratio(450.0, 500.0), "0.900");
         assert_eq!(ratio(510.0, 500.0), "1.020");
         assert_eq!(ratio(449.0, 500.0), "0.898 < 0.90");
+    }
+
+    #[test]
+    fn a_ratio_that_is_not_a_number_misses_the_bar() {
+        // A mode that moved nothing: 0 / 0.
+        assert_eq!(ratio(0.0, 0.0), "NaN < 0.90");
+        let error = verdict([470.0, 0.0], [500.0, 0.0]).unwrap_err().to_string();
+        assert!(error.contains("download NaN") && !error.contains("upload"), "{error}");
+
+        // Forward mode moving nothing is no reason to fail route.
+        assert_eq!(ratio(470.0, 0.0), "inf");
+        assert!(verdict([470.0, 450.0], [0.0, 500.0]).is_ok());
     }
 }
