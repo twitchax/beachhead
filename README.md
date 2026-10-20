@@ -102,15 +102,16 @@ whatever address it has on the remote.
 
 Names resolve on the remote. The relay looks each one up with the remote's own resolver, and a name
 that exists there gets a stable fake address from `198.18.0.0/15`, remembered in
-`~/.local/state/sshunnel/names`; one that doesn't is NXDOMAIN here too. Connections refused or
-unreachable on the remote look the same to the app.
+`$XDG_STATE_HOME/sshunnel/names` (by default `~/.local/state/sshunnel/names`); one that doesn't is
+NXDOMAIN here too. Connections refused or unreachable on the remote look the same to the app.
 
 Before ssh even starts, `route` refuses `0.0.0.0/0` and `::/0`, a bare `*`, a target equal to or
 inside a directly connected subnet (a broader one is allowed, and the connected part stays local,
-with a warning), a target equal to or inside `198.18.0.0/15`, and a route the main table already
-has at the metric sshunnel's own would get (0 for IPv4, 1024 for IPv6; the kernel won't hold two),
-reporting every problem at once. Each target gets a route of its own, never merged with its
-neighbors, so each competes with the machine's routes on its own prefix.
+with a warning), a target equal to or inside `198.18.0.0/15`, a connected subnet overlapping
+`198.18.0.0/15` (whatever the targets), and a route the main table already has at the metric
+sshunnel's own would get (0 for IPv4, 1024 for IPv6; the kernel won't hold two), reporting every
+problem at once. Each target gets a route of its own, never merged with its neighbors, so each
+competes with the machine's routes on its own prefix.
 
 ```text
 $ sshunnel route --help
@@ -255,13 +256,14 @@ again as root over throwaway user, mount, PID and network namespaces (`unshare`)
 network in a second namespace across a veth pair. Nothing on the machine changes, and nothing needs
 sudo. Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; there, each test
 runs in a privileged Docker container instead (Docker without sudo, about half a second a test),
-built from your own Ubuntu release plus iproute2 and an ssh client as
-`sshunnel-netns:<codename>-<hash>` (the hash is the Dockerfile's) on first use, with the checkout
-mounted read-only. `cargo xtask bench --route` runs its client side in the same container. With
-neither, the tests skip with a warning (under `CI`, they fail). `SSHUNNEL_NETNS=docker` forces the
-container. A change to the image's definition builds a new tag and leaves the old one behind:
-`docker image ls sshunnel-netns` lists them, and `docker image rm sshunnel-netns:<tag>` frees one.
-The alternative to Docker is lifting the restriction, as CI does on its throwaway runners:
+built from your own Ubuntu release (for a derivative, the one it is built on) plus iproute2 and an
+ssh client as `sshunnel-netns:<codename>-<hash>` (the hash is the Dockerfile's) on first use, with
+the checkout and the cargo target dir mounted read-only. `cargo xtask bench --route` runs its
+client side in the same container. With neither, the tests skip with a warning (under `CI`, they
+fail). `SSHUNNEL_NETNS=docker` forces the container. A change to the image's definition builds a
+new tag and leaves the old one behind: `docker image ls sshunnel-netns` lists them, and
+`docker image rm sshunnel-netns:<tag>` frees one. The alternative to Docker is lifting the
+restriction, as CI does on its throwaway runners:
 
 ```bash
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   # until reboot

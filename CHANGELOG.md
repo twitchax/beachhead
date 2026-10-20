@@ -28,13 +28,20 @@ why the version moved the way it did.
   is under 90% of forward mode's, and prints the best beside it.
 - `sshunnel route <destination> <target>...` (Linux): routes TCP to CIDRs and to names matching
   domain patterns (`*.corp.example`) through the relay, over a TUN device, `sshunnel0`. Names
-  resolve on the remote and get stable fake addresses from `198.18.0.0/15`, and `-x` carves CIDRs
-  and names out. Every refusal (`/0`, a bare `*`, a target inside a connected subnet or the fake
-  range, a route the main table already has) is reported before ssh runs. A root helper started
-  through sudo sets the device up, keeps ssh's peers and the DNS servers on their routes, and
-  leaves nothing behind on exit.
+  resolve on the remote and get stable fake addresses from `198.18.0.0/15`, kept in
+  `~/.local/state/sshunnel/names` (under `$XDG_STATE_HOME` when set), and `-x` carves CIDRs and
+  names out. Domain patterns need systemd-resolved, which hands sshunnel only the queries under
+  them. UDP and ICMP to a routed address get ICMP administratively prohibited. Every refusal (`/0`,
+  a bare `*`, a target inside a connected subnet or the fake range, a connected subnet overlapping
+  the fake range, a route the main table already has, patterns without systemd-resolved) is
+  reported before ssh runs. A root helper started through sudo (the hidden `sshunnel helper`, which
+  the README's `NOPASSWD` sudoers line names) sets the device up, keeps ssh's peers and the DNS
+  servers on their routes, and leaves nothing behind on exit.
 - Protocol v3: `Resolve` / `Resolved` / `ResolveErr` frames, so the relay can resolve a name with
   its own resolver (`getaddrinfo`), and a kind on `OpenErr` (refused, unreachable, timed out,
   other), so a failed dial says why. A cached v2 relay is simply replaced, since the cache is keyed
   by hash.
+- `route`'s e2e tests run as root over throwaway network namespaces: through `unshare`, or where
+  Ubuntu restricts user namespaces, in a privileged Docker container built on first use
+  (`sshunnel-netns:*`). `SSHUNNEL_NETNS=docker` forces the container.
 - Initial scaffold.
