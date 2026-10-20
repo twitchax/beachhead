@@ -45,5 +45,7 @@ why the version moved the way it did.
   by hash.
 - `route`'s e2e tests run as root over throwaway network namespaces: through `unshare`, or where
   Ubuntu restricts user namespaces, in a privileged Docker container built on first use
-  (`sshunnel-netns:*`). `SSHUNNEL_NETNS=docker` forces the container.
+  (`sshunnel-netns:*`). `SSHUNNEL_NETNS=docker` forces the container. In CI, `tests/route_sudo.rs`
+  also runs `route` as a user does, through the real sudo on a pseudo-terminal, and ends it with a
+  Ctrl-C typed there.
 - Initial scaffold.

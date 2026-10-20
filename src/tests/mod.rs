@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, bail, ensure};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::{TcpListener, TcpStream},
@@ -28,7 +28,10 @@ use crate::{
 };
 #[cfg(target_os = "linux")]
 use {
-    crate::route::helper::{self, Helper, Setup},
+    crate::route::{
+        DEVICE, PIN_PROTO,
+        helper::{self, Helper, Setup},
+    },
     rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair},
     std::os::fd::OwnedFd,
     tokio::net::UnixDatagram,
@@ -100,9 +103,10 @@ impl FakeRemote {
         Ok(self)
     }
 
-    /// Runs the remote side with `hosts` as its `/etc/hosts`, bind-mounted in a mount namespace of
-    /// its own (`unshare -m`, so as root). Its `/etc/nsswitch.conf` names that file alone: the
-    /// remote is this machine, whose resolver `route` may be sending back to the relay.
+    /// Runs the remote side with `hosts` as its `/etc/hosts`, bind-mounted in user and mount
+    /// namespaces of its own (`unshare -rm`, so any user can, where user namespaces are allowed).
+    /// Its `/etc/nsswitch.conf` names that file alone: the remote is this machine, whose resolver
+    /// `route` may be sending back to the relay.
     ///
     /// # Errors
     ///
@@ -113,7 +117,7 @@ impl FakeRemote {
         std::fs::write(&hosts_file, hosts).context("writing the remote's hosts file")?;
         std::fs::write(&nsswitch, "hosts: files\n").context("writing the remote's nsswitch.conf")?;
         self.wrapper.push(format!(
-            "unshare -m sh -c {} sh {} {}",
+            "unshare -rm sh -c {} sh {} {}",
             quote(r#"mount --bind "$1" /etc/hosts && mount --bind "$2" /etc/nsswitch.conf && shift 2 && exec "$@""#)?,
             quote(&hosts_file.to_string_lossy())?,
             quote(&nsswitch.to_string_lossy())?,
@@ -423,6 +427,45 @@ pub fn route_command(exe: impl AsRef<OsStr>, dir: &Path, ssh: &Path, relays: &Pa
 pub async fn start_helper(exe: &Path, dir: &Path, setup: &Setup) -> Res<Helper> {
     let euid = rustix::process::geteuid().as_raw();
     Helper::start_with(setup, dir, |socket| helper::command(exe, socket, euid)).await
+}
+
+/// What `sshunnel route` has in this network namespace, one line of `ip` each: its device, any route
+/// on the device and any pinned route. Empty once a run is over.
+///
+/// # Errors
+///
+/// Fails when `ip` does.
+#[cfg(target_os = "linux")]
+pub fn leftovers() -> Res<Vec<String>> {
+    let pinned = format!("proto {PIN_PROTO}");
+    let device = ip(&["-o", "link", "show"])?.into_iter().filter(|link| link.contains(DEVICE));
+    let routes = routes()?.into_iter().filter(|route| route.contains(DEVICE) || route.contains(&pinned));
+    Ok(device.chain(routes).collect())
+}
+
+/// Every route in every table, v4 then v6, one line of `ip` each.
+///
+/// # Errors
+///
+/// Fails when `ip` does.
+#[cfg(target_os = "linux")]
+pub fn routes() -> Res<Vec<String>> {
+    let mut routes = ip(&["-4", "route", "show", "table", "all"])?;
+    routes.extend(ip(&["-6", "route", "show", "table", "all"])?);
+    Ok(routes)
+}
+
+/// `ip`'s output, trimmed line by line.
+///
+/// # Errors
+///
+/// Fails, quoting its stderr, when `ip` does.
+#[cfg(target_os = "linux")]
+pub fn ip(args: &[&str]) -> Res<Vec<String>> {
+    let out = std::process::Command::new("ip").args(args).output().context("running ip")?;
+    ensure!(out.status.success(), "ip {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8(out.stdout).context("ip printed something other than UTF-8")?;
+    Ok(stdout.lines().map(|line| line.trim().to_owned()).collect())
 }
 
 /// A process whose stderr is collected line by line as it arrives, so a test can wait for a line and

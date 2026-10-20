@@ -276,7 +276,10 @@ escalation exploits.
 
 The name tests (`tests/route_root.rs`) go through the host's own systemd-resolved, which no test
 namespace has, so they run as root on the host and only in CI (`#[ignore]`d, through
-`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'`). Locally they skip.
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'`). Locally they skip. So does
+`tests/route_sudo.rs`, which runs `route` the way you do: not root, through the real sudo, on a
+pseudo-terminal, ended by a Ctrl-C typed there. CI runs it as the runner's own user, which has
+passwordless sudo.
 
 ## License
 

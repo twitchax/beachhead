@@ -74,9 +74,10 @@ tempfile = "3"
 # Paused time for the netstack's held-SYN and timeout tests.
 tokio = { workspace = true, features = ["test-util"] }
 
-# What only the tests need from rustix: a stdin of their choosing for the helper's.
+# What only the tests need from rustix: a stdin of their choosing for the helper's, and a terminal
+# to run `route` on.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-rustix = { version = "1", features = ["stdio"] }
+rustix = { version = "1", features = ["pty", "stdio", "termios"] }
 
 [lints]
 workspace = true

@@ -22,7 +22,7 @@ use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use sshunnel::{
     route::{helper::Setup, peers::process_tree, system::same_netns_as_init},
-    tests::{FakeRemote, RemoteNs, Watched, echo_on, netns, pattern, relay_dir, round_trip, route_command, shim_dir, start_helper},
+    tests::{self, FakeRemote, RemoteNs, Watched, echo_on, netns, pattern, relay_dir, round_trip, route_command, shim_dir, start_helper},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -136,25 +136,17 @@ fn helper_of(route: &Watched) -> u32 {
 
 /// `ip`'s output, trimmed line by line.
 fn ip(args: &[&str]) -> Vec<String> {
-    let out = StdCommand::new("ip").args(args).output().unwrap();
-    assert!(out.status.success(), "ip {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().lines().map(|line| line.trim().to_owned()).collect()
-}
-
-/// Every route in every table, v4 then v6.
-fn routes() -> impl Iterator<Item = String> {
-    ["-4", "-6"].into_iter().flat_map(|family| ip(&[family, "route", "show", "table", "all"]))
+    tests::ip(args).unwrap()
 }
 
 /// The pinned routes. (`ip route show proto 222` would leave the protocol out of each line.)
 fn pins() -> Vec<String> {
-    routes().filter(|route| route.contains("proto 222")).collect()
+    tests::routes().unwrap().into_iter().filter(|route| route.contains("proto 222")).collect()
 }
 
 /// What `route` has in this namespace: its device, any route on the device, any pinned route.
 fn leftovers() -> Vec<String> {
-    let device = ip(&["-o", "link", "show"]).into_iter().filter(|link| link.contains("sshunnel0"));
-    device.chain(routes().filter(|route| route.contains("sshunnel0") || route.contains("proto 222"))).collect()
+    tests::leftovers().unwrap()
 }
 
 /// [`leftovers`] once `settled` holds for them (or [`WITHIN`] has passed), for what goes with a
