@@ -105,14 +105,15 @@ that exists there gets a stable fake address from `198.18.0.0/15`, remembered in
 `$XDG_STATE_HOME/sshunnel/names` (by default `~/.local/state/sshunnel/names`); one that doesn't is
 NXDOMAIN here too. Connections refused or unreachable on the remote look the same to the app.
 
-Before ssh even starts, `route` refuses `0.0.0.0/0` and `::/0`, a bare `*`, a target equal to or
-inside a directly connected subnet (a broader one is allowed, and the connected part stays local,
-with a warning), a target equal to or inside `198.18.0.0/15`, a connected subnet overlapping
-`198.18.0.0/15` (whatever the targets), targets that come to more than 4096 routes (an exclude
-carves its target into pieces, each a route), and a route the main table already has at the metric
-sshunnel's own would get (0 for IPv4, 1 for IPv6, so either wins a tie with a route at the kernel's
-default; the kernel won't hold two at the same metric), reporting every problem at once. Each
-target gets a route of its own, never merged with its neighbors, so each competes with the
+Before ssh even starts, `route` refuses `0.0.0.0/0` and `::/0`, a bare `*`, a pattern no hostname
+can match (labels are ASCII letters, digits, `-` and `_`; an IDN goes in its `xn--` form), a target
+equal to or inside a directly connected subnet (a broader one is allowed, and the connected part
+stays local, with a warning), a target equal to or inside `198.18.0.0/15`, a connected subnet
+overlapping `198.18.0.0/15` (whatever the targets), targets that come to more than 4096 routes (an
+exclude carves its target into pieces, each a route), and a route the main table already has at the
+metric sshunnel's own would get (0 for IPv4, 1 for IPv6, so either wins a tie with a route at the
+kernel's default; the kernel won't hold two at the same metric), reporting every problem at once.
+Each target gets a route of its own, never merged with its neighbors, so each competes with the
 machine's routes on its own prefix.
 
 ```text

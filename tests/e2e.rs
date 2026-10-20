@@ -213,15 +213,17 @@ async fn e2e_route_refuses_before_running_ssh() {
         .arg(remote.ssh_path())
         .arg("--relay-dir")
         .arg(&relays)
-        .args(["fake-host", "0.0.0.0/0", "*"])
+        .args(["fake-host", "0.0.0.0/0", "*", "*.caf\u{e9}.example"])
         .output()
         .await
         .unwrap();
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "stderr: {stderr}");
-    // Every problem at once, so one run shows everything to fix.
+    // Every problem at once, so one run shows everything to fix. A pattern no hostname can match
+    // would otherwise get resolved's routing domain and answer NXDOMAIN for every name.
     assert!(stderr.contains("'0.0.0.0/0'") && stderr.contains("'*'"), "{stderr}");
+    assert!(stderr.contains("'*.caf\u{e9}.example'"), "{stderr}");
     assert!(remote.last_ssh_args().is_err(), "ssh ran before the targets were checked");
 }
 

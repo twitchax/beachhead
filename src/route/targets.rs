@@ -21,6 +21,10 @@ use crate::{
 /// How specific a name rule is: more labels first, then exact beats wildcard.
 type Rank = (usize, bool);
 
+/// The longest hostname, and the longest label in one.
+const MAX_NAME: usize = 253;
+const MAX_LABEL: usize = 63;
+
 /// The most routes one setup may add. Each is an `ip` run as root, and excludes inside a wide v6
 /// target can carve one into a hundred thousand.
 pub const MAX_ROUTES: usize = 4096;
@@ -72,8 +76,13 @@ impl FromStr for Pattern {
         if domain.contains('*') {
             bail!("'*' is only allowed as the whole leftmost label");
         }
-        if domain.chars().any(|c| c.is_whitespace() || c == '/') {
-            bail!("not a valid domain name");
+        // resolved would route every name under it here, and the DNS server answers NXDOMAIN for
+        // any name that isn't a hostname.
+        if !plausible(domain) {
+            bail!(
+                "no hostname can match it: labels are ASCII letters, digits, '-' and '_', of 1 to {MAX_LABEL} bytes, in at most {MAX_NAME} \
+                 (an IDN in its xn-- form)"
+            );
         }
 
         Ok(Self { name: domain.to_owned(), wildcard })
@@ -334,6 +343,16 @@ impl Targets {
     }
 }
 
+/// Whether `name` (already normalized) could be a hostname: ASCII letters, digits, `-`, `_`,
+/// labels of 1 to 63 bytes, and at most 253 bytes in all. One rule for the patterns a run accepts
+/// and the names its DNS server looks up.
+pub(crate) fn plausible(name: &str) -> bool {
+    name.len() <= MAX_NAME
+        && name
+            .split('.')
+            .all(|label| (1..=MAX_LABEL).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+}
+
 /// Lowercase with no trailing dot, so `WIKI.Corp.Example.` is `wiki.corp.example`.
 pub(crate) fn normalize(name: &str) -> String {
     name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
@@ -452,6 +471,36 @@ mod tests {
         for target in bad {
             assert!(error.contains(&format!("'{target}'")), "{error} should name {target}");
         }
+    }
+
+    // Patterns are typed, so these limits refuse; the DNS wire format already caps a query's labels
+    // and names, where they are a backstop.
+    #[test]
+    fn plausible_names_are_hostnames() {
+        assert!(plausible("wiki.corp.example"));
+        assert!(plausible("_dmarc.a-b.corp.example"));
+        assert!(plausible(&format!("{}.example", "a".repeat(63))));
+        assert!(plausible(&vec!["a".repeat(61); 4].join(".")));
+
+        assert!(!plausible(""));
+        assert!(!plausible("a..b"));
+        assert!(!plausible("bad name"));
+        assert!(!plausible("caf\u{e9}.example"));
+        assert!(!plausible(&format!("{}.example", "a".repeat(64))));
+        assert!(!plausible(&format!("{}.example", vec!["a".repeat(60); 5].join("."))));
+    }
+
+    #[test]
+    fn refuses_a_pattern_no_hostname_can_match() {
+        // resolved would hand sshunnel every name under these, and each would be NXDOMAIN.
+        let long_label = format!("*.{}.example", "a".repeat(64));
+        let bad = ["caf\u{e9}.corp.example", "*.b\u{fc}ro.example", &long_label, "under_score.ok.example"];
+        let error = Targets::parse(&strings(&bad[..3]), &strings(&bad[..1])).unwrap_err().to_string();
+
+        for pattern in &bad[..3] {
+            assert!(error.contains(&format!("'{pattern}': no hostname can match it")), "{error} should name {pattern}");
+        }
+        assert!(Targets::parse(&strings(&bad[3..]), &[]).is_ok(), "an underscore is a hostname's");
     }
 
     #[test]

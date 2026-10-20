@@ -24,7 +24,12 @@ use tokio::{
 
 use crate::{
     base::Res,
-    route::{names::today, router::Router, stack::Dns, targets::normalize},
+    route::{
+        names::today,
+        router::Router,
+        stack::Dns,
+        targets::{normalize, plausible},
+    },
     tunnel::Tunnel,
 };
 
@@ -41,8 +46,6 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const UPSTREAM_BUF: usize = 65535;
 /// The zone negative answers claim to come from; `.invalid` can never exist, so it can't clash.
 const SOA_ZONE: &str = "sshunnel.invalid";
-const MAX_NAME: usize = 253;
-const MAX_LABEL: usize = 63;
 
 /// Answers the queries the netstack hands it.
 pub struct Server<T: Tunnel> {
@@ -216,35 +219,4 @@ const fn ttl_secs() -> u32 {
 
 fn is_a_in(question: &Question<'_>) -> bool {
     question.qtype == QTYPE::TYPE(TYPE::A) && matches!(question.qclass, QCLASS::CLASS(CLASS::IN) | QCLASS::ANY)
-}
-
-/// Whether `name` (already normalized) could be a hostname: ASCII letters, digits, `-`, `_`,
-/// labels of 1 to 63 bytes, and at most 253 bytes in all.
-fn plausible(name: &str) -> bool {
-    name.len() <= MAX_NAME
-        && name
-            .split('.')
-            .all(|label| (1..=MAX_LABEL).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-}
-
-#[cfg(test)]
-mod unit {
-    use super::plausible;
-
-    // The wire format already caps labels at 63 bytes and names at 253, so the parser never lets
-    // these through; the length checks are a backstop that these pin down.
-    #[test]
-    fn plausible_names_are_hostnames() {
-        assert!(plausible("wiki.corp.example"));
-        assert!(plausible("_dmarc.a-b.corp.example"));
-        assert!(plausible(&format!("{}.example", "a".repeat(63))));
-        assert!(plausible(&vec!["a".repeat(61); 4].join(".")));
-
-        assert!(!plausible(""));
-        assert!(!plausible("a..b"));
-        assert!(!plausible("bad name"));
-        assert!(!plausible("caf\u{e9}.example"));
-        assert!(!plausible(&format!("{}.example", "a".repeat(64))));
-        assert!(!plausible(&format!("{}.example", vec!["a".repeat(60); 5].join("."))));
-    }
 }
