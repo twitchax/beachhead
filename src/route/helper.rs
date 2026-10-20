@@ -45,7 +45,7 @@ use crate::{
     route::{
         DEVICE, DNS_ADDR, FAKE_RANGE, MTU, PIN_PROTO, TUN_ADDR, TUN_ADDR6,
         system::{self, Via},
-        targets::Targets,
+        targets::{MAX_ROUTES, Targets},
     },
 };
 
@@ -409,6 +409,8 @@ fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
         "domain patterns need the host's network namespace, where systemd-resolved runs"
     );
     let routes = targets.routes();
+    let pins = honored(&routes, &setup.pins, &snapshot.hosts);
+    within_cap(&routes, &pins)?;
 
     let tun = system::create_tun()?;
     // Holding the device means no other session is running, so any pinned route left is a dead one's.
@@ -417,10 +419,7 @@ fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
         system::run("ip", &[family, "route", "flush", "proto", &proto])?;
     }
     // Each pin copies the route its address has before the device has any.
-    let vias = honored(&routes, &setup.pins, &snapshot.hosts)
-        .into_iter()
-        .map(|pin| Ok((pin, system::route_get(pin)?)))
-        .collect::<Res<Vec<_>>>()?;
+    let vias = pins.into_iter().map(|pin| Ok((pin, system::route_get(pin)?))).collect::<Res<Vec<_>>>()?;
     let plan = plan(&targets, &routes, &vias);
     let pins = execute(&plan.steps, &mut run_step)?;
     warnings.extend(plan.warnings);
@@ -440,6 +439,21 @@ fn honored(routes: &[IpNet], pins: &[IpAddr], hosts: &[IpAddr]) -> Vec<IpAddr> {
     honored.sort_unstable();
     honored.dedup();
     honored
+}
+
+/// Refuses more routes and pins together than [`MAX_ROUTES`]: each pin is root's `ip` as a route
+/// is, a lookup, an add and a delete. `Targets::parse` has capped the routes alone; only the helper
+/// can count the pins, since the client finds them after ssh starts and the helper decides which
+/// it honors.
+fn within_cap(routes: &[IpNet], pins: &[IpAddr]) -> Void {
+    let total = routes.len() + pins.len();
+    ensure!(
+        total <= MAX_ROUTES,
+        "the targets' {} routes and {} pinned addresses come to {total}, more than the {MAX_ROUTES} sshunnel adds",
+        routes.len(),
+        pins.len()
+    );
+    Ok(())
 }
 
 /// One command the helper runs as root. A pin is remembered, so a failure or teardown deletes it.
@@ -974,6 +988,44 @@ mod tests {
         assert!(error.contains(DEVICE) && !error.contains("refused"), "{error}");
         assert!(fd.is_none());
         assert!(helper.await.unwrap().is_err());
+    }
+
+    /// `count` distinct addresses inside `10.99.0.0/16`.
+    fn pins_in_10_99(count: u32) -> Vec<IpAddr> {
+        (0..count).map(|i| IpAddr::V4(std::net::Ipv4Addr::from_bits(0x0a63_0000 + i))).collect()
+    }
+
+    #[test]
+    fn routes_and_pins_share_the_cap() {
+        let routes = [net("10.99.0.0/16")];
+
+        assert!(within_cap(&routes, &pins_in_10_99(4095)).is_ok());
+        let error = within_cap(&routes, &pins_in_10_99(4096)).unwrap_err().to_string();
+        assert!(error.contains("1 routes and 4096 pinned addresses come to 4097, more than the 4096"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_helper_counts_its_pins_against_the_cap() {
+        if getuid().is_root() {
+            eprintln!("skipping: as root, a helper past this check would set up {DEVICE}");
+            return;
+        }
+        let root = TempDir::new().unwrap();
+        let (listener, helper) = serving(&root);
+        // One route, and a pin for every address of 4096 inside it: each pin is root's `ip` too.
+        let crowded = Setup {
+            include: strings(&["10.99.0.0/16"]),
+            exclude: Vec::new(),
+            pins: pins_in_10_99(4096),
+        };
+
+        let (reply, fd) = reply_to(&listener, &crowded).await;
+
+        // Refused before the device: the first thing that needs root would name it.
+        let Reply::Failed { error } = reply else { panic!("4097 routes and pins were set up") };
+        assert!(error.contains("more than the 4096") && !error.contains(DEVICE), "{error}");
+        assert!(fd.is_none());
+        assert!(helper.await.unwrap().unwrap_err().is::<Reported>());
     }
 
     #[tokio::test]

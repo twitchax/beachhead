@@ -5,8 +5,10 @@
 //! has on the remote, and a CIDR exclude never touches a name.
 
 use std::{
+    collections::BTreeSet,
     fmt::{self, Display},
     net::IpAddr,
+    ops::ControlFlow,
     str::FromStr,
 };
 
@@ -26,7 +28,7 @@ const MAX_NAME: usize = 253;
 const MAX_LABEL: usize = 63;
 
 /// The most routes one setup may add. Each is an `ip` run as root, and excludes inside a wide v6
-/// target can carve one into a hundred thousand.
+/// target can carve one into a hundred thousand. The helper counts its pins against it too.
 pub const MAX_ROUTES: usize = 4096;
 
 /// A domain pattern: an exact name, or `*.` followed by a domain (the domain and everything under it).
@@ -215,9 +217,10 @@ impl Targets {
         let exclude = parse_all(exclude, false);
         let targets = Self { include, exclude };
 
-        let routes = targets.routes().len();
-        if routes > MAX_ROUTES {
-            problems.push(format!("the targets come to {routes} routes, more than the {MAX_ROUTES} sshunnel adds"));
+        // Carving stops once the routes pass the cap, so refusing costs the cap's worth of work
+        // however large the setup.
+        if targets.carve_into(&mut Carving::up_to(MAX_ROUTES)).is_break() {
+            problems.push(format!("the targets come to more than the {MAX_ROUTES} routes sshunnel adds"));
         }
         if !problems.is_empty() {
             bail!("invalid targets:\n  {}", problems.join("\n  "));
@@ -231,19 +234,25 @@ impl Targets {
     /// equal one elsewhere on its own, which a merged, broader route would lose on prefix length.
     #[must_use]
     pub fn routes(&self) -> Vec<IpNet> {
+        let mut carving = Carving::up_to(usize::MAX);
+        let _ = self.carve_into(&mut carving);
+        carving.routes.into_iter().collect()
+    }
+
+    /// Carves the routes into `carving`, until they pass its cap. An include given twice is carved
+    /// once: its routes would be the same, and each copy would cost the carving again.
+    fn carve_into(&self, carving: &mut Carving) -> ControlFlow<()> {
         // The fake range belongs to sshunnel, so it is always a hole in what a wider include routes.
         let excludes: Vec<IpNet> = nets(&self.exclude).chain([IpNet::V4(FAKE_RANGE)]).collect();
-        let mut routed = Vec::new();
-
-        for include in nets(&self.include) {
+        let mut includes: Vec<IpNet> = nets(&self.include).collect();
+        includes.sort_unstable();
+        includes.dedup();
+        for include in includes {
             // Only excludes inside the include carve it; one enclosing it loses to it (more specific).
             let holes: Vec<IpNet> = excludes.iter().filter(|e| include.contains(*e)).copied().collect();
-            carve(include, &holes, &mut routed);
+            carving.carve(include, &holes)?;
         }
-
-        routed.sort_unstable();
-        routed.dedup();
-        routed
+        ControlFlow::Continue(())
     }
 
     /// Whether traffic to `addr` goes through the tunnel: the most specific CIDR rule wins, an
@@ -396,23 +405,39 @@ fn refusal_for(target: &Target) -> Option<String> {
     IpNet::V4(FAKE_RANGE).contains(net).then(|| format!("is the fake range {FAKE_RANGE} or inside it"))
 }
 
-/// Adds `net` minus `holes`, each inside `net`, to `kept`: halves `net` until each half is inside a
-/// hole or holds none. A hole goes down one half at each split, so the work grows with the holes
-/// times the depth plus the pieces kept, where carving one hole at a time out of every piece grew
-/// with the holes times the pieces: seconds of root's CPU for the largest setup the helper reads.
-fn carve(net: IpNet, holes: &[IpNet], kept: &mut Vec<IpNet>) {
-    if holes.is_empty() {
-        kept.push(net);
-        return;
+/// Routes being carved: the distinct ones so far, how many may be kept before carving stops, and
+/// how many nodes carving has visited, its work.
+struct Carving {
+    routes: BTreeSet<IpNet>,
+    cap: usize,
+    visited: usize,
+}
+
+impl Carving {
+    fn up_to(cap: usize) -> Self {
+        Self { routes: BTreeSet::new(), cap, visited: 0 }
     }
-    if holes.iter().any(|hole| hole.contains(&net)) {
-        return;
-    }
-    // A hole is strictly inside `net`, so `net` is not a host route and can split.
-    let Ok(halves) = net.subnets(net.prefix_len() + 1) else { return };
-    for half in halves {
-        let inside: Vec<IpNet> = holes.iter().filter(|hole| half.contains(*hole)).copied().collect();
-        carve(half, &inside, kept);
+
+    /// Keeps `net` minus `holes`, each inside `net`: halves `net` until each half is inside a hole
+    /// or holds none, and breaks as soon as the routes kept pass the cap. A hole goes down one half
+    /// at each split, so the work grows with the holes times the depth plus the pieces kept, where
+    /// carving one hole at a time out of every piece grew with the holes times the pieces.
+    fn carve(&mut self, net: IpNet, holes: &[IpNet]) -> ControlFlow<()> {
+        self.visited += 1;
+        if holes.is_empty() {
+            self.routes.insert(net);
+            return if self.routes.len() > self.cap { ControlFlow::Break(()) } else { ControlFlow::Continue(()) };
+        }
+        if holes.iter().any(|hole| hole.contains(&net)) {
+            return ControlFlow::Continue(());
+        }
+        // A hole is strictly inside `net`, so `net` is not a host route and can split.
+        let Ok(halves) = net.subnets(net.prefix_len() + 1) else { return ControlFlow::Continue(()) };
+        for half in halves {
+            let inside: Vec<IpNet> = holes.iter().filter(|hole| half.contains(*hole)).copied().collect();
+            self.carve(half, &inside)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -740,28 +765,153 @@ mod tests {
         (0..count).map(|i| std::net::Ipv6Addr::from_bits(base | u128::from(i * step + 1)).to_string()).collect()
     }
 
+    /// Targets as written, without `parse`'s refusals, so a test can watch a setup past the cap carve.
+    fn unchecked(include: &[String], exclude: &[String]) -> Targets {
+        let entries = |raws: &[String]| {
+            raws.iter()
+                .map(|raw| Entry {
+                    target: raw.parse().unwrap(),
+                    raw: raw.clone(),
+                })
+                .collect()
+        };
+        Targets {
+            include: entries(include),
+            exclude: entries(exclude),
+        }
+    }
+
     #[test]
     fn refuses_more_routes_than_the_cap() {
-        // 128 excludes, one at the start of each /72 in the lower /65: the upper /65 stays whole, and
-        // each of the 128 /72s splits into 56 pieces around its hole.
+        // 128 excludes, one at the start of each /72 in the lower /65, come to 7169 routes: refused
+        // once the routes pass the cap, before the rest are carved, so no count is named.
         let excludes: Vec<String> = (0..128_u16).map(|i| format!("fd99::{i:x}00:0:0:0")).collect();
         let error = Targets::parse(&strings(&["fd99::/64"]), &excludes).unwrap_err().to_string();
-        assert!(error.contains("7169 routes") && error.contains("4096"), "{error}");
+        assert!(error.contains("the targets come to more than the 4096 routes sshunnel adds"), "{error}");
 
         // The cap itself is allowed: a host target each.
         let hosts = |count: u16| (0..count).map(|i| format!("fd99::{i:x}")).collect::<Vec<_>>();
         assert_eq!(Targets::parse(&hosts(4096), &[]).unwrap().routes().len(), 4096);
         let error = Targets::parse(&hosts(4097), &[]).unwrap_err().to_string();
-        assert!(error.contains("4097 routes") && error.contains("4096"), "{error}");
+        assert!(error.contains("the targets come to more than the 4096 routes sshunnel adds"), "{error}");
     }
 
     #[test]
-    fn the_cap_counts_the_largest_setup_without_quadratic_work() {
-        // About as many excludes as the helper's 64 KiB setup holds, spread to carve the most
-        // routes: some 120,000. Carving them one exclude at a time over every piece took seconds
-        // of root's CPU (minutes unoptimized) before any refusal.
-        let error = Targets::parse(&strings(&["fd99::/64"]), &spread_excludes(2300)).unwrap_err().to_string();
-        assert!(error.contains("4096"), "{error}");
+    fn carving_stops_once_the_routes_pass_the_cap() {
+        // Some 55,000 routes in all. The work before the refusal is the cap's, however often the
+        // include repeats: a binary tree has fewer nodes than twice its leaves, here the routes kept
+        // (the cap's worth and the one past it) and the holes reached on the way.
+        let excludes = spread_excludes(1000);
+        let work = |copies: usize| {
+            let mut carving = Carving::up_to(MAX_ROUTES);
+            let carved = unchecked(&vec!["fd99::/64".to_owned(); copies], &excludes).carve_into(&mut carving);
+            assert!(carved.is_break(), "{copies} copies stayed under the cap");
+            carving.visited
+        };
+
+        let once = work(1);
+        assert!(once < 2 * (MAX_ROUTES + 1 + excludes.len()), "{once} nodes visited");
+        assert_eq!(work(2000), once);
+    }
+
+    #[test]
+    fn a_repeated_target_is_carved_once() {
+        // Under the cap, every copy was carved again: 12 ms and 1.1 MB of root's apiece in release,
+        // and the helper's 64 KiB setup holds thousands of copies.
+        let excludes = spread_excludes(20);
+        let carved = |copies: usize| {
+            let mut carving = Carving::up_to(MAX_ROUTES);
+            let flow = unchecked(&vec!["fd99::/64".to_owned(); copies], &excludes).carve_into(&mut carving);
+            assert!(flow.is_continue(), "{copies} copies passed the cap");
+            carving
+        };
+
+        let (once, often) = (carved(1), carved(2000));
+        assert_eq!(often.routes, once.routes);
+        assert_eq!(often.visited, once.visited);
+        // A nested target still keeps a route of its own.
+        let nested = targets(&["10.0.0.0/22", "10.0.0.0/22", "10.0.2.0/24"], &["10.0.1.0/24"]).routes();
+        assert_eq!(nested, [net("10.0.0.0/24"), net("10.0.2.0/23"), net("10.0.2.0/24")]);
+    }
+
+    #[test]
+    fn nested_repeated_and_adjacent_excludes_carve_exactly() {
+        let carved = |include: &str, exclude: &[&str]| targets(&[include], exclude).routes().iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        // Nested: the inner exclude adds nothing to the outer one's hole.
+        assert_eq!(carved("10.0.0.0/22", &["10.0.1.0/24", "10.0.1.128/25"]), ["10.0.0.0/24", "10.0.2.0/23"]);
+        assert_eq!(carved("fd99::/62", &["fd99:0:0:1::/64", "fd99:0:0:1:8000::/65"]), ["fd99::/64", "fd99:0:0:2::/63"]);
+        // Repeated: once is the same as twice.
+        assert_eq!(carved("10.0.0.0/22", &["10.0.1.0/24", "10.0.1.0/24"]), ["10.0.0.0/24", "10.0.2.0/23"]);
+        assert_eq!(carved("fd99::/62", &["fd99:0:0:1::/64", "fd99:0:0:1::/64"]), ["fd99::/64", "fd99:0:0:2::/63"]);
+        // Adjacent across a split: each half carves on its own.
+        assert_eq!(carved("10.0.0.0/22", &["10.0.1.0/24", "10.0.2.0/24"]), ["10.0.0.0/24", "10.0.3.0/24"]);
+        assert_eq!(carved("fd99::/62", &["fd99:0:0:1::/64", "fd99:0:0:2::/64"]), ["fd99::/64", "fd99:0:0:3::/64"]);
+        // Adjacent siblings: together they are their parent's hole.
+        assert_eq!(carved("10.0.0.0/22", &["10.0.2.0/24", "10.0.3.0/24"]), ["10.0.0.0/23"]);
+        assert_eq!(carved("fd99::/62", &["fd99:0:0:2::/64", "fd99:0:0:3::/64"]), ["fd99::/63"]);
+    }
+
+    /// Numbers for generated setups: xorshift, so every run checks the same ones.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % bound
+        }
+
+        /// A CIDR inside `range`, a 256-address one, of any prefix length from `range`'s down.
+        fn inside(&mut self, range: IpNet) -> IpNet {
+            let spare = range.max_prefix_len() - range.prefix_len();
+            let len = range.prefix_len() + u8::try_from(self.below(u64::from(spare) + 1)).unwrap();
+            IpNet::new(nth(range, self.below(256)), len).unwrap().trunc()
+        }
+    }
+
+    /// The `n`th address of `range`.
+    fn nth(range: IpNet, n: u64) -> IpAddr {
+        match range.network() {
+            IpAddr::V4(v4) => std::net::Ipv4Addr::from_bits(v4.to_bits() + u32::try_from(n).unwrap()).into(),
+            IpAddr::V6(v6) => std::net::Ipv6Addr::from_bits(v6.to_bits() + u128::from(n)).into(),
+        }
+    }
+
+    #[test]
+    fn carving_covers_exactly_the_includes_minus_their_excludes() {
+        let mut numbers = Xorshift(0x9E37_79B9_7F4A_7C15);
+        for range in [net("10.99.7.0/24"), net("fd99::/120")] {
+            for _ in 0..400 {
+                let include = numbers.inside(range);
+                let excludes: Vec<IpNet> = (0..numbers.below(8)).map(|_| numbers.inside(range)).collect();
+                let names = |nets: &[IpNet]| nets.iter().map(ToString::to_string).collect::<Vec<_>>();
+                let routes = Targets::parse(&names(&[include]), &names(&excludes)).unwrap().routes();
+                let setup = format!("{include} minus {excludes:?}: {routes:?}");
+
+                // Every address once if the include has it and no exclude inside the include does,
+                // else never: the routes are disjoint and cover exactly that.
+                for n in 0..256 {
+                    let addr = nth(range, n);
+                    let kept = include.contains(&addr) && !excludes.iter().any(|exclude| include.contains(exclude) && exclude.contains(&addr));
+                    let covering = routes.iter().filter(|route| route.contains(&addr)).count();
+                    assert_eq!(covering, usize::from(kept), "{addr} in {setup}");
+                }
+                // And as few routes as that takes: no two are halves of one block.
+                for route in &routes {
+                    let sibling = route.supernet().and_then(|parent| parent.subnets(route.prefix_len()).ok()?.find(|half| half != route));
+                    assert!(sibling.is_none_or(|sibling| !routes.contains(&sibling)), "{route} and its sibling in {setup}");
+                }
+
+                // Several includes: each one's routes, each once.
+                let more: Vec<IpNet> = (0..numbers.below(3)).map(|_| numbers.inside(range)).chain([include]).collect();
+                let mut each: Vec<IpNet> = more.iter().flat_map(|one| Targets::parse(&names(&[*one]), &names(&excludes)).unwrap().routes()).collect();
+                each.sort_unstable();
+                each.dedup();
+                assert_eq!(Targets::parse(&names(&more), &names(&excludes)).unwrap().routes(), each, "{more:?} minus {excludes:?}");
+            }
+        }
     }
 
     #[test]
