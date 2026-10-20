@@ -24,7 +24,8 @@ why the version moved the way it did.
   them embedded, and compare throughput against `ssh -L`.
 - `cargo xtask bench --route`: `sshunnel route` against `sshunnel forward -L`, one stream each way,
   with the client side in network namespaces (a privileged Docker container where Ubuntu restricts
-  user namespaces), with the best and the median of its rounds, marking a best under 0.90.
+  user namespaces), over 15 interleaved rounds by default. It fails when either direction's median
+  is under 90% of forward mode's, and prints the best beside it.
 - `sshunnel route <destination> <target>...` (Linux): routes TCP to CIDRs and to names matching
   domain patterns (`*.corp.example`) through the relay, over a TUN device, `sshunnel0`. Names
   resolve on the remote and get stable fake addresses from `198.18.0.0/15`, and `-x` carves CIDRs

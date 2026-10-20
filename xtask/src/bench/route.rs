@@ -29,7 +29,8 @@ use sshunnel::tests::Namespaces;
 use super::{DESTINATION, Forwarder, Guard, MIB, Options, Sshd, download, local, serve, sink_conn, source_conn, started, upload};
 use crate::StatusOk as _;
 
-/// Route mode's bar: the share of forward mode's single-stream throughput it keeps, each way.
+/// Route mode's bar: the share of forward mode's single-stream throughput its median over the
+/// rounds keeps, each way.
 const BAR: f64 = 0.90;
 /// How long the route bench's client side may run in its container: a backstop, since a killed
 /// `docker run` leaves its container running.
@@ -59,7 +60,7 @@ pub fn run(client: &Path, dir: &Path, target: &Path, options: &Options) -> Resul
     program.extend(side.args());
     println!("route bench: the client side runs in {namespaces}");
     let status = namespaces.command(&program, &[target.to_owned()], CLIENT_LIMIT)?.status().context("running the client side")?;
-    ensure!(status.success(), "the route bench's client side failed ({status})");
+    ensure!(status.success(), "the route bench's client side failed ({status}); its error is above");
     Ok(())
 }
 
@@ -102,7 +103,8 @@ impl ClientSide {
     }
 
     /// Brings up `sshunnel route` to the host's address and `sshunnel forward -L` to the same sink
-    /// and source, then measures both, in rounds that alternate which goes first.
+    /// and source, then measures both, in rounds that alternate which goes first. Fails when either
+    /// direction misses the bar.
     fn measure(&self, state: &Path) -> Result<()> {
         let targets = self.ports.map(|port| SocketAddr::from((self.addr, port)));
         let routed = route_up(&self.client, &self.ssh_cmd, self.addr, state)?;
@@ -134,22 +136,22 @@ impl ClientSide {
         drop(forwarded);
         drop(routed);
 
-        let [route, forward] = rounds.each_ref().map(|mode| mode.each_ref().map(|rates| rates.iter().copied().fold(0.0, f64::max)));
-        let [route_median, forward_median] = rounds.each_ref().map(|mode| mode.each_ref().map(|rates| median(rates)));
-        println!("\n{} MiB per transfer, one stream, {} interleaved rounds; the bar is on the best:\n", self.mib, self.runs);
-        println!("{:<20} {:>15} {:>15} {:>15} {:>15}", "", "best up", "best down", "median up", "median down");
-        let row = |[best_up, best_down]: [f64; 2], [median_up, median_down]: [f64; 2]| format!("{best_up:>9.0} MiB/s {best_down:>9.0} MiB/s {median_up:>9.0} MiB/s {median_down:>9.0} MiB/s");
-        println!("{:<20} {}", "sshunnel forward -L", row(forward, forward_median));
-        println!("{:<20} {}", "sshunnel route", row(route, route_median));
+        let [route, forward] = rounds.each_ref().map(|mode| mode.each_ref().map(|rates| median(rates)));
+        let [route_best, forward_best] = rounds.each_ref().map(|mode| mode.each_ref().map(|rates| rates.iter().copied().fold(0.0, f64::max)));
+        println!("\n{} MiB per transfer, one stream, {} interleaved rounds; the bar is on the median:\n", self.mib, self.runs);
+        println!("{:<20} {:>15} {:>15} {:>15} {:>15}", "", "median up", "median down", "best up", "best down");
+        let row = |[median_up, median_down]: [f64; 2], [best_up, best_down]: [f64; 2]| format!("{median_up:>9.0} MiB/s {median_down:>9.0} MiB/s {best_up:>9.0} MiB/s {best_down:>9.0} MiB/s");
+        println!("{:<20} {}", "sshunnel forward -L", row(forward, forward_best));
+        println!("{:<20} {}", "sshunnel route", row(route, route_best));
         println!(
             "{:<20} {:>15} {:>15} {:>15.3} {:>15.3}",
             "route / forward",
             ratio(route[0], forward[0]),
             ratio(route[1], forward[1]),
-            route_median[0] / forward_median[0],
-            route_median[1] / forward_median[1]
+            route_best[0] / forward_best[0],
+            route_best[1] / forward_best[1]
         );
-        Ok(())
+        verdict(route, forward)
     }
 }
 
@@ -173,6 +175,20 @@ fn median(rates: &[f64]) -> f64 {
         len if len % 2 == 0 => f64::midpoint(sorted[mid - 1], sorted[mid]),
         _ => sorted[mid],
     }
+}
+
+/// The bench's verdict on route mode's medians (upload, download) against forward mode's: an error
+/// naming each direction under [`BAR`].
+fn verdict(route: [f64; 2], forward: [f64; 2]) -> Result<()> {
+    let missed: Vec<String> = ["upload", "download"]
+        .into_iter()
+        .zip(route.into_iter().zip(forward))
+        .map(|(direction, (route, forward))| (direction, route / forward))
+        .filter(|&(_, ratio)| ratio < BAR)
+        .map(|(direction, ratio)| format!("{direction} {ratio:.3}"))
+        .collect();
+    ensure!(missed.is_empty(), "route mode's median is under {BAR:.2} of forward mode's: {}", missed.join(", "));
+    Ok(())
 }
 
 /// `cargo xtask bench-client`: the route bench's client side, as root over its namespaces.
@@ -436,6 +452,20 @@ mod unit {
         assert_eq!(median(&[470.0, 354.0, 389.0]), 389.0, "odd: the middle one");
         assert_eq!(median(&[470.0, 354.0, 389.0, 428.0]), 408.5, "even: the mean of the middle two");
         assert_eq!(median(&[437.0]), 437.0);
+    }
+
+    #[test]
+    fn the_bar_is_on_each_directions_median() {
+        assert!(verdict([470.0, 450.0], [500.0, 500.0]).is_ok(), "0.94 and exactly 0.90");
+
+        let down = verdict([510.0, 430.0], [500.0, 500.0]).unwrap_err().to_string();
+        assert!(down.contains("download 0.860") && !down.contains("upload"), "{down}");
+
+        let up = verdict([440.0, 510.0], [500.0, 500.0]).unwrap_err().to_string();
+        assert!(up.contains("upload 0.880") && !up.contains("download"), "{up}");
+
+        let both = verdict([440.0, 430.0], [500.0, 500.0]).unwrap_err().to_string();
+        assert!(both.contains("upload 0.880") && both.contains("download 0.860"), "{both}");
     }
 
     #[test]

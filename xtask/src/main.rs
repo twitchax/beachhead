@@ -24,7 +24,8 @@ tasks:
                            a throwaway non-root sshd (default 512 MiB per transfer, best of 3);
                            --route compares `sshunnel route` with `sshunnel forward -L` instead,
                            one stream each way, from network namespaces (Linux only; needs Docker
-                           where user namespaces are restricted)";
+                           where user namespaces are restricted), over 15 rounds by default, and
+                           fails when either direction's median is under 90% of forward mode's";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -153,23 +154,29 @@ fn arches(args: &[String]) -> Result<Vec<Arch>> {
     Ok(if arches.is_empty() { Arch::ALL.to_vec() } else { arches })
 }
 
+/// The plain bench's rounds when `--runs` doesn't say: it reports the best of a few.
+const RUNS: usize = 3;
+/// The route bench's rounds when `--runs` doesn't say: its bar is on the median, which wants more.
+const ROUTE_RUNS: usize = 15;
+
 fn bench_options(args: &[String]) -> Result<bench::Options> {
-    let mut options = bench::Options { mib: 512, runs: 3, route: false };
+    let (mut mib, mut runs, mut route) = (512, None, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let mut value = || -> Result<usize> { args.next().with_context(|| format!("{arg} needs a value"))?.parse().with_context(|| format!("{arg} needs a number")) };
         match arg.as_str() {
-            "--mib" => options.mib = value()?.max(8),
-            "--runs" => options.runs = value()?.max(1),
+            "--mib" => mib = value()?.max(8),
+            "--runs" => runs = Some(value()?.max(1)),
             "--route" => {
                 // Checked before the relay and client builds, which take a while.
                 ensure!(cfg!(target_os = "linux"), "--route is Linux only: `sshunnel route` needs a TUN device and network namespaces");
-                options.route = true;
+                route = true;
             }
             other => bail!("unexpected argument `{other}`\n\n{USAGE}"),
         }
     }
-    Ok(options)
+    let runs = runs.unwrap_or(if route { ROUTE_RUNS } else { RUNS });
+    Ok(bench::Options { mib, runs, route })
 }
 
 fn target(args: &[String]) -> Result<Option<&str>> {
@@ -255,11 +262,24 @@ mod unit {
         let route = bench_options(&["--route".into(), "--mib".into(), "64".into()]);
         if cfg!(target_os = "linux") {
             let route = route.unwrap();
-            assert_eq!((route.mib, route.runs, route.route), (64, 3, true));
+            assert_eq!((route.mib, route.runs, route.route), (64, 15, true));
         } else {
             assert!(route.is_err_and(|e| e.to_string().contains("Linux only")));
         }
         assert!(bench_options(&["--routes".into()]).is_err());
+    }
+
+    #[test]
+    fn the_route_bench_defaults_to_15_rounds() {
+        let runs = |args: &[&str]| bench_options(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()).unwrap().runs;
+
+        assert_eq!(runs(&[]), 3, "the plain bench keeps its best of 3");
+        assert_eq!(runs(&["--runs", "5"]), 5);
+        if cfg!(target_os = "linux") {
+            assert_eq!(runs(&["--route"]), 15);
+            assert_eq!(runs(&["--route", "--runs", "5"]), 5);
+            assert_eq!(runs(&["--runs", "5", "--route"]), 5, "in either order");
+        }
     }
 
     #[test]

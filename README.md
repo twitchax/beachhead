@@ -187,17 +187,19 @@ window held one stream to roughly half of `ssh -L`, which is why the default is 
 in the [bench log](.prds/PRD-0002.log.md)).
 
 `cargo xtask bench --route` puts `route` against `forward -L`, one stream each way, both from a
-network namespace of their own and through the same sshd, to this host's own address. Three runs
-(512 MiB per transfer, best of three interleaved rounds each) on a 64-core x86_64 Linux machine:
+network namespace of their own and through the same sshd, to this host's own address. It runs 15
+interleaved rounds and fails when either direction's median is under 90% of forward mode's. The
+medians of two runs (512 MiB per transfer) on a 64-core x86_64 Linux machine:
 
 | | upload | download |
 |---|---|---|
-| `sshunnel forward -L` | 456 to 492 MiB/s | 433 to 456 MiB/s |
-| `sshunnel route` | 485 to 511 MiB/s | 374 to 428 MiB/s |
-| route / forward | 1.01 to 1.07 | 0.82 to 0.98 |
+| `sshunnel forward -L` | 485 and 457 MiB/s | 435 and 412 MiB/s |
+| `sshunnel route` | 486 and 482 MiB/s | 429 and 377 MiB/s |
+| route / forward | 1.00 and 1.06 | 0.99 and 0.91 |
 
-Upload keeps pace. Download averages about 86% of forward mode's across every round, under the
-milestone's 90% bar; the profile and the options are in the [PRD log](.prds/PRD-0004.log.md).
+Upload keeps pace. Download is about 93% of forward mode's across all 30 rounds, and its rounds
+vary more than forward mode's. The runs, the profile and how the bar came to be on the median are
+in the [PRD log](.prds/PRD-0004.log.md).
 
 ## Caveats
 
