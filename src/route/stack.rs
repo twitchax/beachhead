@@ -366,8 +366,8 @@ pub(crate) struct Ip {
 }
 
 impl Ip {
-    /// Parses a whole IPv4 or IPv6 packet. A fragment doesn't parse: the stack doesn't reassemble,
-    /// and with the device's MTU the kernel has no reason to fragment toward it.
+    /// Parses a whole IPv4 or IPv6 packet. A v4 fragment doesn't parse: the stack doesn't
+    /// reassemble, and with the device's MTU the kernel has no reason to fragment toward it.
     pub(crate) fn parse(packet: &[u8]) -> Option<Self> {
         match packet.first()? >> 4 {
             4 => {
