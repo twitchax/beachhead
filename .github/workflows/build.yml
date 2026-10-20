@@ -62,15 +62,17 @@ jobs:
         run: SSHUNNEL_NETNS=docker cargo nextest run --workspace --test route
       # systemd-resolved serves only the host's namespace, so the name tests run as root on the host.
       # No retries here or below: a flake in a step that runs nowhere else must fail, not pass as
-      # FLAKY.
+      # FLAKY. No fail-fast either, and the sudo step runs even when this one fails: these run only
+      # here, so one push should show every failure.
       - name: Root tests through systemd-resolved
         id: route-root
-        run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo nextest run --workspace --run-ignored only -E 'test(/^e2e_route_name|^e2e_resolved/)' --retries 0
+        run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo nextest run --workspace --run-ignored only -E 'test(/^e2e_route_name|^e2e_resolved/)' --retries 0 --no-fail-fast
       # The path every user takes: route as the runner's own user, through the real sudo (the runner
       # has it passwordless), on a pseudo-terminal, ended by a Ctrl-C typed there.
       - name: Route through sudo on a terminal
         id: route-sudo
-        run: cargo nextest run --workspace --test route_sudo --run-ignored only --retries 0
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --workspace --test route_sudo --run-ignored only --retries 0 --no-fail-fast
 
   codecov:
     name: Code coverage

@@ -16,7 +16,7 @@ use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, geteuid, kill_process};
 use sshunnel::{
     route::FAKE_RANGE,
-    tests::{FakeRemote, Watched, echo_server, pattern, relay_dir, round_trip, route_command},
+    tests::{FakeRemote, Watched, echo_server, pattern, relay_dir, resolved_leftovers, round_trip, route_command},
 };
 use tempfile::TempDir;
 
@@ -119,6 +119,5 @@ async fn e2e_resolved_routes_only_the_patterns() {
     stop(route).await;
 
     // The link's resolver config went with the device.
-    let link = StdCommand::new("resolvectl").args(["status", "sshunnel0"]).output().unwrap();
-    assert!(!link.status.success(), "{}", String::from_utf8_lossy(&link.stdout));
+    assert_eq!(resolved_leftovers().unwrap(), Vec::<String>::new());
 }

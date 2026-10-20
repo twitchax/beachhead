@@ -444,6 +444,28 @@ pub fn leftovers() -> Res<Vec<String>> {
     Ok(device.chain(routes).collect())
 }
 
+/// What systemd-resolved still has for `sshunnel route`'s device: its link's line in `resolvectl
+/// domain`. Empty once a run is over, since a link's resolver config goes with its device. (Asking
+/// `resolvectl status sshunnel0` can't tell: since systemd 259 it ignores a missing link and
+/// succeeds.)
+///
+/// # Errors
+///
+/// Fails when `resolvectl` does.
+#[cfg(target_os = "linux")]
+pub fn resolved_leftovers() -> Res<Vec<String>> {
+    let out = std::process::Command::new("resolvectl").arg("domain").output().context("running resolvectl")?;
+    ensure!(out.status.success(), "resolvectl domain: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(device_links(&String::from_utf8(out.stdout).context("resolvectl printed something other than UTF-8")?))
+}
+
+/// The lines of a `resolvectl` listing that name [`DEVICE`]'s link.
+#[cfg(target_os = "linux")]
+fn device_links(listing: &str) -> Vec<String> {
+    let link = format!("({DEVICE})");
+    listing.lines().filter(|line| line.contains(&link)).map(|line| line.trim().to_owned()).collect()
+}
+
 /// Every route in every table, v4 then v6, one line of `ip` each.
 ///
 /// # Errors
@@ -565,4 +587,19 @@ fn write_executable(path: &Path, contents: &str) -> Res<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).with_context(|| format!("marking {} executable", path.display()))
+}
+
+// `unit`, not `tests`: this module is already `tests`.
+#[cfg(all(test, target_os = "linux"))]
+mod unit {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn resolved_leftovers_are_the_devices_link() {
+        let listing = "Global:\nLink 2 (eth0): ~.\nLink 15 (sshunnel0): ~corp.example\nLink 16 (sshunnel0x):\n";
+        assert_eq!(device_links(listing), ["Link 15 (sshunnel0): ~corp.example"]);
+        assert_eq!(device_links("Global:\nLink 2 (eth0): ~.\n"), Vec::<String>::new());
+    }
 }

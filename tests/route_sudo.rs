@@ -23,7 +23,7 @@ use rustix::{
     pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt},
     termios::{LocalModes, tcgetattr},
 };
-use sshunnel::tests::{FakeRemote, leftovers, relay_dir, route_command};
+use sshunnel::tests::{FakeRemote, leftovers, relay_dir, resolved_leftovers, route_command};
 use tempfile::TempDir;
 use tokio::{
     process::{Child, Command},
@@ -179,6 +179,5 @@ async fn e2e_sudo_ctrl_c_at_the_terminal_ends_the_run_cleanly() {
     assert!(status.success(), "{status}; the terminal showed:\n{shown}");
     assert_eq!(leftovers().unwrap(), Vec::<String>::new(), "the terminal showed:\n{shown}");
     // The link's resolver config went with the device.
-    let link = StdCommand::new("resolvectl").args(["status", "sshunnel0"]).output().unwrap();
-    assert!(!link.status.success(), "{}", String::from_utf8_lossy(&link.stdout));
+    assert_eq!(resolved_leftovers().unwrap(), Vec::<String>::new());
 }
