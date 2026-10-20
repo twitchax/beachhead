@@ -33,10 +33,10 @@ channels bounded by credit, so the ssh pipe always drains. `route::stack` (the T
 the same shape: **its packet loop never waits on one connection**. Each smoltcp socket bridges to
 its relay stream through a bounded pipe, so a slow stream closes only that socket's window. The
 packet loop, its connections' tasks, the device's reader and writer and the DNS server share one
-current-thread runtime on a thread of their own (`route::thread`, named `sshunnel-stack`), so a
-segment's round trip stays on one core; the mux and everything else stay on the main runtime, and
-tokio's channels cross between them. **Nothing on that thread may block**: a blocking call there
-stalls every connection.
+current-thread runtime on a thread of their own (`route::thread`, named `sshunnel-stack`), so the
+netstack's own hops stay on one thread. The mux and everything else stay on the main runtime, and
+each segment still crosses to the mux there and back, through tokio's channels. **Nothing on that
+thread may block**: a blocking call there stalls every connection.
 
 `route::helper` is the privilege boundary, not the client. `sshunnel route` starts it through sudo,
 and with a `NOPASSWD` sudoers line anything running as the user can too, so it trusts nothing the

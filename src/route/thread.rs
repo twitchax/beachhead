@@ -1,11 +1,12 @@
 //! The netstack on a thread of its own: the device's reader and writer, the packet loop with its
-//! connections, and the DNS server, all on one current-thread runtime. Each segment's round trip
-//! (a device read or write, a smoltcp pass, a connection's pipe) then stays on one core instead of
-//! waking a different worker of the main runtime at every step, which is what held route's
-//! download under forward mode's. The mux, the session, the helper and the signals stay on the
-//! main runtime; tokio's channels and the mux's streams work across the two.
+//! connections, and the DNS server, all on one current-thread runtime. The netstack's own hops (a
+//! device read or write, a smoltcp pass, a connection's pipe) then stay on one thread instead of
+//! waking a different worker of the main runtime at each step. Each segment's bytes still cross to
+//! the mux's tasks on the main runtime and back: the mux, the session, the helper and the signals
+//! stay there, and tokio's channels and the mux's streams work across the two.
 
 use std::{
+    any::Any,
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     os::fd::OwnedFd,
@@ -87,8 +88,11 @@ impl Netstack {
             finished,
             thread,
         };
-        started.await.unwrap_or_else(|_| Err(panicked()))?;
-        Ok(netstack)
+        match started.await {
+            Ok(started) => started.map(|()| netstack),
+            // The thread panicked starting; joining it, as it unwinds, recovers the panic's message.
+            Err(_) => Err(netstack.stop_within(STOP_LIMIT).err().unwrap_or_else(|| panicked(None))),
+        }
     }
 
     /// Resolves when the netstack ends by itself: the first of its tasks to end, with that task's
@@ -98,7 +102,7 @@ impl Netstack {
         let Some(ended) = self.ended.as_mut() else {
             return std::future::pending().await;
         };
-        let ended = ended.await.unwrap_or_else(|_| Err(panicked()));
+        let ended = ended.await.unwrap_or_else(|_| Err(panicked(None)));
         self.ended = None;
         ended
     }
@@ -121,7 +125,7 @@ impl Netstack {
         match finished.recv_timeout(limit) {
             Ok(never) => match never {},
             Err(RecvTimeoutError::Timeout) => bail!("the netstack's thread didn't stop within {limit:?}; leaving it behind"),
-            Err(RecvTimeoutError::Disconnected) => thread.join().map_err(|_| panicked()),
+            Err(RecvTimeoutError::Disconnected) => thread.join().map_err(|payload| panicked(Some(payload.as_ref()))),
         }
     }
 }
@@ -133,6 +137,8 @@ fn run(start: impl FnOnce(&mut JoinSet<Void>) -> Void, started: oneshot::Sender<
     let runtime = match Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(e) => {
+            // As below: the device's fd, which `start` holds, is closed by the time the caller hears.
+            drop(start);
             let _ = started.send(Err(e).context("starting the netstack's runtime"));
             return;
         }
@@ -167,19 +173,34 @@ fn run(start: impl FnOnce(&mut JoinSet<Void>) -> Void, started: oneshot::Sender<
     }
 }
 
-fn panicked() -> Err {
-    anyhow!("the netstack's thread panicked")
+/// A panic on the netstack's thread as an error, with the panic's message when `payload` has one.
+fn panicked(payload: Option<&(dyn Any + Send)>) -> Err {
+    let message = payload.and_then(|payload| payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str)));
+    match message {
+        Some(message) => anyhow!("the netstack's thread panicked: {message}"),
+        None => anyhow!("the netstack's thread panicked"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::{sync::mpsc as std_mpsc, time::Instant};
+    use std::{
+        os::fd::AsFd as _,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc as std_mpsc,
+        },
+        time::Instant,
+    };
 
     use bytes::Bytes;
     use pretty_assertions::assert_eq;
-    use rustix::thread::gettid;
+    use rustix::{
+        net::{RecvFlags, recv},
+        thread::gettid,
+    };
     use sshunnel_mux::{
         OpenError, ResolveError,
         frame::{OpenErrKind, ResolveErrKind},
@@ -230,6 +251,8 @@ mod tests {
         dials: mpsc::UnboundedReceiver<i32>,
         /// Carries packets between the app and the device; ends once the device's fd closes.
         wire: JoinHandle<()>,
+        /// The device's far end again, to look at without the carrier.
+        far: OwnedFd,
         _state: TempDir,
     }
 
@@ -241,12 +264,14 @@ mod tests {
         let (tun, kernel) = device_pair().unwrap();
         let netstack = Netstack::start(tun, Recorder(dialed), router, &[]).await.unwrap();
         let (app, packets) = AppStack::new().unwrap();
+        let far = kernel.as_fd().try_clone_to_owned().unwrap();
         let wire = tokio::spawn(carry(kernel, packets));
         Rig {
             netstack,
             app,
             dials,
             wire,
+            far,
             _state: state,
         }
     }
@@ -268,6 +293,20 @@ mod tests {
                     }
                     _ => return,
                 },
+            }
+        }
+    }
+
+    /// Whether the device's fd has closed, read from its far end without waiting: whatever the
+    /// device wrote last, then the end.
+    fn device_closed(far: &OwnedFd) -> bool {
+        let mut buf = vec![0; usize::from(MTU)];
+        loop {
+            match recv(far, &mut buf[..], RecvFlags::DONTWAIT) {
+                Ok((0, _)) => return true,
+                Ok(_) => {}
+                // Nothing yet: the device is still open.
+                Err(_) => return false,
             }
         }
     }
@@ -295,6 +334,17 @@ mod tests {
         panic!("the stack fell over")
     }
 
+    /// Lets go slowly as it drops, then raises its flag: a task slow to release what it holds.
+    struct SlowDrop(Arc<AtomicBool>);
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            // Not covering a race: it makes "returned before the drop" observable.
+            std::thread::sleep(Duration::from_millis(100));
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
     async fn the_netstack_runs_on_a_thread_of_its_own() {
         let mut rig = rig().await;
@@ -314,22 +364,42 @@ mod tests {
 
         rig.netstack.stop().unwrap();
 
+        // At once, with nothing awaited: the fd closed before `stop` returned.
+        assert!(device_closed(&rig.far), "the device's fd outlived the stop");
         // The kernel reaps a thread a moment after the join that waited on it returns.
         let deadline = Instant::now() + Duration::from_secs(1);
         while comm(dialed_on).is_some() && Instant::now() < deadline {
             std::thread::yield_now();
         }
         assert_eq!(comm(dialed_on), None, "the netstack's thread outlived its stop");
-        // The far end reads the device's end only once its fd has closed.
-        timeout(Duration::from_secs(5), rig.wire).await.expect("the device's fd outlived the stop").unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_returns_once_the_netstacks_tasks_are_gone() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let holder = SlowDrop(Arc::clone(&dropped));
+        let netstack = Netstack::spawn(move |tasks| {
+            tasks.spawn(async move {
+                let _holder = holder;
+                std::future::pending().await
+            });
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        netstack.stop().unwrap();
+
+        assert!(dropped.load(Ordering::SeqCst), "stop returned before the netstack's tasks were dropped");
     }
 
     #[tokio::test]
     async fn a_netstack_error_ends_closed() {
         let mut rig = rig().await;
 
-        // Takes the device's far end with it: the device's reader fails.
+        // The far end goes with the carrier and the second fd on it: the device's reader fails.
         rig.wire.abort();
+        drop(rig.far);
 
         let ended = timeout(Duration::from_secs(5), rig.netstack.closed()).await.expect("the netstack's end went unreported");
         let error = format!("{:#}", ended.unwrap_err());
@@ -350,6 +420,14 @@ mod tests {
         let error = format!("{:#}", ended.unwrap_err());
         assert!(error.contains("netstack") && error.contains("the stack fell over"), "{error}");
         netstack.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_panic_starting_the_netstack_is_an_error() {
+        let started = Netstack::spawn(|_| panic!("the device wouldn't open")).await;
+
+        let error = format!("{:#}", started.err().expect("a panicking start succeeded"));
+        assert!(error.contains("netstack") && error.contains("the device wouldn't open"), "{error}");
     }
 
     #[tokio::test]
