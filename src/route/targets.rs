@@ -21,6 +21,10 @@ use crate::{
 /// How specific a name rule is: more labels first, then exact beats wildcard.
 type Rank = (usize, bool);
 
+/// The most routes one setup may add. Each is an `ip` run as root, and excludes inside a wide v6
+/// target can carve one into a hundred thousand.
+pub const MAX_ROUTES: usize = 4096;
+
 /// A domain pattern: an exact name, or `*.` followed by a domain (the domain and everything under it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
@@ -173,8 +177,9 @@ pub struct Targets {
 
 impl Targets {
     /// Parses the targets and applies the refusals that don't depend on the machine: `/0`s, a
-    /// bare `*`, and anything equal to or inside the fake range. A target that merely contains
-    /// the fake range is allowed; [`Self::check`] warns and the range is carved out of the routes.
+    /// bare `*`, anything equal to or inside the fake range, and more than [`MAX_ROUTES`] routes.
+    /// A target that merely contains the fake range is allowed; [`Self::check`] warns and the range
+    /// is carved out of the routes.
     ///
     /// # Errors
     ///
@@ -199,12 +204,17 @@ impl Targets {
 
         let include = parse_all(include, true);
         let exclude = parse_all(exclude, false);
+        let targets = Self { include, exclude };
 
+        let routes = targets.routes().len();
+        if routes > MAX_ROUTES {
+            problems.push(format!("the targets come to {routes} routes, more than the {MAX_ROUTES} sshunnel adds"));
+        }
         if !problems.is_empty() {
             bail!("invalid targets:\n  {}", problems.join("\n  "));
         }
 
-        Ok(Self { include, exclude })
+        Ok(targets)
     }
 
     /// The CIDR includes minus the CIDR excludes inside them and minus the fake range, sorted, each
@@ -217,12 +227,9 @@ impl Targets {
         let mut routed = Vec::new();
 
         for include in nets(&self.include) {
-            let mut pieces = vec![include];
             // Only excludes inside the include carve it; one enclosing it loses to it (more specific).
-            for exclude in excludes.iter().filter(|e| include.contains(*e)) {
-                pieces = pieces.into_iter().flat_map(|p| subtract(p, *exclude)).collect();
-            }
-            routed.extend(pieces);
+            let holes: Vec<IpNet> = excludes.iter().filter(|e| include.contains(*e)).copied().collect();
+            carve(include, &holes, &mut routed);
         }
 
         routed.sort_unstable();
@@ -370,26 +377,24 @@ fn refusal_for(target: &Target) -> Option<String> {
     IpNet::V4(FAKE_RANGE).contains(net).then(|| format!("is the fake range {FAKE_RANGE} or inside it"))
 }
 
-/// `net` minus `hole`: halves `net` until each half is disjoint from or inside the hole.
-fn subtract(net: IpNet, hole: IpNet) -> Vec<IpNet> {
-    let mut kept = Vec::new();
-    let mut pending = vec![net];
-
-    while let Some(piece) = pending.pop() {
-        if hole.contains(&piece) {
-            continue;
-        }
-        if !piece.contains(&hole) {
-            kept.push(piece);
-            continue;
-        }
-        // `piece` strictly contains `hole`, so it is not a host route and can split.
-        if let Ok(halves) = piece.subnets(piece.prefix_len() + 1) {
-            pending.extend(halves);
-        }
+/// Adds `net` minus `holes`, each inside `net`, to `kept`: halves `net` until each half is inside a
+/// hole or holds none. A hole goes down one half at each split, so the work grows with the holes
+/// times the depth plus the pieces kept, where carving one hole at a time out of every piece grew
+/// with the holes times the pieces: seconds of root's CPU for the largest setup the helper reads.
+fn carve(net: IpNet, holes: &[IpNet], kept: &mut Vec<IpNet>) {
+    if holes.is_empty() {
+        kept.push(net);
+        return;
     }
-
-    kept
+    if holes.iter().any(|hole| hole.contains(&net)) {
+        return;
+    }
+    // A hole is strictly inside `net`, so `net` is not a host route and can split.
+    let Ok(halves) = net.subnets(net.prefix_len() + 1) else { return };
+    for half in halves {
+        let inside: Vec<IpNet> = holes.iter().filter(|hole| half.contains(*hole)).copied().collect();
+        carve(half, &inside, kept);
+    }
 }
 
 #[cfg(test)]
@@ -676,6 +681,38 @@ mod tests {
         let error = targets(&["192.168.1.0/25"], &[]).check(&connected).unwrap_err().to_string();
 
         assert!(error.contains("'192.168.1.0/25'") && error.contains("198.18.0.0/16"), "{error}");
+    }
+
+    /// `/128` excludes at `count` points spread evenly over `fd99::/64`, each in a subtree of its
+    /// own, so each carves some 50 routes out of it.
+    fn spread_excludes(count: u64) -> Vec<String> {
+        let base = "fd99::".parse::<std::net::Ipv6Addr>().unwrap().to_bits();
+        let step = u64::MAX / count;
+        (0..count).map(|i| std::net::Ipv6Addr::from_bits(base | u128::from(i * step + 1)).to_string()).collect()
+    }
+
+    #[test]
+    fn refuses_more_routes_than_the_cap() {
+        // 128 excludes, one at the start of each /72 in the lower /65: the upper /65 stays whole, and
+        // each of the 128 /72s splits into 56 pieces around its hole.
+        let excludes: Vec<String> = (0..128_u16).map(|i| format!("fd99::{i:x}00:0:0:0")).collect();
+        let error = Targets::parse(&strings(&["fd99::/64"]), &excludes).unwrap_err().to_string();
+        assert!(error.contains("7169 routes") && error.contains("4096"), "{error}");
+
+        // The cap itself is allowed: a host target each.
+        let hosts = |count: u16| (0..count).map(|i| format!("fd99::{i:x}")).collect::<Vec<_>>();
+        assert_eq!(Targets::parse(&hosts(4096), &[]).unwrap().routes().len(), 4096);
+        let error = Targets::parse(&hosts(4097), &[]).unwrap_err().to_string();
+        assert!(error.contains("4097 routes") && error.contains("4096"), "{error}");
+    }
+
+    #[test]
+    fn the_cap_counts_the_largest_setup_without_quadratic_work() {
+        // About as many excludes as the helper's 64 KiB setup holds, spread to carve the most
+        // routes: some 120,000. Carving them one exclude at a time over every piece took seconds
+        // of root's CPU (minutes unoptimized) before any refusal.
+        let error = Targets::parse(&strings(&["fd99::/64"]), &spread_excludes(2300)).unwrap_err().to_string();
+        assert!(error.contains("4096"), "{error}");
     }
 
     #[test]
