@@ -41,11 +41,12 @@ why the version moved the way it did.
   setting the device's persist flag could keep open past the helper.
 - Protocol v3: `Resolve` / `Resolved` / `ResolveErr` frames, so the relay can resolve a name with
   its own resolver (`getaddrinfo`), and a kind on `OpenErr` (refused, unreachable, timed out,
-  other), so a failed dial says why. A cached v2 relay is simply replaced, since the cache is keyed
-  by hash.
+  other), so a failed dial says why. The cache is keyed by hash, so the new relay is pushed beside a
+  cached v2 one under its own hash, and the v2 one is cleared out by the first install in its
+  directory once it is over 30 days old.
+- Initial scaffold.
 - `route`'s e2e tests run as root over throwaway network namespaces: through `unshare`, or where
   Ubuntu restricts user namespaces, in a privileged Docker container built on first use
   (`sshunnel-netns:*`). `SSHUNNEL_NETNS=docker` forces the container. In CI, `tests/route_sudo.rs`
   also runs `route` as a user does, through the real sudo on a pseudo-terminal, and ends it with a
   Ctrl-C typed there.
-- Initial scaffold.
