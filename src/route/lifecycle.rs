@@ -1,11 +1,12 @@
 //! `sshunnel route` from start to exit, in the spec's lifecycle order: check everything that can
 //! refuse the run before ssh starts; start the session; find what the machine depends on; start the
-//! root helper; run the netstack and the DNS server on its device; then wait for a signal, the
-//! session ending, the helper dying or the netstack failing, and tear down. The helper is stopped
-//! on every path once it has started, so its pinned routes are gone when [`run`] returns.
+//! root helper; run the netstack and the DNS server on its device, on a thread of their own; then
+//! wait for a signal, the session ending, the helper dying or the netstack failing, and tear down.
+//! The netstack's thread is joined and then the helper stopped, on every path once each has
+//! started, so its pinned routes are gone when [`run`] returns.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr},
     sync::Arc,
     time::Duration,
 };
@@ -13,21 +14,21 @@ use std::{
 use anyhow::{Context as _, bail};
 use ipnet::IpNet;
 use sshunnel_mux::Mux;
-use tokio::{task::JoinSet, time::timeout};
+use tokio::time::timeout;
 use tracing::warn;
 
 use crate::{
     base::{Res, Void},
     relays::Relays,
     route::{
-        DEVICE, FAKE_RANGE, device, dns,
+        DEVICE, FAKE_RANGE,
         helper::{Helper, Setup, Signals},
         names::{FakeMap, state_path, today},
         peers,
         router::Router,
-        stack::{self, DNS_PORT},
         system::{self, Via},
         targets::{Snapshot, Targets},
+        thread::Netstack,
     },
     session::{Session, SshCommand},
 };
@@ -80,22 +81,23 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
     warned.warn(helper.warnings());
 
     let router = Arc::new(Router::new(targets, names));
-    let mut tasks = JoinSet::new();
-    let ended = match start(&mut tasks, &mut helper, session.mux(), &router, &upstreams) {
-        Ok(()) => {
+    let mut netstack = None;
+    let ended = match start(&mut helper, session.mux(), &router, &upstreams).await {
+        Ok(started) => {
             warned.warn(&check_routes(probes).await);
             eprintln!("{status}");
-            wait(&mut signals, session, &mut helper, &mut tasks).await
+            wait(&mut signals, session, &mut helper, netstack.insert(started)).await
         }
         Err(e) => Err(e),
     };
 
-    // The client's fd on the device closes with its tasks; the helper's goes as it stops, and the
-    // device vanishes with the last one, taking its addresses, routes and resolver config along.
-    tasks.shutdown().await;
+    // The client's fd on the device closes as the netstack's thread ends; the helper's goes as it
+    // stops, and the device vanishes with the last one, taking its addresses, routes and resolver
+    // config along.
+    let halted = netstack.map_or(Ok(()), Netstack::stop);
     let saved = router.names().save().context("saving the fake-address map");
     let stopped = helper.stop().await;
-    first_failure([ended, saved, stopped])
+    first_failure([ended, halted, saved, stopped])
 }
 
 /// Everything that can refuse the run without privileges or ssh: the targets themselves, the
@@ -137,18 +139,14 @@ async fn connect(ssh: &SshCommand, destination: &str, relays: &Relays, upstreams
     Ok((session, Pins { addrs, warnings }))
 }
 
-/// Puts the device's packets through the netstack, with the DNS server on it, all in `tasks`.
-fn start(tasks: &mut JoinSet<Void>, helper: &mut Helper, mux: &Mux, router: &Arc<Router>, upstreams: &[IpAddr]) -> Void {
-    let packets = device::spawn(helper.take_tun()?, tasks)?;
-    let upstreams = upstreams.iter().map(|&addr| SocketAddr::new(addr, DNS_PORT)).collect();
-    let dns = Arc::new(dns::Server::new(mux.clone(), Arc::clone(router), upstreams));
-    tasks.spawn(stack::run(packets, mux.clone(), Arc::clone(router), dns));
-    Ok(())
+/// Puts the device's packets through the netstack, with the DNS server on it, on its own thread.
+async fn start(helper: &mut Helper, mux: &Mux, router: &Arc<Router>, upstreams: &[IpAddr]) -> Res<Netstack> {
+    Netstack::start(helper.take_tun()?, mux.clone(), Arc::clone(router), upstreams).await
 }
 
-/// Runs until a signal (a clean exit), or the session, the helper or a netstack task ends (an
-/// error, unless a signal follows at once: see [`SIGNAL_GRACE`]).
-async fn wait(signals: &mut Signals, session: Session, helper: &mut Helper, tasks: &mut JoinSet<Void>) -> Void {
+/// Runs until a signal (a clean exit), or the session, the helper or the netstack ends (an error,
+/// unless a signal follows at once: see [`SIGNAL_GRACE`]).
+async fn wait(signals: &mut Signals, session: Session, helper: &mut Helper, netstack: &mut Netstack) -> Void {
     let ended = async {
         tokio::select! {
             // A Ctrl-C reaches the helper too, which then exits: the signal is the reason.
@@ -159,8 +157,8 @@ async fn wait(signals: &mut Signals, session: Session, helper: &mut Helper, task
                 bail!("the ssh session ended")
             }
             () = helper.closed() => bail!("the root helper exited"),
-            Some(done) = tasks.join_next() => {
-                done.context("a netstack task panicked")??;
+            closed = netstack.closed() => {
+                closed?;
                 bail!("the netstack stopped")
             }
         }

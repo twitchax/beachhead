@@ -112,7 +112,8 @@ impl ClientSide {
         let bytes = self.mib * MIB;
 
         println!();
-        let mut best = [[0f64; 2]; 2];
+        // Each mode's rates by direction, one per round.
+        let mut rounds: [[Vec<f64>; 2]; 2] = Default::default();
         for round in 0..self.runs {
             let mut rates = [[0f64; 2]; 2];
             // Swapping the order each round keeps drift over the run from favoring either mode.
@@ -126,19 +127,28 @@ impl ClientSide {
                 "round {}: route {route_up:.0} up, {route_down:.0} down; forward -L {forward_up:.0} up, {forward_down:.0} down (MiB/s)",
                 round + 1
             );
-            for (best, rate) in best.iter_mut().flatten().zip(rates.iter().flatten()) {
-                *best = best.max(*rate);
+            for (series, &rate) in rounds.iter_mut().flatten().zip(rates.iter().flatten()) {
+                series.push(rate);
             }
         }
         drop(forwarded);
         drop(routed);
 
-        let [route, forward] = best;
-        println!("\n{} MiB per transfer, one stream, best of {} interleaved rounds:\n", self.mib, self.runs);
-        println!("{:<20} {:>14} {:>14}", "", "upload", "download");
-        println!("{:<20} {:>9.0} MiB/s {:>9.0} MiB/s", "sshunnel forward -L", forward[0], forward[1]);
-        println!("{:<20} {:>9.0} MiB/s {:>9.0} MiB/s", "sshunnel route", route[0], route[1]);
-        println!("{:<20} {:>14} {:>14}", "route / forward", ratio(route[0], forward[0]), ratio(route[1], forward[1]));
+        let [route, forward] = rounds.each_ref().map(|mode| mode.each_ref().map(|rates| rates.iter().copied().fold(0.0, f64::max)));
+        let [route_median, forward_median] = rounds.each_ref().map(|mode| mode.each_ref().map(|rates| median(rates)));
+        println!("\n{} MiB per transfer, one stream, {} interleaved rounds; the bar is on the best:\n", self.mib, self.runs);
+        println!("{:<20} {:>15} {:>15} {:>15} {:>15}", "", "best up", "best down", "median up", "median down");
+        let row = |[best_up, best_down]: [f64; 2], [median_up, median_down]: [f64; 2]| format!("{best_up:>9.0} MiB/s {best_down:>9.0} MiB/s {median_up:>9.0} MiB/s {median_down:>9.0} MiB/s");
+        println!("{:<20} {}", "sshunnel forward -L", row(forward, forward_median));
+        println!("{:<20} {}", "sshunnel route", row(route, route_median));
+        println!(
+            "{:<20} {:>15} {:>15} {:>15.3} {:>15.3}",
+            "route / forward",
+            ratio(route[0], forward[0]),
+            ratio(route[1], forward[1]),
+            route_median[0] / forward_median[0],
+            route_median[1] / forward_median[1]
+        );
         Ok(())
     }
 }
@@ -151,6 +161,18 @@ fn number<T: std::str::FromStr>(arg: &str) -> Result<T> {
 fn ratio(route: f64, forward: f64) -> String {
     let ratio = route / forward;
     if ratio < BAR { format!("{ratio:.3} < {BAR:.2}") } else { format!("{ratio:.3}") }
+}
+
+/// The middle of `rates`, or the mean of the middle two when there are an even number.
+fn median(rates: &[f64]) -> f64 {
+    let mut sorted = rates.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    match sorted.len() {
+        0 => f64::NAN,
+        len if len % 2 == 0 => f64::midpoint(sorted[mid - 1], sorted[mid]),
+        _ => sorted[mid],
+    }
 }
 
 /// `cargo xtask bench-client`: the route bench's client side, as root over its namespaces.
@@ -407,6 +429,13 @@ mod unit {
         let mut bad = args.clone();
         bad[2] = "192.0.2.300".to_owned();
         assert!(ClientSide::parse(&bad).is_err(), "not an address");
+    }
+
+    #[test]
+    fn median_of_rounds() {
+        assert_eq!(median(&[470.0, 354.0, 389.0]), 389.0, "odd: the middle one");
+        assert_eq!(median(&[470.0, 354.0, 389.0, 428.0]), 408.5, "even: the mean of the middle two");
+        assert_eq!(median(&[437.0]), 437.0);
     }
 
     #[test]

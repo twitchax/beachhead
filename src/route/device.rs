@@ -1,6 +1,6 @@
-//! The TUN device's fd as the netstack's [`Packets`]. The fd goes non-blocking under tokio's
-//! reactor; one task reads it and one writes it, and each read or write is one whole IP packet
-//! (the device has no packet-info header).
+//! The TUN device's fd as the netstack's [`Packets`]. The fd goes non-blocking under the reactor of
+//! the runtime it is spawned on, the netstack thread's (`route::thread`); one task reads it and one
+//! writes it, and each read or write is one whole IP packet (the device has no packet-info header).
 
 use std::{io, os::fd::OwnedFd, sync::Arc};
 
@@ -21,8 +21,10 @@ use crate::{
 /// Packets queued each way between the device and the stack.
 const QUEUE: usize = 256;
 
-/// Starts the reader and the writer on `tun` in `tasks` and returns the stack's end. A failed read
-/// or write, or a short write, ends its task with the error; the fd closes once both tasks are gone.
+/// Starts the reader and the writer on `tun` in `tasks` and returns the stack's end. Call it inside
+/// the runtime that will drive the device: an `AsyncFd` belongs to the reactor it registered with. A
+/// failed read or write, or a short write, ends its task with the error; the fd closes once both
+/// tasks are gone.
 ///
 /// # Errors
 ///
@@ -82,21 +84,13 @@ mod tests {
     use std::time::Duration;
 
     use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair, sockopt::set_socket_send_buffer_size};
-    use tokio::net::UnixDatagram;
 
     use super::*;
-
-    /// A stand-in for the TUN fd that keeps packet boundaries, and the far end of it, as the kernel.
-    fn device_pair() -> (OwnedFd, UnixDatagram) {
-        let (tun, kernel) = socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None).unwrap();
-        let kernel = std::os::unix::net::UnixDatagram::from(kernel);
-        kernel.set_nonblocking(true).unwrap();
-        (tun, UnixDatagram::from_std(kernel).unwrap())
-    }
+    use crate::tests::device_pair;
 
     #[tokio::test]
     async fn packets_cross_whole_each_way() {
-        let (tun, kernel) = device_pair();
+        let (tun, kernel) = device_pair().unwrap();
         let mut tasks = JoinSet::new();
         let Packets { mut rx, tx } = spawn(tun, &mut tasks).unwrap();
         let largest = vec![7; usize::from(MTU)];
@@ -114,7 +108,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_device_that_ends_ends_the_reader_with_an_error() {
-        let (tun, kernel) = device_pair();
+        let (tun, kernel) = device_pair().unwrap();
         let mut tasks = JoinSet::new();
         let _packets = spawn(tun, &mut tasks).unwrap();
 
@@ -158,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_tasks_end_with_the_stack() {
-        let (tun, kernel) = device_pair();
+        let (tun, kernel) = device_pair().unwrap();
         let mut tasks = JoinSet::new();
         let packets = spawn(tun, &mut tasks).unwrap();
 

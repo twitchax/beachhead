@@ -26,6 +26,12 @@ use crate::{
     base::{Res, Void},
     session::SshCommand,
 };
+#[cfg(target_os = "linux")]
+use {
+    rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair},
+    std::os::fd::OwnedFd,
+    tokio::net::UnixDatagram,
+};
 
 mod app;
 #[cfg(target_os = "linux")]
@@ -344,6 +350,20 @@ pub fn echo_on(listener: TcpListener) -> Res<SocketAddr> {
         }
     });
     Ok(addr)
+}
+
+/// A stand-in for the TUN device's fd that keeps packet boundaries, and the far end of it, as the
+/// kernel, on the current runtime.
+///
+/// # Errors
+///
+/// Fails when the pair can't be made or the far end can't join the runtime.
+#[cfg(target_os = "linux")]
+pub fn device_pair() -> Res<(OwnedFd, UnixDatagram)> {
+    let (tun, kernel) = socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None).context("making the device's socket pair")?;
+    let kernel = std::os::unix::net::UnixDatagram::from(kernel);
+    kernel.set_nonblocking(true).context("making the device's far end non-blocking")?;
+    Ok((tun, UnixDatagram::from_std(kernel).context("registering the device's far end")?))
 }
 
 /// Sends `data` to the echo server at `addr` and reads until it closes; returns what came back.

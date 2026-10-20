@@ -19,7 +19,9 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   sharing the map), `stack` (the smoltcp netstack) with `dns` on it, `device` (the TUN fd as the
   stack's packets), `peers` and `system` (what the machine depends on, and the commands and
   syscalls behind it), `helper` (the root side, run as the hidden `sshunnel helper` through sudo),
-  and `lifecycle`, which runs them in the spec's order and stops the helper on every exit path.
+  `thread` (the netstack's own thread: `device`, `stack` and `dns` on a runtime of their own), and
+  `lifecycle`, which runs them in the spec's order and, on every exit path, joins the netstack's
+  thread and then stops the helper.
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.
 - `crates/sshunnel-relay`: the remote binary, pushed over SSH as a static musl build. Every
@@ -29,7 +31,12 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
 The mux invariant to protect: **the frame reader never blocks**. It hands frames to per-stream
 channels bounded by credit, so the ssh pipe always drains. `route::stack` (the TUN netstack) keeps
 the same shape: **its packet loop never waits on one connection**. Each smoltcp socket bridges to
-its relay stream through a bounded pipe, so a slow stream closes only that socket's window.
+its relay stream through a bounded pipe, so a slow stream closes only that socket's window. The
+packet loop, its connections' tasks, the device's reader and writer and the DNS server share one
+current-thread runtime on a thread of their own (`route::thread`, named `sshunnel-stack`), so a
+segment's round trip stays on one core; the mux and everything else stay on the main runtime, and
+tokio's channels cross between them. **Nothing on that thread may block**: a blocking call there
+stalls every connection.
 
 `route::helper` is the privilege boundary, not the client. `sshunnel route` starts it through sudo,
 and with a `NOPASSWD` sudoers line anything running as the user can too, so it trusts nothing the

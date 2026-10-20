@@ -21,6 +21,8 @@ pub mod stack;
 #[cfg(target_os = "linux")]
 pub mod system;
 pub mod targets;
+#[cfg(target_os = "linux")]
+mod thread;
 
 #[cfg(target_os = "linux")]
 pub use lifecycle::{Options, run};
