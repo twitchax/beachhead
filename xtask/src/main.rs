@@ -9,7 +9,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use sshunnel::{arch::Arch, relays::Relays};
 
 const USAGE: &str = "usage: cargo xtask <task>
@@ -23,7 +23,7 @@ tasks:
                            relay + dist, then compare `sshunnel forward -L` with `ssh -L` through
                            a throwaway non-root sshd (default 512 MiB per transfer, best of 3);
                            --route compares `sshunnel route` with `sshunnel forward -L` instead,
-                           one stream each way, from network namespaces (Linux, needs Docker
+                           one stream each way, from network namespaces (Linux only; needs Docker
                            where user namespaces are restricted)";
 
 fn main() -> Result<()> {
@@ -40,11 +40,13 @@ fn main() -> Result<()> {
             bench::run(&target_dir().join("dist").join("sshunnel"), &target_dir(), &options)
         }
         // Hidden: ssh's ProxyCommand and the client side, both in the route bench's namespaces.
+        #[cfg(target_os = "linux")]
         "bridge" => match rest {
-            [socket] => bench::bridge_stdio(Path::new(socket)),
+            [socket] => bench::route::bridge_stdio(Path::new(socket)),
             _ => bail!("usage: cargo xtask bridge <socket>"),
         },
-        "bench-client" => bench::client(rest),
+        #[cfg(target_os = "linux")]
+        "bench-client" => bench::route::client(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
@@ -159,7 +161,11 @@ fn bench_options(args: &[String]) -> Result<bench::Options> {
         match arg.as_str() {
             "--mib" => options.mib = value()?.max(8),
             "--runs" => options.runs = value()?.max(1),
-            "--route" => options.route = true,
+            "--route" => {
+                // Checked before the relay and client builds, which take a while.
+                ensure!(cfg!(target_os = "linux"), "--route is Linux only: `sshunnel route` needs a TUN device and network namespaces");
+                options.route = true;
+            }
             other => bail!("unexpected argument `{other}`\n\n{USAGE}"),
         }
     }
@@ -246,8 +252,13 @@ mod unit {
     fn bench_flags_parse() {
         let plain = bench_options(&[]).unwrap();
         assert_eq!((plain.mib, plain.runs, plain.route), (512, 3, false));
-        let route = bench_options(&["--route".into(), "--mib".into(), "64".into()]).unwrap();
-        assert_eq!((route.mib, route.runs, route.route), (64, 3, true));
+        let route = bench_options(&["--route".into(), "--mib".into(), "64".into()]);
+        if cfg!(target_os = "linux") {
+            let route = route.unwrap();
+            assert_eq!((route.mib, route.runs, route.route), (64, 3, true));
+        } else {
+            assert!(route.is_err_and(|e| e.to_string().contains("Linux only")));
+        }
         assert!(bench_options(&["--routes".into()]).is_err());
     }
 

@@ -255,9 +255,11 @@ sudo. Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor
 runs in a privileged Docker container instead (Docker without sudo, about half a second a test),
 built from your own Ubuntu release plus iproute2 and an ssh client as
 `sshunnel-netns:<codename>-<hash>` (the hash is the Dockerfile's) on first use, with the checkout
-mounted read-only. `cargo xtask bench --route` runs its client side the same way. With neither, the tests skip with a warning (under `CI`, they fail).
-`SSHUNNEL_NETNS=docker` forces the container. The alternative to Docker is lifting the restriction,
-as CI does on its throwaway runners:
+mounted read-only. `cargo xtask bench --route` runs its client side in the same container. With
+neither, the tests skip with a warning (under `CI`, they fail). `SSHUNNEL_NETNS=docker` forces the
+container. A change to the image's definition builds a new tag and leaves the old one behind:
+`docker image ls sshunnel-netns` lists them, and `docker image rm sshunnel-netns:<tag>` frees one.
+The alternative to Docker is lifting the restriction, as CI does on its throwaway runners:
 
 ```bash
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   # until reboot

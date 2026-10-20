@@ -49,6 +49,13 @@ jobs:
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo make ci
+      # The release builds a macOS client (`cargo xtask dist` on macos-15), and every job here runs
+      # on Linux, so Linux-only code reaching an always-compiled module would otherwise go unseen
+      # until a release. Checking needs only the target's std, no macOS SDK.
+      - name: Every crate still builds for macOS
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo check --workspace --all-targets --target x86_64-apple-darwin
       # The same suite through the Docker fallback a restricted dev box takes, so it can't rot.
       - name: Namespace tests in Docker
         id: route-docker

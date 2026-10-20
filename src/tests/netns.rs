@@ -137,32 +137,35 @@ impl Runner {
     /// The [`rerun`] of `test` in `exe`, where this runner runs it. A container gets what is left
     /// of [`CONTAINER_TIMEOUT`] since `entered`, after any image build.
     fn command(&self, exe: &Path, test: &str, entered: Instant) -> Res<Command> {
-        let limit = CONTAINER_TIMEOUT
-            .checked_sub(entered.elapsed())
-            .filter(|left| left.as_secs() > 0)
-            .context("building the image took the test's whole time")?;
-        let mounts = [PathBuf::from(env!("CARGO_MANIFEST_DIR")), target_dir(exe)?];
-        self.wrap(&rerun(exe, test), &mounts, limit)
-    }
-
-    /// `inner` (a program and its arguments) where this runner runs it, with [`INSIDE`] set: here,
-    /// or in the container with `mounts` read-only at their own paths and `limit` to live.
-    fn wrap(&self, inner: &[OsString], mounts: &[PathBuf], limit: Duration) -> Res<Command> {
+        let inner = rerun(exe, test);
         match self {
-            Self::Direct => {
-                let (program, args) = inner.split_first().context("the command is empty")?;
-                let mut command = Command::new(program);
-                command.args(args).env(INSIDE, "1");
-                Ok(command)
-            }
+            Self::Direct => direct(&inner),
             Self::Docker { image } => {
-                let workdir = std::env::current_dir().context("reading the working directory")?;
-                let mut command = Command::new("docker");
-                command.args(docker_run(image, mounts, &workdir, limit, inner)?);
-                Ok(command)
+                let limit = CONTAINER_TIMEOUT
+                    .checked_sub(entered.elapsed())
+                    .filter(|left| left.as_secs() > 0)
+                    .context("building the image took the test's whole time")?;
+                let mounts = [PathBuf::from(env!("CARGO_MANIFEST_DIR")), target_dir(exe)?];
+                in_container(image, &inner, &mounts, limit)
             }
         }
     }
+}
+
+/// `inner` (a program and its arguments) here, with [`INSIDE`] set.
+fn direct(inner: &[OsString]) -> Res<Command> {
+    let (program, args) = inner.split_first().context("the command is empty")?;
+    let mut command = Command::new(program);
+    command.args(args).env(INSIDE, "1");
+    Ok(command)
+}
+
+/// `inner` in a container from `image`, as [`docker_run`] runs it, from this working directory.
+fn in_container(image: &str, inner: &[OsString], mounts: &[PathBuf], limit: Duration) -> Res<Command> {
+    let workdir = std::env::current_dir().context("reading the working directory")?;
+    let mut command = Command::new("docker");
+    command.args(docker_run(image, mounts, &workdir, limit, inner)?);
+    Ok(command)
 }
 
 /// Where a command that isn't a test runs as root over fresh namespaces: here or in the container,
@@ -185,18 +188,23 @@ impl Namespaces {
     /// paths and `limit` to live: a user namespace of its own would map only that root, leaving the
     /// files this user owns in the mounts unreadable.
     ///
+    /// One difference follows from that: here, as in a test's rerun, PID 1 sits outside `program`'s
+    /// network namespace, so `route::system::same_netns_as_init()` reads false; in the container,
+    /// PID 1 (Docker's init) shares it, and it reads true. `route`'s helper refuses domain patterns
+    /// on that check, so a caller routing patterns would be refused here and not in the container.
+    ///
     /// # Errors
     ///
     /// Fails when `program` is empty or a mount can't be passed to Docker.
     pub fn command(&self, program: &[OsString], mounts: &[PathBuf], limit: Duration) -> Res<Command> {
         ensure!(!program.is_empty(), "no command to run in the namespaces");
-        match self.0 {
+        match &self.0 {
             Runner::Direct => {
                 let mut inner = namespaced();
                 inner.extend_from_slice(program);
-                self.0.wrap(&inner, mounts, limit)
+                direct(&inner)
             }
-            Runner::Docker { .. } => self.0.wrap(program, mounts, limit),
+            Runner::Docker { image } => in_container(image, program, mounts, limit),
         }
     }
 }
@@ -527,20 +535,32 @@ mod tests {
     }
 
     #[test]
-    fn a_command_runs_where_its_runner_runs_it() {
+    fn a_direct_rerun_needs_no_target_dir_or_time_left() {
+        // Only the container mounts the target dir and has a limit. A `CARGO_TARGET_DIR` made before
+        // cargo ran has no `CACHEDIR.TAG`, and a direct rerun has no image build to run out of time.
+        let long_ago = Instant::now().checked_sub(CONTAINER_TIMEOUT).expect("the machine has been up longer than the container's limit");
+
+        let command = Runner::Direct.command(Path::new("/nowhere/route-0123"), "e2e_route_x", long_ago).unwrap();
+
+        assert_eq!(command.get_program(), "unshare");
+    }
+
+    #[test]
+    fn a_command_runs_here_or_in_the_container() {
         let inner = strings(&["/repo/target/debug/xtask", "bench-client"]);
         let mounts = [PathBuf::from("/repo/target")];
 
-        let direct = Runner::Direct.wrap(&inner, &mounts, Duration::from_secs(60)).unwrap();
-        assert_eq!(direct.get_program(), "/repo/target/debug/xtask");
-        assert_eq!(direct.get_args().collect::<Vec<_>>(), ["bench-client"]);
-        assert_eq!(direct.get_envs().collect::<Vec<_>>(), [(OsStr::new(INSIDE), Some(OsStr::new("1")))]);
+        let here = direct(&inner).unwrap();
+        assert_eq!(here.get_program(), "/repo/target/debug/xtask");
+        assert_eq!(here.get_args().collect::<Vec<_>>(), ["bench-client"]);
+        assert_eq!(here.get_envs().collect::<Vec<_>>(), [(OsStr::new(INSIDE), Some(OsStr::new("1")))]);
+        assert!(direct(&[]).is_err(), "nothing to run");
 
         let image = "sshunnel-netns:noble-0123456789ab";
-        let docker = Runner::Docker { image: image.to_owned() }.wrap(&inner, &mounts, Duration::from_secs(60)).unwrap();
+        let contained = in_container(image, &inner, &mounts, Duration::from_secs(60)).unwrap();
         let workdir = std::env::current_dir().unwrap();
-        assert_eq!(docker.get_program(), "docker");
-        assert_eq!(docker.get_args().collect::<Vec<_>>(), docker_run(image, &mounts, &workdir, Duration::from_secs(60), &inner).unwrap());
+        assert_eq!(contained.get_program(), "docker");
+        assert_eq!(contained.get_args().collect::<Vec<_>>(), docker_run(image, &mounts, &workdir, Duration::from_secs(60), &inner).unwrap());
     }
 
     #[test]
