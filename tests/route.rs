@@ -191,6 +191,37 @@ async fn e2e_route_carries_tcp_to_a_cidr_target() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_a_closed_port_is_refused() {
+    if !netns("e2e_route_a_closed_port_is_refused").unwrap() {
+        return;
+    }
+    let world = World::new();
+    let route = world.start(&["10.99.0.0/16"]).await;
+
+    // Nothing listens there on the remote: the relay's dial is refused, and so is the app's connect.
+    let connect = timeout(WITHIN, TcpStream::connect((RemoteNs::HOST, 9))).await.expect("the connect ends");
+    let refused = connect.expect_err("connected to a closed port");
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused, "{refused}");
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_an_unreachable_host_is_unreachable() {
+    if !netns("e2e_route_an_unreachable_host_is_unreachable").unwrap() {
+        return;
+    }
+    let world = World::new();
+    let route = world.start(&["10.99.0.0/16"]).await;
+
+    // Inside the target, but nothing on the remote's network routes it: the relay's dial fails
+    // there, and the app's connect here fails as the spec promises.
+    let connect = timeout(WITHIN, TcpStream::connect((Ipv4Addr::new(10, 99, 0, 77), 80))).await.expect("the connect ends");
+    let unreachable = connect.expect_err("connected to an unreachable host");
+    assert_eq!(unreachable.kind(), io::ErrorKind::HostUnreachable, "{unreachable}");
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_route_teardown_after_a_clean_exit() {
     if !netns("e2e_route_teardown_after_a_clean_exit").unwrap() {
         return;
