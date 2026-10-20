@@ -36,7 +36,9 @@ why the version moved the way it did.
   the fake range, a route the main table already has, patterns without systemd-resolved) is
   reported before ssh runs. A root helper started through sudo (the hidden `sshunnel helper`, which
   the README's `NOPASSWD` sudoers line names) sets the device up, keeps ssh's peers and the DNS
-  servers on their routes, and leaves nothing behind on exit.
+  servers on their routes, and leaves nothing behind on exit: it deletes the device itself rather
+  than leaving it to go with the last fd, which a client setting the device's persist flag could
+  keep open past the helper.
 - Protocol v3: `Resolve` / `Resolved` / `ResolveErr` frames, so the relay can resolve a name with
   its own resolver (`getaddrinfo`), and a kind on `OpenErr` (refused, unreachable, timed out,
   other), so a failed dial says why. A cached v2 relay is simply replaced, since the cache is keyed

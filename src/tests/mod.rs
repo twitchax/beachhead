@@ -28,6 +28,7 @@ use crate::{
 };
 #[cfg(target_os = "linux")]
 use {
+    crate::route::helper::{self, Helper, Setup},
     rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair},
     std::os::fd::OwnedFd,
     tokio::net::UnixDatagram,
@@ -409,6 +410,19 @@ pub fn route_command(exe: impl AsRef<OsStr>, dir: &Path, ssh: &Path, relays: &Pa
         .arg("fake-host")
         .args(targets);
     command
+}
+
+/// `sshunnel route`'s side of the root helper: starts `exe helper` (through sudo unless already root)
+/// with its socket in `dir`, sends it `setup` and returns once the device is up. The client code
+/// is `route`'s own; only the executable is the caller's, since a test's own isn't sshunnel.
+///
+/// # Errors
+///
+/// Fails as [`Helper::start`] does.
+#[cfg(target_os = "linux")]
+pub async fn start_helper(exe: &Path, dir: &Path, setup: &Setup) -> Res<Helper> {
+    let euid = rustix::process::geteuid().as_raw();
+    Helper::start_with(setup, dir, |socket| helper::command(exe, socket, euid)).await
 }
 
 /// A process whose stderr is collected line by line as it arrives, so a test can wait for a line and

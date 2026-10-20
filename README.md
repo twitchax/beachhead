@@ -164,11 +164,12 @@ half-working. sshunnel sets only its own link's DNS: a `~domain` routing domain 
 default route, so resolved hands it the queries under those domains and nothing else.
 
 **What it leaves behind: nothing.** Ctrl-C, SIGTERM, a closed terminal (unless started under
-`nohup`), the session ending and the helper dying all end the run. The device takes its addresses,
-routes and resolver config with it, and the helper deletes its pinned routes (the host routes that
-keep ssh's peer and your DNS servers off the device when a target covers them; an address with a
-host route of its own already stays off it) before `route` returns. Only the helper dying without
-its teardown (a SIGKILL, say) can leave a pinned route; the next start sweeps it, or
+`nohup`), the session ending and the helper dying all end the run. Before `route` returns, the
+helper deletes its pinned routes (the host routes that keep ssh's peer and your DNS servers off the
+device when a target covers them; an address with a host route of its own already stays off it)
+and then the device itself, which takes its addresses, routes and resolver config with it. Only the
+helper dying without its teardown (a SIGKILL, say) can leave a pinned route, and the device still
+goes when `route` closes its own fd on it. The next start sweeps the pin, or
 `sudo ip route flush proto 222` and `sudo ip -6 route flush proto 222` remove it by hand.
 
 ## Performance

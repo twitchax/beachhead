@@ -1,9 +1,10 @@
 //! The root helper, both sides of its socket. `sshunnel route` listens on a unix socket in a
 //! private directory and starts `sshunnel helper` through sudo. The helper connects back, takes the
 //! targets, sets up [`DEVICE`] as root and hands its fd over the socket (sudo closes inherited fds
-//! and may put the helper on a pty, so the socket carries everything). It then holds its pinned
-//! routes until the socket closes or a signal arrives, deletes them and exits; the device goes with
-//! the last fd.
+//! and may put the helper on a pty, so the socket carries everything). It then holds the device and
+//! its pinned routes until the socket closes or a signal arrives, deletes the pins and then the
+//! device, and exits. Deleting the device, rather than leaving it to go with the last fd, means it
+//! can't outlive the helper whatever the client does with its own fd.
 //!
 //! The helper is the privilege boundary, not the client. With a `NOPASSWD` sudoers line anything
 //! running as the user can start it, so it takes targets, never routes or domains: it parses them
@@ -95,7 +96,7 @@ impl Helper {
     }
 
     /// [`Self::start`] with the socket's parent dir and the command line chosen by the caller.
-    async fn start_with(setup: &Setup, base: &Path, command_line: impl FnOnce(&Path) -> Vec<OsString>) -> Res<Self> {
+    pub(crate) async fn start_with(setup: &Setup, base: &Path, command_line: impl FnOnce(&Path) -> Vec<OsString>) -> Res<Self> {
         let dir = SocketDir::create(base)?;
         let socket = dir.0.join("helper.sock");
         let listener = UnixListener::bind(&socket).with_context(|| format!("listening on {}", socket.display()))?;
@@ -204,15 +205,15 @@ async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, s
 }
 
 /// `sshunnel helper --socket <path>`, run as root: connect to the client, set the device up as it
-/// asks if its targets pass every check here, and hand over the fd. Then hold the pins until the
-/// socket closes or SIGINT, SIGTERM or SIGHUP arrives (a Ctrl-C reaches the helper through sudo
-/// too), and delete them.
+/// asks if its targets pass every check here, and hand over the fd. Then hold the device and its
+/// pins until the socket closes or SIGINT, SIGTERM or SIGHUP arrives (a Ctrl-C reaches the helper
+/// through sudo too), and delete them.
 ///
 /// # Errors
 ///
 /// Fails when the client can't be reached or isn't the user who ran sudo, when the setup is refused
 /// or fails (after telling the client and undoing what was done; marked [`Reported`] once the
-/// client has it), or when a pin can't be deleted.
+/// client has it), or when a pin or the device can't be deleted.
 pub async fn serve(socket: &Path) -> Void {
     let uid = served_uid(std::env::var_os("SUDO_UID").as_deref(), rustix::process::getuid().as_raw())?;
     serve_with(socket, uid).await
@@ -242,15 +243,18 @@ async fn serve_with(socket: &Path, uid: u32) -> Void {
         }
     };
 
-    let delivered = send(&mut conn, &Reply::Ready { warnings }, Some(applied.tun.as_fd())).await;
+    let delivered = send(&mut conn, &Reply::Ready { warnings }, applied.tun.as_ref().map(|tun| tun.as_fd())).await;
     if delivered.is_ok() {
         tokio::select! {
             () = closed(&mut conn) => {}
             () = signals.recv() => {}
         }
     }
-    let unpinned = applied.teardown();
-    delivered.and(unpinned)
+    // Closed before the device goes, so a client still running hears the helper is stopping rather
+    // than finding its device gone. It waits for this process to exit all the same.
+    drop(conn);
+    let torn_down = applied.teardown();
+    delivered.and(torn_down)
 }
 
 /// Marks the helper's error once the client has it: the client prints it, so `sshunnel helper`
@@ -354,20 +358,41 @@ impl Signals {
     }
 }
 
-/// What the helper holds while the client runs: the device, and the pins it added.
-struct Applied {
-    tun: OwnedFd,
+/// What the helper holds while the client runs: the device, and the pins it added, undone by `run`.
+/// Dropped without [`Self::teardown`], by an early return or a panic, it still undoes them, and never
+/// twice.
+struct Applied<R: FnMut(&Step) -> Void = fn(&Step) -> Void> {
+    /// `None` once undone.
+    tun: Option<OwnedFd>,
     pins: Vec<IpAddr>,
+    run: R,
 }
 
-impl Applied {
-    /// Deletes the pins, then lets the device go, persist flag cleared. Holding the device until the
-    /// pins are gone means no new session can start in between and lose a pin of the same address
-    /// to this one's delete.
-    fn teardown(self) -> Void {
-        let unpinned = unpin(&self.pins, &mut run_step);
-        let released = system::release_tun(self.tun);
-        unpinned.and(released)
+impl<R: FnMut(&Step) -> Void> Applied<R> {
+    /// [`Self::undo`], reporting what failed.
+    fn teardown(mut self) -> Void {
+        self.undo()
+    }
+
+    /// Deletes the pins, then the device, while this fd still holds it, and lets the fd go with its
+    /// persist flag cleared. Deleted, the device can't outlive the helper, even when the client set
+    /// that flag through its own fd (no capability needed) after this one closed; its routes and
+    /// resolver config go with it. Holding the device until the pins are gone means no new session
+    /// can start in between and lose a pin of the same address to this one's delete.
+    fn undo(&mut self) -> Void {
+        let Some(tun) = self.tun.take() else { return Ok(()) };
+        let unpinned = unpin(&self.pins, &mut self.run);
+        let deleted = delete_device(&mut self.run);
+        let released = system::release_tun(tun);
+        unpinned.and(deleted).and(released)
+    }
+}
+
+impl<R: FnMut(&Step) -> Void> Drop for Applied<R> {
+    fn drop(&mut self) {
+        if let Err(e) = self.undo() {
+            tracing::warn!("{e:#}");
+        }
     }
 }
 
@@ -400,7 +425,7 @@ fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
     let pins = execute(&plan.steps, &mut run_step)?;
     warnings.extend(plan.warnings);
 
-    Ok((Applied { tun, pins }, warnings))
+    Ok((Applied { tun: Some(tun), pins, run: run_step }, warnings))
 }
 
 /// The pins a route would capture, each once. A pin outside every route needs nothing, and is never
@@ -518,6 +543,15 @@ fn execute(steps: &[Step], run: &mut impl FnMut(&Step) -> Void) -> Res<Vec<IpAdd
         pins.extend(step.pin);
     }
     Ok(pins)
+}
+
+/// Deletes [`DEVICE`] by name, which is this helper's while its fd holds the device. One already gone
+/// (deleted under the fd mid-session) counts as deleted.
+fn delete_device(run: &mut impl FnMut(&Step) -> Void) -> Void {
+    match run(&Step::new("ip", ["link", "del", "dev", DEVICE])) {
+        Err(e) if format!("{e:#}").contains("Cannot find device") => Ok(()),
+        deleted => deleted,
+    }
 }
 
 /// Deletes `pins`, newest first, trying every one.
@@ -1096,6 +1130,41 @@ mod tests {
 
         assert!(format!("{error:#}").contains("10.99.0.6"), "{error:#}");
         assert_eq!(log, ["ip route del 10.99.0.6/32 proto 222", "ip route del 10.99.0.5/32 proto 222"]);
+    }
+
+    #[test]
+    fn an_applied_setup_is_undone_once_even_when_dropped() {
+        let undo = ["ip route del 10.99.0.5/32 proto 222", "ip link del dev sshunnel0"];
+        // Stands in for the device's fd: clearing its persist flag fails, which neither path minds.
+        let tun = || Some(OwnedFd::from(tempfile::tempfile().unwrap()));
+
+        // An early return or a panic between setup and teardown.
+        let mut log = Vec::new();
+        drop(Applied {
+            tun: tun(),
+            pins: vec![addr("10.99.0.5")],
+            run: recorder(&mut log, &[]),
+        });
+        assert_eq!(log, undo);
+
+        // Torn down, then dropped: nothing runs twice.
+        let mut log = Vec::new();
+        let applied = Applied {
+            tun: tun(),
+            pins: vec![addr("10.99.0.5")],
+            run: recorder(&mut log, &[]),
+        };
+        let _ = applied.teardown();
+        assert_eq!(log, undo);
+    }
+
+    #[test]
+    fn a_device_already_gone_counts_as_deleted() {
+        let mut gone = |_: &Step| -> Void { bail!("`ip link del dev sshunnel0` failed (exit status: 1): Cannot find device \"sshunnel0\"") };
+        assert!(delete_device(&mut gone).is_ok());
+
+        let mut refused = |_: &Step| -> Void { bail!("`ip link del dev sshunnel0` failed (exit status: 2): RTNETLINK answers: Operation not permitted") };
+        assert!(delete_device(&mut refused).is_err());
     }
 
     #[tokio::test]

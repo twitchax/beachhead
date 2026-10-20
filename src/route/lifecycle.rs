@@ -3,7 +3,7 @@
 //! root helper; run the netstack and the DNS server on its device, on a thread of their own; then
 //! wait for a signal, the session ending, the helper dying or the netstack failing, and tear down.
 //! The netstack's thread is joined and then the helper stopped, on every path once each has
-//! started, so its pinned routes are gone when [`run`] returns.
+//! started, so its pinned routes and the device are gone when [`run`] returns.
 
 use std::{
     net::{IpAddr, Ipv4Addr},
@@ -91,8 +91,8 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
         Err(e) => Err(e),
     };
 
-    // The client's fd on the device closes as the netstack's thread ends; the helper's goes as it
-    // stops, and the device vanishes with the last one, taking its addresses, routes and resolver
+    // The client's fd on the device closes as the netstack's thread ends. The helper deletes its
+    // pins and then the device as it stops, which takes the device's addresses, routes and resolver
     // config along.
     let halted = netstack.map_or(Ok(()), Netstack::stop);
     let saved = router.names().save().context("saving the fake-address map");

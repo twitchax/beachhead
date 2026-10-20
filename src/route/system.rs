@@ -149,7 +149,8 @@ pub fn create_tun() -> Res<OwnedFd> {
 }
 
 /// Clears the device's persist flag, then closes this fd on it. A client holding the other fd can
-/// set the flag without any capability; cleared here, the device still goes when that fd closes.
+/// set the flag without any capability; cleared here, a device teardown failed to delete still goes
+/// when that fd closes, unless the client sets the flag again.
 ///
 /// # Errors
 ///

@@ -7,8 +7,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
+    io,
     net::{Ipv4Addr, SocketAddr},
-    os::unix::fs::PermissionsExt as _,
+    os::{
+        fd::{AsRawFd as _, OwnedFd},
+        unix::fs::PermissionsExt as _,
+    },
     path::{Path, PathBuf},
     process::Command as StdCommand,
     time::{Duration, Instant},
@@ -17,8 +21,8 @@ use std::{
 use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use sshunnel::{
-    route::{peers::process_tree, system::same_netns_as_init},
-    tests::{FakeRemote, RemoteNs, Watched, echo_on, netns, pattern, relay_dir, round_trip, route_command, shim_dir},
+    route::{helper::Setup, peers::process_tree, system::same_netns_as_init},
+    tests::{FakeRemote, RemoteNs, Watched, echo_on, netns, pattern, relay_dir, round_trip, route_command, shim_dir, start_helper},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -363,6 +367,41 @@ async fn e2e_route_teardown_when_the_device_is_deleted() {
     // The helper still deletes its pins, and has nothing else to undo.
     assert!(!stderr.contains("the root helper exited with"), "{stderr}");
     assert_eq!(leftovers(), Vec::<String>::new(), "stderr:\n{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_teardown_deletes_a_device_the_client_made_persistent() {
+    if !netns("e2e_route_teardown_deletes_a_device_the_client_made_persistent").unwrap() {
+        return;
+    }
+    let world = World::new();
+    // The test plays `route`'s side of the helper, so it holds the device's fd itself.
+    let setup = Setup {
+        include: vec!["10.98.0.0/16".to_owned()],
+        exclude: Vec::new(),
+        pins: vec![RemoteNs::PEER.into()],
+    };
+    let mut helper = start_helper(Path::new(env!("CARGO_BIN_EXE_sshunnel")), world.dir.path(), &setup).await.unwrap();
+    let tun = helper.take_tun().unwrap();
+    assert_eq!(pins(), [PIN]);
+
+    // The helper sees its socket close, tears down and exits, while this fd outlives it.
+    helper.stop().await.unwrap();
+    // Then the client asks the driver to keep the device past its last close. Once the helper has
+    // deleted the device, this fd is detached and the driver refuses.
+    let _ = persist(&tun);
+    drop(tun);
+
+    assert_eq!(leftovers(), Vec::<String>::new());
+}
+
+/// Sets the persist flag on a TUN device through `tun`, so the device outlives its last fd. Any
+/// holder of an fd on the device can, without a capability.
+fn persist(tun: &OwnedFd) -> io::Result<()> {
+    // SAFETY: TUNSETPERSIST takes an int by value (non-zero sets the flag), and `tun` is an open fd
+    // for the whole call.
+    let set = unsafe { libc::ioctl(tun.as_raw_fd(), libc::TUNSETPERSIST, 1) };
+    if set == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 /// `route` over the ssh `make_ssh` writes, which connects to the peer: the target captures the
