@@ -61,12 +61,7 @@ fn relay(arches: &[Arch]) -> Result<()> {
     let out = target_dir().join("relay");
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
     for &arch in arches {
-        cargo().args(["build", "-p", "sshunnel-relay", "--profile", "relay", "--target", arch.triple()]).status_ok()?;
-        let built = target_dir().join(arch.triple()).join("relay").join("sshunnel-relay");
-        let bytes = std::fs::read(&built).with_context(|| format!("reading {}", built.display()))?;
-        if !is_static_elf(&bytes).with_context(|| format!("inspecting {}", built.display()))? {
-            bail!("{} needs a dynamic loader; the relay must be static", built.display());
-        }
+        let built = build_relay(arch)?;
         std::fs::copy(&built, out.join(arch.file_name())).with_context(|| format!("installing the {arch} relay"))?;
     }
 
@@ -80,6 +75,51 @@ fn relay(arches: &[Arch]) -> Result<()> {
     std::fs::write(out.join("SHA256SUMS"), sums).context("writing SHA256SUMS")?;
     println!("wrote {}", out.display());
     Ok(())
+}
+
+/// Builds one relay, checks it is static and names no builder directory, and returns its path.
+///
+/// Paths are trimmed on the command line, never in a manifest: a `trim-paths` profile key would ship
+/// in the published `Cargo.toml` and break installs on toolchains older than the one that stabilized it.
+fn build_relay(arch: Arch) -> Result<PathBuf> {
+    cargo()
+        .args(["build", "-p", "sshunnel-relay", "--profile", "relay", "--target", arch.triple()])
+        .args(["--config", "profile.relay.trim-paths=\"all\""])
+        .status_ok()?;
+    let built = target_dir().join(arch.triple()).join("relay").join("sshunnel-relay");
+    let bytes = std::fs::read(&built).with_context(|| format!("reading {}", built.display()))?;
+    if !is_static_elf(&bytes).with_context(|| format!("inspecting {}", built.display()))? {
+        bail!("{} needs a dynamic loader; the relay must be static", built.display());
+    }
+    if let Some(dir) = builder_paths(&bytes, &builder_dirs()) {
+        bail!("the {arch} relay contains {}: trimming missed it", dir.display());
+    }
+    Ok(built)
+}
+
+/// The first of `dirs` that occurs in `bytes`. A relay is pushed to other machines, so none of the
+/// builder's directories may survive in it. Empty and `/` are skipped: they would match anything.
+fn builder_paths<'a>(bytes: &[u8], dirs: &'a [PathBuf]) -> Option<&'a Path> {
+    dirs.iter().map(PathBuf::as_path).find(|dir| {
+        let needle = dir.to_str().unwrap_or_default().as_bytes();
+        needle.len() > 1 && bytes.windows(needle.len()).any(|window| window == needle)
+    })
+}
+
+/// The directories a build on this machine can leak into a binary: home, cargo, rustup and the workspace.
+fn builder_dirs() -> Vec<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+    let home = var("HOME");
+    let under_home = |name: &str| home.as_ref().map(|home| home.join(name));
+    [
+        home.clone(),
+        var("CARGO_HOME").or_else(|| under_home(".cargo")),
+        var("RUSTUP_HOME").or_else(|| under_home(".rustup")),
+        Some(root().to_path_buf()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Builds the release client with `target/relay` embedded and copies it to `target/dist`.
@@ -288,5 +328,24 @@ mod unit {
         assert_eq!(arches(&["--arch".into(), "aarch64".into()]).unwrap(), vec![Arch::Aarch64]);
         assert!(arches(&["--arch".into(), "mips".into()]).is_err());
         assert!(arches(&["--arch".into()]).is_err());
+    }
+
+    #[test]
+    fn builder_paths_finds_a_planted_home() {
+        let dirs = [PathBuf::from("/home/someone")];
+        let bytes = b"...panicked at /home/someone/.cargo/registry/src/x.rs...";
+        assert_eq!(builder_paths(bytes, &dirs), Some(Path::new("/home/someone")));
+    }
+
+    #[test]
+    fn builder_paths_passes_clean_bytes() {
+        let dirs = [PathBuf::from("/home/someone"), PathBuf::from("/work/sshunnel")];
+        assert_eq!(builder_paths(b"panicked at /cargo/registry/src/x.rs", &dirs), None);
+    }
+
+    #[test]
+    fn builder_paths_skips_root_and_empty() {
+        let dirs = [PathBuf::new(), PathBuf::from("/")];
+        assert_eq!(builder_paths(b"/usr/lib/x.rs", &dirs), None);
     }
 }

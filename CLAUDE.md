@@ -57,7 +57,7 @@ cargo make ci        # fmt-check + clippy (-D warnings) + nextest: the gate, run
 cargo make test      # nextest
 cargo make uat       # ci + the #[ignore]d slow suites: what PRD UATs point at
 cargo make codecov   # coverage.lcov
-cargo xtask relay    # static musl relays + SHA256SUMS into target/relay
+cargo xtask relay    # static musl relays + SHA256SUMS into target/relay; paths trimmed, refuses a relay naming the builder's dirs
 cargo xtask dist     # release client with target/relay embedded, hashes checked
 cargo xtask bench    # sshunnel -L vs ssh -L through a throwaway sshd (not part of ci)
 cargo xtask bench --route  # sshunnel route vs sshunnel -L from namespaces; 15 rounds, fails if a median is under 90%

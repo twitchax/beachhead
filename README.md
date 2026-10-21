@@ -52,8 +52,8 @@ remote**:
 ```text
 $ sshunnel relays
 relays (embedded):
-  x86_64   sha256 604223ed029fe70992b2d61cbe9346c823c45b1aa8914d9dc369d034146ef886  618032 bytes
-  aarch64  sha256 8e945bdc13c0a21ad98c41d6fd3e9da84b6ae086780fb1d01f94853029d5ed0b  557744 bytes
+  x86_64   sha256 61bf6514b25cafe316123d8f87a5ad0abcf274251d7bbcdfc3e6ea76532ab881  616464 bytes
+  aarch64  sha256 992a462f694f57f0487fb3548d24324e1bac094a8cd257e159a7311462eb6df4  556176 bytes
 ```
 
 ## Usage
