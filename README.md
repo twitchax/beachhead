@@ -60,7 +60,7 @@ relays (embedded):
 
 ```text
 $ sshunnel forward -L 8080:server.lan:80 server
-sshunnel: relay x86_64 604223ed029f pushed to /home/me/.cache/sshunnel
+sshunnel: relay x86_64 61bf6514b25c pushed to /home/me/.cache/sshunnel
 sshunnel: forwarding 127.0.0.1:8080 -> server.lan:80
 sshunnel: forwarding [::1]:8080 -> server.lan:80
 ```
@@ -88,7 +88,7 @@ Options:
 
 ```text
 $ sshunnel route jump.corp.example 10.99.0.0/16 '*.corp.example' -x 10.99.7.0/24
-sshunnel: relay x86_64 604223ed029f cached in /home/me/.cache/sshunnel
+sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
 [sudo] password for me:
 sshunnel: routing 10.99.0.0/16, *.corp.example (except 10.99.7.0/24) through jump.corp.example on sshunnel0
 ```
@@ -141,7 +141,7 @@ to its own device. To skip the password prompt, install sshunnel where only root
 that, and allow the helper alone:
 
 ```bash
-sudo install -o root -g root -m 0755 target/dist/sshunnel /usr/local/bin/sshunnel
+sudo install -o root -g root -m 0755 "$(command -v sshunnel)" /usr/local/bin/sshunnel
 namei -l /usr/local/bin/sshunnel          # every line root-owned and writable by root alone
 sudo visudo -f /etc/sudoers.d/sshunnel    # add the line below, with your user name
 ```
@@ -150,15 +150,17 @@ sudo visudo -f /etc/sudoers.d/sshunnel    # add the line below, with your user n
 me ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *
 ```
 
-sudo runs the helper by the binary's real path (symlinks resolved), so that is the path the line
-names. **Never point a `NOPASSWD` line at a binary you can write:** whoever can write it is root,
-since sudo runs whatever they put there. The line lets anything running as you start the helper, so
-it grants exactly what `route` allows: route any range except the default route (`0.0.0.0/0`,
-`::/0`) through `sshunnel0`, keep addresses inside those ranges on their current route, and send the
-matching domains' queries to sshunnel while the device exists. That grant is machine-wide: the
-routes and the `~domain` resolver routing apply to every user's traffic and lookups on the host, and
-that traffic goes to a process running as you. `0.0.0.0/1` plus `128.0.0.0/1` is a deliberate full
-tunnel; the `/0` refusal guards against accidents and is not a security boundary.
+`route` asks sudo for the helper by its own real path (symlinks resolved), so that is the path the
+line names, and the copy to run `route` from: a copy earlier on your `PATH` (`~/.cargo/bin`, say)
+still prompts. **Never point a `NOPASSWD` line at a binary you can write:** whoever can write it is
+root, since sudo runs whatever they put there. The line lets anything running as you start the
+helper, so it grants exactly what `route` allows: route any range except the default route
+(`0.0.0.0/0`, `::/0`) through `sshunnel0`, keep addresses inside those ranges on their current
+route, and send the matching domains' queries to sshunnel while the device exists. That grant is
+machine-wide: the routes and the `~domain` resolver routing apply to every user's traffic and
+lookups on the host, and that traffic goes to a process running as you. `0.0.0.0/1` plus
+`128.0.0.0/1` is a deliberate full tunnel; the `/0` refusal guards against accidents and is not a
+security boundary.
 
 **systemd-resolved.** Domain patterns need systemd-resolved, and the system has to actually ask it:
 `/etc/resolv.conf` points at its stub (`127.0.0.53`), or `nss-resolve` is on the `hosts:` line of
@@ -236,12 +238,12 @@ in the [PRD log](.prds/PRD-0004.log.md).
 ## Install
 
 ```bash
-cargo install sshunnel
+cargo install sshunnel --locked
 ```
 
-This builds on stable Rust, offline once the crates are fetched. The relays come inside the crate,
-built when it was published, so their hashes can differ from the GitHub release's;
-`sshunnel relays` shows what this client pushes.
+This builds on stable Rust, with the dependency versions the crate was published with, and fetches
+nothing beyond the crates: the relays come inside the crate, built when it was published, so their
+hashes can differ from the GitHub release's. `sshunnel relays` shows what this client pushes.
 
 ```bash
 cargo binstall sshunnel

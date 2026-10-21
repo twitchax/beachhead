@@ -1,8 +1,9 @@
 name: Release
 
-# A `v*` tag (from `cargo release`, or by hand) builds the relays once, embeds those same bytes in
-# one client per platform, and publishes the clients, the relays and their SHA256SUMS on a GitHub
-# Release: one set of hashes per release is the trust story.
+# A `v*` tag, pushed by hand at release time (CLAUDE.md's Releasing), builds the relays once, embeds
+# those same bytes in one client per platform, and publishes the clients, the relays and their
+# SHA256SUMS on a GitHub Release: one set of hashes per release is the trust story. crates.io is
+# published from a local machine afterwards, never from here.
 on:
   push:
     tags:

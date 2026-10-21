@@ -1,6 +1,7 @@
-//! Fixtures shared by unit tests, integration tests and benches. Always compiled (not
-//! `#[cfg(test)]`), so `tests/` and `benches/` can use it too; keep it free of test-only
-//! dependencies.
+//! Fixtures shared by unit tests, integration tests and benches. Behind the `testing` feature
+//! (which the crate's self dev-dependency turns on for its own tests) rather than `#[cfg(test)]`,
+//! so `tests/` and `benches/` can use it too. The library build never sees dev-dependencies, so
+//! keep it free of them.
 
 use std::{
     ffi::OsStr,
