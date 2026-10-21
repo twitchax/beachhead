@@ -45,7 +45,7 @@ headers, one stream per TCP connection). Every stream has its own 1 MiB credit w
 frame reader *never* blocks, so a stalled connection parks its own sender without holding up the
 pipe or its neighbors. Memory stays bounded at window × streams.
 
-Release builds embed the relays and will ship their `SHA256SUMS` beside the binaries, and
+Release builds embed the relays and ship their `SHA256SUMS` beside the binaries, and
 `sshunnel relays` prints the arch, sha256 and size of **exactly what the client will execute on a
 remote**:
 
@@ -235,7 +235,25 @@ in the [PRD log](.prds/PRD-0004.log.md).
 
 ## Install
 
-There is no release yet. To build a client with both relays embedded:
+```bash
+cargo install sshunnel
+```
+
+This builds on stable Rust, offline once the crates are fetched. The relays come inside the crate,
+built when it was published, so their hashes can differ from the GitHub release's;
+`sshunnel relays` shows what this client pushes.
+
+```bash
+cargo binstall sshunnel
+```
+
+This fetches the GitHub release's client for x86_64 Linux and aarch64 macOS, and builds from source
+anywhere else.
+
+Each GitHub release also carries the client zips (`sshunnel_<target>.zip`), the relays and their
+`SHA256SUMS`.
+
+From source, to build a client with both relays embedded:
 
 ```bash
 cargo xtask relay   # static musl relays and SHA256SUMS into target/relay

@@ -228,7 +228,8 @@ mod unit {
 
     #[test]
     fn a_build_without_embedded_relays_says_how_to_get_them() {
-        // Test builds never set SSHUNNEL_EMBED_RELAY_DIR.
+        // Test builds never set SSHUNNEL_EMBED_RELAY_DIR, and a checkout's `.git` makes the build
+        // ignore its `relays/`, so nothing embeds.
         assert!(Relays::embedded().unwrap_err().to_string().contains("--relay-dir"));
     }
 

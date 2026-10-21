@@ -9,6 +9,11 @@ why the version moved the way it did.
 
 ### Added
 
+- `sshunnel`, `sshunnel-mux` and `sshunnel-relay` on crates.io, with `sshunnel` carrying both
+  relays inside, so `cargo install sshunnel` builds on stable with nothing else to fetch. Those
+  relays are built at publish time, so their hashes can differ from the GitHub release's.
+- `cargo binstall sshunnel` support: the GitHub release's client for x86_64 Linux and aarch64
+  macOS, a source build elsewhere.
 - `sshunnel forward -L [bind:]port:host:hostport <destination>`: TCP forwards through a relay
   that sshunnel pushes over the system `ssh`, caches on the remote by sha256, and execs. Like
   `ssh -L`, it listens on both loopbacks by default and outlives running out of descriptors.
@@ -51,3 +56,8 @@ why the version moved the way it did.
   (`sshunnel-netns:*`). `SSHUNNEL_NETNS=docker` forces the container. In CI, `tests/route_sudo.rs`
   also runs `route` as a user does, through the real sudo on a pseudo-terminal, and ends it with a
   Ctrl-C typed there.
+
+### Changed
+
+- Relays carry no build-machine paths: `cargo xtask relay` trims them, and refuses a relay that
+  still names a builder's directory.
