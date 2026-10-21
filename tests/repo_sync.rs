@@ -33,14 +33,17 @@ fn toolchain_is_pinned_only_in_rust_toolchain_toml() {
     }
 }
 
-/// Refs whose `action.yml` says `runs.using: node20` (GitHub forces Node 24 and annotates every run
-/// that uses one). Checked against each ref's `action.yml`; upload-artifact moved at v6 and
-/// download-artifact at v7.
-const NODE20_ACTIONS: [&str; 4] = [
+/// Refs that run on Node 20 (GitHub forces Node 24 and annotates every run that uses one). Checked
+/// against each ref's `action.yml`; upload-artifact moved at v6 and download-artifact at v7. A
+/// composite action is only as new as what it nests: codecov-action v5 is composite, but its OIDC
+/// step runs `actions/github-script` v7.0.1 (node20); v6 nests v8.0.0 (node24).
+const NODE20_ACTIONS: [&str; 6] = [
     "actions/upload-artifact@v4",
     "actions/upload-artifact@v5",
     "actions/download-artifact@v4",
+    "actions/download-artifact@v5",
     "actions/download-artifact@v6",
+    "codecov/codecov-action@v5",
 ];
 
 #[test]
@@ -48,7 +51,7 @@ fn workflows_use_no_node20_actions() {
     for file in &PINNABLE[..2] {
         let text = read(file);
         for action in NODE20_ACTIONS {
-            assert!(!text.contains(action), "{file} uses {action}, which runs on Node 20; move to a ref whose action.yml says node24");
+            assert!(!text.contains(action), "{file} uses {action}, which runs on Node 20 itself or in an action it nests");
         }
     }
 }
