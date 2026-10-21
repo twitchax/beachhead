@@ -251,31 +251,55 @@ mod unit {
     fn embed_dir_prefers_the_env_dir() {
         let manifest = manifest_with_relays();
         let env = manifest.path().join("elsewhere");
-        assert_eq!(build_embed::embed_dir(Some(env.clone()), manifest.path()), Some(env));
+        assert_eq!(build_embed::embed_dir(Some(env.clone()), manifest.path()), Ok(Some(build_embed::RelayDir::Env(env))));
     }
 
     #[test]
     fn embed_dir_reads_relays_in_a_package() {
         let manifest = manifest_with_relays();
-        assert_eq!(build_embed::embed_dir(None, manifest.path()), Some(manifest.path().join("relays")));
+        assert_eq!(build_embed::embed_dir(None, manifest.path()), Ok(Some(build_embed::RelayDir::Package(manifest.path().join("relays")))));
     }
 
     #[test]
     fn embed_dir_ignores_relays_in_a_checkout() {
         let checkout = manifest_with_relays();
         std::fs::create_dir(checkout.path().join(".git")).unwrap();
-        assert_eq!(build_embed::embed_dir(None, checkout.path()), None);
+        assert_eq!(build_embed::embed_dir(None, checkout.path()), Ok(None));
 
         // A worktree's `.git` is a file pointing at the main checkout's.
         let worktree = manifest_with_relays();
         std::fs::write(worktree.path().join(".git"), "gitdir: /elsewhere/.git/worktrees/w\n").unwrap();
-        assert_eq!(build_embed::embed_dir(None, worktree.path()), None);
+        assert_eq!(build_embed::embed_dir(None, worktree.path()), Ok(None));
     }
 
     #[test]
     fn embed_dir_is_none_without_relays() {
+        // A checkout: it has no `Cargo.toml.orig`, so it isn't a package missing its relays.
         let manifest = tempfile::tempdir().unwrap();
-        assert_eq!(build_embed::embed_dir(None, manifest.path()), None);
+        assert_eq!(build_embed::embed_dir(None, manifest.path()), Ok(None));
+    }
+
+    #[test]
+    fn embed_dir_refuses_a_package_without_relays() {
+        // Cargo writes `Cargo.toml.orig` into every .crate, so cargo's verify build of a publish lands here.
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(package.path().join("Cargo.toml.orig"), "[package]\n").unwrap();
+        let err = build_embed::embed_dir(None, package.path()).unwrap_err();
+        assert!(err.contains("cargo xtask package"), "{err}");
+
+        // The variable still wins.
+        let env = package.path().join("elsewhere");
+        assert_eq!(build_embed::embed_dir(Some(env.clone()), package.path()), Ok(Some(build_embed::RelayDir::Env(env))));
+    }
+
+    #[test]
+    fn an_unresolvable_env_dir_names_the_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let err = build_embed::RelayDir::Env(missing.clone()).canonicalize().unwrap_err();
+        assert!(err.contains(build_embed::DIR_VAR) && err.contains(missing.to_str().unwrap()), "{err}");
+        let err = build_embed::RelayDir::Package(missing).canonicalize().unwrap_err();
+        assert!(!err.contains(build_embed::DIR_VAR), "{err}");
     }
 
     /// `(name, bytes)` pairs as `build.rs` reads them, and their `SHA256SUMS` as `cargo xtask` writes it.
@@ -308,5 +332,22 @@ mod unit {
         let x86_only = sums.lines().find(|line| line.ends_with("x86_64")).unwrap();
         let err = build_embed::check_sums(x86_only, &relays).unwrap_err();
         assert!(err.contains("sshunnel-relay-aarch64"), "{err}");
+    }
+
+    #[test]
+    fn embedded_sums_reject_a_line_without_a_relay() {
+        let (mut relays, sums) = relays_and_sums();
+        relays.retain(|(name, _)| name.ends_with("x86_64"));
+        let err = build_embed::check_sums(&sums, &relays).unwrap_err();
+        assert!(err.contains("sshunnel-relay-aarch64"), "{err}");
+
+        // A directory whose relays are all gone still lists them.
+        let err = build_embed::check_sums(&sums, &[]).unwrap_err();
+        assert!(err.contains("sshunnel-relay-"), "{err}");
+
+        // Only relay lines need a file.
+        let (relays, mut sums) = relays_and_sums();
+        writeln!(sums, "{}  README.md", hex(&Sha256::digest(b"readme"))).unwrap();
+        assert_eq!(build_embed::check_sums(&sums, &relays), Ok(()));
     }
 }

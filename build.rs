@@ -2,17 +2,18 @@
 //! `SSHUNNEL_EMBED_RELAY_DIR` names (`cargo xtask dist` sets it to `target/relay`); the crate's own
 //! `relays/`, only when building from a package (`cargo xtask package` writes it, and a package
 //! has no `.git` beside its manifest); else none, and the client needs `--relay-dir`. A checkout
-//! never embeds its `relays/`, which goes stale with the next relay change. Every relay must match
-//! its directory's `SHA256SUMS`, or the build fails. The generated `embedded.rs` lists every
-//! `sshunnel-relay-*` file by name; the library maps names to arches, so this script needs no copy
-//! of that table.
+//! never embeds its `relays/`, which goes stale with the next relay change, and a package without
+//! one fails to build, so cargo won't publish it. Every relay must match its directory's
+//! `SHA256SUMS`, and every relay listed there must be present, or the build fails. The generated
+//! `embedded.rs` lists every `sshunnel-relay-*` file by name; the library maps names to arches, so
+//! this script needs no copy of that table.
 
 #[path = "build/embed.rs"]
 mod embed;
 
 use std::{env, error::Error, fmt::Write as _, fs, path::PathBuf};
 
-const DIR_VAR: &str = "SSHUNNEL_EMBED_RELAY_DIR";
+use embed::DIR_VAR;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-env-changed={DIR_VAR}");
@@ -21,14 +22,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("cargo sets CARGO_MANIFEST_DIR for build scripts")?);
 
     let mut entries = String::new();
-    if let Some(dir) = embed::embed_dir(env::var_os(DIR_VAR).map(PathBuf::from), &manifest_dir) {
+    if let Some(dir) = embed::embed_dir(env::var_os(DIR_VAR).map(PathBuf::from), &manifest_dir)? {
         // Only paths that exist get a rerun-if-changed: cargo treats a missing one as always stale.
-        let dir = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
+        let dir = dir.canonicalize()?;
         println!("cargo::rerun-if-changed={}", dir.display());
         let mut names: Vec<String> = fs::read_dir(&dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?
             .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter(|name| name.starts_with("sshunnel-relay-"))
+            .filter(|name| name.starts_with(embed::RELAY_PREFIX))
             .collect();
         names.sort();
 
@@ -39,8 +40,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             relays.push((name, bytes));
         }
-        if !relays.is_empty() {
-            let sums = dir.join("SHA256SUMS");
+        // Even with no relays: a SHA256SUMS that lists some means they went missing.
+        let sums = dir.join("SHA256SUMS");
+        if !relays.is_empty() || sums.exists() {
             let listed = fs::read_to_string(&sums).map_err(|e| format!("{}: {e}", sums.display()))?;
             println!("cargo::rerun-if-changed={}", sums.display());
             embed::check_sums(&listed, &relays).map_err(|e| format!("{}: {e}", dir.display()))?;

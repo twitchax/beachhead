@@ -15,7 +15,8 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   feature. The binary parses arguments and calls the library; everything testable lives in the
   library. `tests` is the shared fixture factory. `build.rs` embeds the relays in
   `SSHUNNEL_EMBED_RELAY_DIR`, else a package's own `relays/` (no `.git` beside the manifest), never a
-  checkout's, and fails on a relay its directory's `SHA256SUMS` doesn't match.
+  checkout's, and fails when its directory's `SHA256SUMS` and relays disagree either way. A package
+  (`Cargo.toml.orig` beside the manifest) with neither fails to build, so cargo won't publish it.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
   matching, refusals), `names` (the fake-address map), `router` (the per-connection decision,
   sharing the map), `stack` (the smoltcp netstack) with `dns` on it, `device` (the TUN fd as the
