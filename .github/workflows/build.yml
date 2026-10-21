@@ -137,7 +137,7 @@ jobs:
             echo "|---|---|"
             echo "| $(wc -c < "$f") | $(sha256sum "$f" | cut -d' ' -f1) |"
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sshunnel-relay-${{ matrix.arch }}
           path: target/relay/sshunnel-relay-${{ matrix.arch }}

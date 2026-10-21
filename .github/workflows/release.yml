@@ -33,7 +33,7 @@ jobs:
           rustflags: ""
       - run: cargo xtask relay --arch ${{ matrix.arch }}
       - run: target/relay/sshunnel-relay-${{ matrix.arch }} --probe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sshunnel-relay-${{ matrix.arch }}
           path: target/relay/sshunnel-relay-${{ matrix.arch }}
@@ -62,7 +62,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: sshunnel-relay-*
           path: target/relay
@@ -75,7 +75,7 @@ jobs:
           mkdir -p dist
           cd target/dist
           zip "$GITHUB_WORKSPACE/dist/sshunnel_${{ matrix.target }}.zip" sshunnel
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sshunnel_${{ matrix.target }}
           path: dist/*.zip
@@ -85,7 +85,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true

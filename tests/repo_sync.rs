@@ -33,6 +33,26 @@ fn toolchain_is_pinned_only_in_rust_toolchain_toml() {
     }
 }
 
+/// Refs whose `action.yml` says `runs.using: node20` (GitHub forces Node 24 and annotates every run
+/// that uses one). Checked against each ref's `action.yml`; upload-artifact moved at v6 and
+/// download-artifact at v7.
+const NODE20_ACTIONS: [&str; 4] = [
+    "actions/upload-artifact@v4",
+    "actions/upload-artifact@v5",
+    "actions/download-artifact@v4",
+    "actions/download-artifact@v6",
+];
+
+#[test]
+fn workflows_use_no_node20_actions() {
+    for file in &PINNABLE[..2] {
+        let text = read(file);
+        for action in NODE20_ACTIONS {
+            assert!(!text.contains(action), "{file} uses {action}, which runs on Node 20; move to a ref whose action.yml says node24");
+        }
+    }
+}
+
 #[test]
 fn dockerfile_cooks_dependencies_on_the_pinned_toolchain() {
     let dockerfile = read("Dockerfile");
