@@ -20,8 +20,9 @@ why the version moved the way it did.
 - `sshunnel-mux`: the wire protocol, with per-stream credit flow control that bounds memory at
   window × streams; each side announces its receive window in its `Hello`.
 - `sshunnel relays`: the arch, sha256 and size of each relay the client would execute.
-- `cargo xtask relay`, `dist` and `bench`: build the relays and `SHA256SUMS`, build a client with
-  them embedded, and compare throughput against `ssh -L`.
+- `cargo xtask relay`, `dist`, `package` and `bench`: build the relays and `SHA256SUMS`, build a
+  client with them embedded, package the crates with the relays inside (and build that client on
+  stable from the packages alone), and compare throughput against `ssh -L`.
 - `cargo xtask bench --route`: `sshunnel route` against `sshunnel forward -L`, one stream each way,
   with the client side in network namespaces (a privileged Docker container where Ubuntu restricts
   user namespaces), over 15 interleaved rounds by default. It fails when either direction's median

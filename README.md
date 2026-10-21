@@ -252,6 +252,7 @@ relays, which then needs `--relay-dir target/relay`.
 cargo make ci        # fmt-check + clippy (-D warnings) + nextest: the gate CI runs
 cargo make uat       # ci + the #[ignore]d slow suites
 cargo make codecov   # coverage.lcov
+cargo xtask package  # trimmed relays into relays/, package the workspace, build the packaged client on stable
 cargo xtask bench    # sshunnel -L against ssh -L through a throwaway sshd
 cargo xtask bench --route   # sshunnel route against sshunnel -L, from network namespaces
 ```

@@ -13,7 +13,9 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
 
 - `.` (`sshunnel`): the client library and a thin binary (`src/bin.rs`) behind the default `cli`
   feature. The binary parses arguments and calls the library; everything testable lives in the
-  library. `tests` is the shared fixture factory.
+  library. `tests` is the shared fixture factory. `build.rs` embeds the relays in
+  `SSHUNNEL_EMBED_RELAY_DIR`, else a package's own `relays/` (no `.git` beside the manifest), never a
+  checkout's, and fails on a relay its directory's `SHA256SUMS` doesn't match.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
   matching, refusals), `names` (the fake-address map), `router` (the per-connection decision,
   sharing the map), `stack` (the smoltcp netstack) with `dns` on it, `device` (the TUN fd as the
@@ -59,6 +61,7 @@ cargo make uat       # ci + the #[ignore]d slow suites: what PRD UATs point at
 cargo make codecov   # coverage.lcov
 cargo xtask relay    # static musl relays + SHA256SUMS into target/relay; paths trimmed, refuses a relay naming the builder's dirs
 cargo xtask dist     # release client with target/relay embedded, hashes checked
+cargo xtask package  # trimmed relays into relays/, package the workspace, build the packaged client on stable
 cargo xtask bench    # sshunnel -L vs ssh -L through a throwaway sshd (not part of ci)
 cargo xtask bench --route  # sshunnel route vs sshunnel -L from namespaces; 15 rounds, fails if a median is under 90%
 ```

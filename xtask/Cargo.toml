@@ -9,6 +9,8 @@ publish = false
 anyhow.workspace = true
 # The Arch table and relay hashing, shared with the client rather than copied.
 sshunnel = { workspace = true, features = ["testing"] }
+# `cargo xtask package` unpacks the crates outside the repository.
+tempfile = "3"
 
 [lints]
 workspace = true

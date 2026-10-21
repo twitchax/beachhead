@@ -172,6 +172,12 @@ mod embedded {
     include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 }
 
+// `build.rs`'s decisions, here so its tests run with the library's. At the top level: a `#[path]`
+// inside an inline module would resolve against that module's directory.
+#[cfg(test)]
+#[path = "../build/embed.rs"]
+mod build_embed;
+
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -231,5 +237,75 @@ mod unit {
         let one = Relay::new(Arch::X86_64, Bytes::from_static(b"1"));
         let two = Relay::new(Arch::X86_64, Bytes::from_static(b"2"));
         assert!(Relays::new(vec![one, two], Source::Embedded).is_err());
+    }
+
+    /// A manifest dir with a `relays/`, as `cargo xtask package` leaves one.
+    fn manifest_with_relays() -> tempfile::TempDir {
+        let manifest = tempfile::tempdir().unwrap();
+        std::fs::create_dir(manifest.path().join("relays")).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn embed_dir_prefers_the_env_dir() {
+        let manifest = manifest_with_relays();
+        let env = manifest.path().join("elsewhere");
+        assert_eq!(build_embed::embed_dir(Some(env.clone()), manifest.path()), Some(env));
+    }
+
+    #[test]
+    fn embed_dir_reads_relays_in_a_package() {
+        let manifest = manifest_with_relays();
+        assert_eq!(build_embed::embed_dir(None, manifest.path()), Some(manifest.path().join("relays")));
+    }
+
+    #[test]
+    fn embed_dir_ignores_relays_in_a_checkout() {
+        let checkout = manifest_with_relays();
+        std::fs::create_dir(checkout.path().join(".git")).unwrap();
+        assert_eq!(build_embed::embed_dir(None, checkout.path()), None);
+
+        // A worktree's `.git` is a file pointing at the main checkout's.
+        let worktree = manifest_with_relays();
+        std::fs::write(worktree.path().join(".git"), "gitdir: /elsewhere/.git/worktrees/w\n").unwrap();
+        assert_eq!(build_embed::embed_dir(None, worktree.path()), None);
+    }
+
+    #[test]
+    fn embed_dir_is_none_without_relays() {
+        let manifest = tempfile::tempdir().unwrap();
+        assert_eq!(build_embed::embed_dir(None, manifest.path()), None);
+    }
+
+    /// `(name, bytes)` pairs as `build.rs` reads them, and their `SHA256SUMS` as `cargo xtask` writes it.
+    fn relays_and_sums() -> (Vec<(String, Vec<u8>)>, String) {
+        let relays = vec![("sshunnel-relay-x86_64".to_owned(), b"x86".to_vec()), ("sshunnel-relay-aarch64".to_owned(), b"arm".to_vec())];
+        let mut sums = String::new();
+        for (name, bytes) in &relays {
+            writeln!(sums, "{}  {name}", hex(&Sha256::digest(bytes))).unwrap();
+        }
+        (relays, sums)
+    }
+
+    #[test]
+    fn embedded_sums_accept_a_matching_set() {
+        let (relays, sums) = relays_and_sums();
+        assert_eq!(build_embed::check_sums(&sums, &relays), Ok(()));
+    }
+
+    #[test]
+    fn embedded_sums_reject_a_changed_relay() {
+        let (mut relays, sums) = relays_and_sums();
+        relays[1].1 = b"tampered".to_vec();
+        let err = build_embed::check_sums(&sums, &relays).unwrap_err();
+        assert!(err.contains("sshunnel-relay-aarch64"), "{err}");
+    }
+
+    #[test]
+    fn embedded_sums_reject_a_relay_without_a_line() {
+        let (relays, sums) = relays_and_sums();
+        let x86_only = sums.lines().find(|line| line.ends_with("x86_64")).unwrap();
+        let err = build_embed::check_sums(x86_only, &relays).unwrap_err();
+        assert!(err.contains("sshunnel-relay-aarch64"), "{err}");
     }
 }

@@ -1,3 +1,5 @@
 /target
 # Coverage output from `cargo make codecov`.
 coverage.lcov
+# The relays `cargo xtask package` builds into the crate: generated, and packaged through `include`.
+/relays/

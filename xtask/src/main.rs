@@ -17,8 +17,16 @@ const USAGE: &str = "usage: cargo xtask <task>
 tasks:
   relay [--arch NAME]...   build static musl relays into target/relay and write SHA256SUMS
                            (every arch unless --arch narrows it)
-  dist [--target TRIPLE]   build the release client with target/relay embedded into target/dist;
-                           without --target, also check its `relays` output against SHA256SUMS
+  dist [--target TRIPLE]   write SHA256SUMS for target/relay and build the release client with
+                           those relays embedded into target/dist; without --target, also check
+                           its `relays` output against them
+  package                  ready the crates for crates.io and build them as an install would:
+                           - build every relay into relays/ with SHA256SUMS (the crate ships them)
+                           - `cargo package --workspace`
+                           - unpack the sshunnel and sshunnel-mux .crate files outside the repo
+                           - build that sshunnel on stable, offline, against the unpacked mux,
+                             into target/package-check
+                           - check its `relays` lists every relay as embedded
   bench [--mib N] [--runs N] [--route]
                            relay + dist, then compare `sshunnel forward -L` with `ssh -L` through
                            a throwaway non-root sshd (default 512 MiB per transfer, best of 3);
@@ -33,6 +41,10 @@ fn main() -> Result<()> {
     match task {
         "relay" => relay(&arches(rest)?),
         "dist" => dist(target(rest)?),
+        "package" => {
+            ensure!(rest.is_empty(), "unexpected arguments {rest:?}\n\n{USAGE}");
+            package()
+        }
         "bench" => {
             let options = bench_options(rest)?;
             let host = Arch::from_name(std::env::consts::ARCH).context("no relay arch for this host")?;
@@ -56,25 +68,35 @@ fn main() -> Result<()> {
     }
 }
 
-/// Builds each relay, checks it is static, and installs it under its arch's file name.
+/// Builds each relay into `target/relay`, with its SHA256SUMS.
 fn relay(arches: &[Arch]) -> Result<()> {
-    let out = target_dir().join("relay");
-    std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+    install_relays(arches, &target_dir().join("relay"))?;
+    Ok(())
+}
+
+/// Builds each relay, installs it in `out` under its arch's file name, and writes `out`'s SHA256SUMS.
+fn install_relays(arches: &[Arch], out: &Path) -> Result<Relays> {
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
     for &arch in arches {
         let built = build_relay(arch)?;
-        std::fs::copy(&built, out.join(arch.file_name())).with_context(|| format!("installing the {arch} relay"))?;
+        std::fs::copy(&built, out.join(arch.file_name())).with_context(|| format!("installing the {arch} relay in {}", out.display()))?;
     }
+    write_sums(out)
+}
 
-    // Hash whatever the dir now holds, so building one arch keeps the other's line.
-    let relays = Relays::from_dir(&out)?;
+/// Hashes every relay `dir` holds, not only the ones just built (so building one arch keeps the
+/// other's line), and writes its SHA256SUMS.
+fn write_sums(dir: &Path) -> Result<Relays> {
+    let relays = Relays::from_dir(dir)?;
     let mut sums = String::new();
     for relay in relays.iter() {
         writeln!(sums, "{}  {}", relay.sha256(), relay.arch().file_name())?;
         println!("{:<8} {:>8} bytes  sha256 {}", relay.arch().name(), relay.len(), relay.sha256());
     }
-    std::fs::write(out.join("SHA256SUMS"), sums).context("writing SHA256SUMS")?;
-    println!("wrote {}", out.display());
-    Ok(())
+    let path = dir.join("SHA256SUMS");
+    std::fs::write(&path, sums).with_context(|| format!("writing {}", path.display()))?;
+    println!("wrote {}", dir.display());
+    Ok(relays)
 }
 
 /// Builds one relay, checks it is static and names no builder directory, and returns its path.
@@ -125,7 +147,8 @@ fn builder_dirs() -> Vec<PathBuf> {
 /// Builds the release client with `target/relay` embedded and copies it to `target/dist`.
 fn dist(target: Option<&str>) -> Result<()> {
     let relay_dir = target_dir().join("relay");
-    let relays = Relays::from_dir(&relay_dir).context("no relays to embed: run `cargo xtask relay` first")?;
+    // `build.rs` checks the relays against their SHA256SUMS, and the release downloads them without one.
+    let relays = write_sums(&relay_dir).context("no relays to embed: run `cargo xtask relay` first")?;
     let mut build = cargo();
     build.args(["build", "--release", "-p", "sshunnel"]).env("SSHUNNEL_EMBED_RELAY_DIR", &relay_dir);
     if let Some(target) = target {
@@ -140,20 +163,98 @@ fn dist(target: Option<&str>) -> Result<()> {
     std::fs::copy(release.join("sshunnel"), &client).context("copying the client into target/dist")?;
 
     if target.is_none() {
-        let out = Command::new(&client).arg("relays").output().context("running the client's `relays`")?;
-        let listing = String::from_utf8(out.stdout).context("`relays` printed non-UTF-8")?;
-        if !out.status.success() || !listing.starts_with("relays (embedded)") {
-            bail!("the client didn't embed its relays:\n{listing}{}", String::from_utf8_lossy(&out.stderr));
-        }
-        for relay in relays.iter() {
-            if !listing.contains(relay.sha256()) {
-                bail!("the client's {} relay doesn't match target/relay:\n{listing}", relay.arch());
-            }
-        }
-        print!("{listing}");
+        print!("{}", check_embedded(&client, &relays)?);
     }
     println!("wrote {}", client.display());
     Ok(())
+}
+
+/// Runs `<client> relays`, checks it lists every one of `relays` as embedded, and returns the listing.
+fn check_embedded(client: &Path, relays: &Relays) -> Result<String> {
+    let out = Command::new(client).arg("relays").output().with_context(|| format!("running `{} relays`", client.display()))?;
+    let listing = String::from_utf8(out.stdout).context("`relays` printed non-UTF-8")?;
+    if !out.status.success() || !listing.starts_with("relays (embedded)") {
+        bail!("{} didn't embed its relays:\n{listing}{}", client.display(), String::from_utf8_lossy(&out.stderr));
+    }
+    for relay in relays.iter() {
+        if !listing.contains(relay.sha256()) {
+            bail!("{} doesn't embed the {} relay with sha256 {}:\n{listing}", client.display(), relay.arch(), relay.sha256());
+        }
+    }
+    Ok(listing)
+}
+
+/// Builds every relay into the crate's `relays/`, packages the workspace, then builds the packaged
+/// client as `cargo install` would (on stable, offline, from the .crate files alone) and checks it
+/// embeds them. `relays/` stays afterwards: the publish packages it again.
+fn package() -> Result<()> {
+    let relay_dir = root().join("relays");
+    remove_dir_if_present(&relay_dir)?;
+    let relays = install_relays(&Arch::ALL, &relay_dir)?;
+    if let Some(arch) = Arch::ALL.into_iter().find(|&arch| relays.get(arch).is_none()) {
+        bail!("{} has no {arch} relay", relay_dir.display());
+    }
+
+    // Cargo counts the gitignored relays the `include` list names as uncommitted changes.
+    cargo().args(["package", "--workspace", "--allow-dirty"]).status_ok()?;
+
+    // Outside the repository: under it, cargo takes the crate for a missing member of this workspace.
+    let scratch = tempfile::Builder::new().prefix("sshunnel-package-check-").tempdir().context("creating a scratch dir")?;
+    let mux = unpack("sshunnel-mux", scratch.path())?;
+    let client_crate = unpack("sshunnel", scratch.path())?;
+
+    // `rustup run stable` and none of the pinned toolchain's variables (xtask runs under it), so
+    // the packaged crate builds on stable exactly as an install's would.
+    let mux = mux.to_str().with_context(|| format!("{} is not UTF-8", mux.display()))?;
+    let build_dir = target_dir().join("package-check");
+    // Not `--locked`: the patch moves the packaged lockfile's mux entry from crates.io to the
+    // unpacked path, and that is the only line it changes.
+    Command::new("rustup")
+        .args(["run", "stable", "cargo", "build", "--release", "--offline"])
+        // Debug quotes the path and escapes `"` and `\` as a TOML basic string does.
+        .args(["--config", &format!("patch.crates-io.sshunnel-mux.path={mux:?}")])
+        .arg("--target-dir")
+        .arg(&build_dir)
+        .current_dir(&client_crate)
+        .env_remove("RUSTC")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("SSHUNNEL_EMBED_RELAY_DIR")
+        .status_ok()?;
+
+    print!("{}", check_embedded(&build_dir.join("release").join("sshunnel"), &relays)?);
+    Ok(())
+}
+
+/// Unpacks `cargo package`'s `<name>-<version>.crate` into `into`, returning the crate's directory.
+fn unpack(name: &str, into: &Path) -> Result<PathBuf> {
+    let unpacked = format!("{name}-{}", version(name)?);
+    let krate = target_dir().join("package").join(format!("{unpacked}.crate"));
+    Command::new("tar").arg("-xzf").arg(&krate).arg("-C").arg(into).status_ok()?;
+    Ok(into.join(unpacked))
+}
+
+/// The version of workspace package `name`, from `cargo pkgid`.
+fn version(name: &str) -> Result<String> {
+    let out = cargo().args(["pkgid", "-p", name]).output().with_context(|| format!("running `cargo pkgid -p {name}`"))?;
+    ensure!(out.status.success(), "`cargo pkgid -p {name}` failed: {}", String::from_utf8_lossy(&out.stderr));
+    let pkgid = String::from_utf8(out.stdout).context("`cargo pkgid` printed non-UTF-8")?;
+    pkgid_version(&pkgid).map(str::to_owned).with_context(|| format!("no version in {name}'s pkgid `{}`", pkgid.trim()))
+}
+
+/// The version a pkgid ends with: `path+file:///dir#0.1.0`, or `path+file:///dir#name@0.1.0` when
+/// the directory isn't named after the package.
+fn pkgid_version(pkgid: &str) -> Option<&str> {
+    let (_, spec) = pkgid.trim().rsplit_once('#')?;
+    Some(spec.rsplit_once('@').map_or(spec, |(_, version)| version))
+}
+
+fn remove_dir_if_present(dir: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("removing {}", dir.display())),
+        _ => Ok(()),
+    }
 }
 
 /// True when the ELF has no `PT_INTERP` header, i.e. it needs no dynamic loader. Static-pie
@@ -347,5 +448,60 @@ mod unit {
     fn builder_paths_skips_root_and_empty() {
         let dirs = [PathBuf::new(), PathBuf::from("/")];
         assert_eq!(builder_paths(b"/usr/lib/x.rs", &dirs), None);
+    }
+
+    #[test]
+    fn write_sums_lists_every_relay_in_the_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sshunnel-relay-x86_64"), b"abc").unwrap();
+        std::fs::write(dir.path().join("sshunnel-relay-aarch64"), b"arm").unwrap();
+
+        let relays = write_sums(dir.path()).unwrap();
+
+        assert_eq!(relays.iter().count(), 2);
+        let sums = std::fs::read_to_string(dir.path().join("SHA256SUMS")).unwrap();
+        let lines: Vec<&str> = sums.lines().collect();
+        assert_eq!(lines.len(), 2, "{sums}");
+        assert!(lines.contains(&"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  sshunnel-relay-x86_64"), "{sums}");
+        assert!(lines.iter().any(|line| line.ends_with("  sshunnel-relay-aarch64")), "{sums}");
+    }
+
+    /// A stand-in client whose `relays` prints `listing`.
+    #[cfg(unix)]
+    fn fake_client(dir: &Path, listing: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let client = dir.join("sshunnel");
+        std::fs::write(&client, format!("#!/bin/sh\n[ \"$1\" = relays ] || exit 2\ncat <<'EOF'\n{listing}EOF\n")).unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        client
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_embedded_wants_every_hash_listed_as_embedded() {
+        use sshunnel::relays::{Relay, Source};
+
+        let dir = tempfile::tempdir().unwrap();
+        let x86 = Relay::new(Arch::X86_64, b"x86".to_vec().into());
+        let arm = Relay::new(Arch::Aarch64, b"arm".to_vec().into());
+        let (x86_hash, arm_hash) = (x86.sha256().to_owned(), arm.sha256().to_owned());
+        let relays = Relays::new(vec![x86, arm], Source::Embedded).unwrap();
+
+        let both = format!("relays (embedded):\n  x86_64   sha256 {x86_hash}\n  aarch64  sha256 {arm_hash}\n");
+        assert_eq!(check_embedded(&fake_client(dir.path(), &both), &relays).unwrap(), both);
+
+        let one = format!("relays (embedded):\n  x86_64   sha256 {x86_hash}\n");
+        let err = check_embedded(&fake_client(dir.path(), &one), &relays).unwrap_err();
+        assert!(err.to_string().contains("aarch64"), "{err}");
+
+        let from_dir = format!("relays (target/relay):\n  x86_64   sha256 {x86_hash}\n  aarch64  sha256 {arm_hash}\n");
+        assert!(check_embedded(&fake_client(dir.path(), &from_dir), &relays).is_err());
+    }
+
+    #[test]
+    fn pkgid_version_reads_either_form() {
+        assert_eq!(pkgid_version("path+file:///work/sshunnel#0.1.0"), Some("0.1.0"));
+        assert_eq!(pkgid_version("path+file:///work/mux#sshunnel-mux@0.2.0\n"), Some("0.2.0"));
+        assert_eq!(pkgid_version("path+file:///work/sshunnel"), None);
     }
 }
