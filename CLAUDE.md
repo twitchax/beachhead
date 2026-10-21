@@ -67,6 +67,22 @@ cargo xtask bench    # sshunnel -L vs ssh -L through a throwaway sshd (not part 
 cargo xtask bench --route  # sshunnel route vs sshunnel -L from namespaces; 15 rounds, fails if a median is under 90%
 ```
 
+## Releasing
+
+`/ship-it` follows this section where its generic steps differ. All three crates publish to
+crates.io, `sshunnel`'s binary included (it's what `cargo install sshunnel` builds): `sshunnel-mux`,
+`sshunnel-relay` and `sshunnel`, from this machine, never from CI, with Aaron confirming each
+publish at the time. In order (`.prds/PRD-0005.md`'s Shipping section has the reasons):
+
+1. Tag `vX.Y.Z`, then push `main` and the tag. `release.yml` creates the GitHub release (clients,
+   relays, `SHA256SUMS`), in place of a `gh release create` by hand.
+2. `cargo xtask package` from the tagged tree: it rebuilds `relays/`, packages the crates, and
+   proves the stable build embeds both relays.
+3. `git status --porcelain` prints nothing.
+4. `cargo publish -p sshunnel-mux`, then `-p sshunnel-relay`, then `-p sshunnel --allow-dirty`.
+   Only `sshunnel` takes the flag: cargo refuses the gitignored `relays/` without it, and the flag
+   also drops cargo's own dirty-tree check, which step 3 replaces.
+
 ## Conventions
 
 - **Toolchain:** pinned in `rust-toolchain.toml` (a dated nightly). Nothing else
@@ -76,7 +92,8 @@ cargo xtask bench --route  # sshunnel route vs sshunnel -L from namespaces; 15 r
   for `too_many_*` or `needless_pass_by_value`: refactor instead.
 - **Errors:** `anyhow` through the `Res` / `Void` aliases, with `.context()` on every `?` that crosses an I/O or parse boundary.
 - **Tests:** unit tests in-module, integration and e2e in `tests/` (one subsystem per file, `e2e_*`
-  names for tests that spawn the binary), fixtures from the `tests` factory module, behind the `testing` feature, which the crate's self dev-dependency turns on for its own tests. Every
+  names for tests that spawn the binary), fixtures from the `tests` factory module, behind the
+  `testing` feature, which the crate's self dev-dependency turns on for its own tests. Every
   behavioral change ships a test. A test that needs a TUN device or routes opens with
   `if !netns("<its name>").unwrap() { return; }`: `tests::netns` runs it again as root over
   throwaway namespaces, in a privileged Docker container where Ubuntu restricts user namespaces
