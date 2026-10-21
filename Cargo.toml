@@ -36,11 +36,13 @@ categories = ["command-line-utilities", "network-programming"]
 # /build and /relays arrive with the embedded relays; the tests, PRDs, CI and xtask stay out of the package.
 include = ["/src/**", "/build.rs", "/build/**", "/relays/*", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
-# The release workflow zips the bare `sshunnel` binary at the zip's root.
+# The release workflow zips the bare `sshunnel` binary at the zip's root. Targets it doesn't build
+# compile from source: never a third party's build (QuickInstall) of a tool that pushes binaries.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/sshunnel_{ target }.zip"
 pkg-fmt = "zip"
 bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install"]
 
 [[bin]]
 name = "sshunnel"

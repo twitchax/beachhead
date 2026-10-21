@@ -112,4 +112,13 @@ fn binstall_matches_release_assets() {
 
     let targets = release.lines().filter(|line| line.trim().starts_with("- target: ")).count();
     assert!(targets >= 1, "release.yml's build matrix lists no targets");
+
+    // Off a release's targets binstall builds from source, never a third party's build of a tool
+    // that pushes binaries to remotes.
+    let disabled = section
+        .lines()
+        .take_while(|line| !line.starts_with('['))
+        .find_map(|line| line.trim().strip_prefix("disabled-strategies = "))
+        .unwrap_or_default();
+    assert!(disabled.contains("\"quick-install\""), "binstall must set disabled-strategies = [\"quick-install\"], not `{disabled}`");
 }

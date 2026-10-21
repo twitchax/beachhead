@@ -248,7 +248,7 @@ cargo binstall sshunnel
 ```
 
 This fetches the GitHub release's client for x86_64 Linux and aarch64 macOS, and builds from source
-anywhere else.
+anywhere else, never fetching a third party's build.
 
 Each GitHub release also carries the client zips (`sshunnel_<target>.zip`), the relays and their
 `SHA256SUMS`.
