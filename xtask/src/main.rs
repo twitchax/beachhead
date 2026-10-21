@@ -22,7 +22,7 @@ tasks:
                            its `relays` output against them
   package                  ready the crates for crates.io and build them as an install would:
                            - build every relay into relays/ with SHA256SUMS (the crate ships them)
-                           - `cargo package --workspace`
+                           - `cargo package --workspace` (all but xtask)
                            - unpack the sshunnel and sshunnel-mux .crate files outside the repo
                            - build that sshunnel on stable, offline, against the unpacked mux,
                              into target/package-check
@@ -195,8 +195,9 @@ fn package() -> Result<()> {
         bail!("{} has no {arch} relay", relay_dir.display());
     }
 
-    // Cargo counts the gitignored relays the `include` list names as uncommitted changes.
-    cargo().args(["package", "--workspace", "--allow-dirty"]).status_ok()?;
+    // Cargo counts the gitignored relays the `include` list names as uncommitted changes. xtask is
+    // `publish = false`, so packaging it would only cost a verify build.
+    cargo().args(["package", "--workspace", "--exclude", "xtask", "--allow-dirty"]).status_ok()?;
 
     // Outside the repository: under it, cargo takes the crate for a missing member of this workspace.
     let scratch = tempfile::Builder::new().prefix("sshunnel-package-check-").tempdir().context("creating a scratch dir")?;
