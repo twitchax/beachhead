@@ -6,6 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["ssh", "multiplexer", "tunnel", "protocol"]
+categories = ["network-programming"]
+include = ["/src/**", "/README.md", "/LICENSE"]
 
 [dependencies]
 anyhow.workspace = true

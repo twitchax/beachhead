@@ -82,3 +82,31 @@ fn dockerfile_cooks_dependencies_on_the_pinned_toolchain() {
     let cook = dockerfile.find("cargo chef cook").expect("Dockerfile cooks dependencies with cargo-chef");
     assert!(copy < cook, "copy rust-toolchain.toml before `cargo chef cook`, or the dependency layer builds on the wrong toolchain");
 }
+
+/// The zip name in `release.yml`'s `Zip the binary` step and the `build` job's matrix targets are
+/// text-scraped (no YAML dependency); binstall's `pkg-url` must name exactly that zip.
+#[test]
+fn binstall_matches_release_assets() {
+    let manifest = read("Cargo.toml");
+    let section = manifest.split("[package.metadata.binstall]").nth(1).expect("Cargo.toml has [package.metadata.binstall]");
+    let pkg_url = section
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pkg-url = "))
+        .expect("binstall sets pkg-url")
+        .trim_matches('"');
+
+    let release = read(".github/workflows/release.yml");
+    let zip_line = release
+        .lines()
+        .skip_while(|line| !line.contains("name: Zip the binary"))
+        .find(|line| line.contains("zip \""))
+        .expect("release.yml has a `Zip the binary` step that runs zip");
+    let zip_name = zip_line.split('/').next_back().and_then(|rest| rest.split('"').next()).expect("the zip command names its output");
+    assert_eq!(zip_name, "sshunnel_${{ matrix.target }}.zip", "release.yml zips under another name");
+
+    assert!(pkg_url.ends_with("/sshunnel_{ target }.zip"), "pkg-url `{pkg_url}` doesn't name the release's zip");
+    assert!(pkg_url.contains("/releases/download/v{ version }/"), "pkg-url `{pkg_url}` isn't under the v{{ version }} release");
+
+    let targets = release.lines().filter(|line| line.trim().starts_with("- target: ")).count();
+    assert!(targets >= 1, "release.yml's build matrix lists no targets");
+}

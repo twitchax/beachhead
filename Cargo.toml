@@ -31,8 +31,16 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-keywords = []
-categories = []
+keywords = ["ssh", "vpn", "tunnel", "proxy", "networking"]
+categories = ["command-line-utilities", "network-programming"]
+# /build and /relays arrive with the embedded relays; the tests, PRDs, CI and xtask stay out of the package.
+include = ["/src/**", "/build.rs", "/build/**", "/relays/*", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+
+# The release workflow zips the bare `sshunnel` binary at the zip's root.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/sshunnel_{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
 
 [[bin]]
 name = "sshunnel"

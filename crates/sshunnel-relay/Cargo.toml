@@ -6,6 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["ssh", "tunnel", "relay"]
+categories = ["network-programming", "command-line-utilities"]
+include = ["/src/**", "/README.md", "/LICENSE"]
 
 # No clap and no tracing-subscriber: every dependency here crosses the SSH session on a cache miss.
 [dependencies]
