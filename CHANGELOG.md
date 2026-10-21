@@ -7,6 +7,11 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-21
+
+The first release, at 0.1.0 rather than 1.0.0 because the command line and the wire protocol can
+still change while UDP and ICMP routing is built.
+
 ### Added
 
 - `sshunnel`, `sshunnel-mux` and `sshunnel-relay` on crates.io, with `sshunnel` carrying both
