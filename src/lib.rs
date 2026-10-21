@@ -12,5 +12,6 @@ pub mod forward;
 pub mod relays;
 pub mod route;
 pub mod session;
+#[cfg(feature = "testing")]
 pub mod tests;
 pub mod tunnel;

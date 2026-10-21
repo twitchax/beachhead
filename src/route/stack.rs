@@ -555,7 +555,8 @@ impl Engine {
         }
     }
 
-    /// Opens a connection from `port` to `to`.
+    /// Opens a connection from `port` to `to`. Only the test factory's app side dials in.
+    #[cfg(feature = "testing")]
     pub(crate) fn connect(&mut self, to: SocketAddr, port: u16) -> Option<SocketHandle> {
         let mut socket = Self::socket();
         socket.connect(self.iface.context(), to, port).ok()?;

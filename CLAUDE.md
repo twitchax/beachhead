@@ -72,7 +72,7 @@ cargo xtask bench --route  # sshunnel route vs sshunnel -L from namespaces; 15 r
   for `too_many_*` or `needless_pass_by_value`: refactor instead.
 - **Errors:** `anyhow` through the `Res` / `Void` aliases, with `.context()` on every `?` that crosses an I/O or parse boundary.
 - **Tests:** unit tests in-module, integration and e2e in `tests/` (one subsystem per file, `e2e_*`
-  names for tests that spawn the binary), fixtures from the `tests` factory module. Every
+  names for tests that spawn the binary), fixtures from the `tests` factory module, behind the `testing` feature, which the crate's self dev-dependency turns on for its own tests. Every
   behavioral change ships a test. A test that needs a TUN device or routes opens with
   `if !netns("<its name>").unwrap() { return; }`: `tests::netns` runs it again as root over
   throwaway namespaces, in a privileged Docker container where Ubuntu restricts user namespaces

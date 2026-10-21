@@ -54,6 +54,25 @@ fn workflows_use_no_node20_actions() {
 }
 
 #[test]
+fn fixtures_are_behind_the_testing_feature() {
+    let lib: Vec<String> = read("src/lib.rs").lines().map(str::to_owned).collect();
+    let at = lib.iter().position(|line| line.trim() == "pub mod tests;").expect("src/lib.rs declares `pub mod tests;`");
+    assert!(
+        at > 0 && lib[at - 1] == "#[cfg(feature = \"testing\")]",
+        "`pub mod tests;` must sit directly under #[cfg(feature = \"testing\")]"
+    );
+
+    let manifest = read("Cargo.toml");
+    let features = manifest.split("[features]").nth(1).expect("Cargo.toml has a [features] table");
+    let default = features
+        .lines()
+        .take_while(|line| !line.starts_with('['))
+        .find(|line| line.starts_with("default"))
+        .expect("[features] sets default");
+    assert!(!default.contains("testing"), "`testing` must stay out of the default features: {default}");
+}
+
+#[test]
 fn dockerfile_cooks_dependencies_on_the_pinned_toolchain() {
     let dockerfile = read("Dockerfile");
     if dockerfile.is_empty() {

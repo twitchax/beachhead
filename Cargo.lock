@@ -585,6 +585,7 @@ dependencies = [
  "shlex",
  "simple-dns",
  "smoltcp",
+ "sshunnel",
  "sshunnel-mux",
  "tempfile",
  "tokio",
