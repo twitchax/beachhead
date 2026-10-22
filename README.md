@@ -6,7 +6,7 @@
 
 A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 
-> **Status: milestone 2 done.** sshunnel forwards TCP ports (the way `ssh -L` does) and UDP
+> **Status: milestone 3 done.** sshunnel forwards TCP ports (the way `ssh -L` does) and UDP
 > ports and, on Linux, routes TCP, UDP and ping to subnets and domain names over a TUN device
 > (`sshunnel route`), through a relay it installs on the remote by itself.
 
@@ -274,8 +274,8 @@ in the [PRD log](.prds/PRD-0004.log.md).
 - A UDP forward has no ICMP to pass on: when the remote reports a closed port or an unreachable
   host, the flow just ends, and the local sender hears nothing.
 - `route` carries TCP, UDP and ping; any other ICMP to a routed address gets ICMP administratively
-  prohibited, and so do ping when the remote doesn't allow unprivileged ping and UDP to an address
-  nothing routes. One `route` runs at a time.
+  prohibited, and so do UDP to an address nothing routes and, when the remote doesn't allow
+  unprivileged ping, ping itself. One `route` runs at a time.
 - Apps that resolve names themselves bypass domain patterns: a browser using DNS over HTTPS never
   asks the system resolver. CIDR targets still catch their traffic.
 - Fake addresses only mean something while `route` runs. Answers carry a 5-second TTL, so a cached

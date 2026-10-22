@@ -62,6 +62,9 @@ why the version moved the way it did.
 - A published package refuses to build with relays from a commit other than its own.
 - `Forward` gains `proto` (a public field, `Proto::Tcp` unless the spec ends in `/udp`) and
   `bind_udp`; `bind` refuses a UDP forward, and `bind_udp` a TCP one.
+- For library users: `route::dns::Server::new` takes a `fake_v6` argument,
+  `route::helper::Reply::Ready` carries a `fake_v6` field, and the relay's `serve` takes the
+  capabilities it reports in `Hello`. `Tunnel` gains flows and queries.
 
 ## [0.1.0] - 2026-10-21
 

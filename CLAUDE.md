@@ -29,9 +29,9 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
   matching, refusals), `names` (the fake-address map), `reverse` (the fake ranges' reverse names
   and zones), `router` (the per-connection decision, sharing the map), `stack` (the smoltcp
-  netstack) with `dns` and `datagrams` (routed UDP's and echo's flows) on it, `device` (the TUN fd as the stack's packets), `peers` and `system` (what the
-  machine depends on, and the commands and syscalls behind it), `helper` (the root side, run as the
-  hidden `sshunnel helper` through sudo), `thread` (the netstack's own thread: `device`, `stack` and
+  netstack) with `dns` and `datagrams` (routed UDP's and echo's flows) on it, `device` (the TUN fd
+  as the stack's packets), `peers` and `system` (what the machine depends on, and the commands and
+  syscalls behind it), `helper` (the root side, run as the hidden `sshunnel helper` through sudo), `thread` (the netstack's own thread: `device`, `stack` and
   `dns` on a runtime of their own), and `lifecycle`, which runs them in the spec's order and, on
   every exit path, joins the netstack's thread and then stops the helper.
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
@@ -66,8 +66,8 @@ resolvectl from a fixed `PATH`, and at teardown deletes the device itself while 
 it (any fd's holder can make the device persistent, so the last fd closing proves nothing). It and
 `route::system` (the system calls behind it) are Linux only. In product code, the two TUN ioctls
 (`route::system`: creating the device, clearing its persist flag), registering the device's fd with
-tokio (`route::device`; tokio offers no safe way) and the relay's `getaddrinfo` and `setrlimit` are the only
-`unsafe`, each block with a `// SAFETY:` comment.
+tokio (`route::device`; tokio offers no safe way) and the relay's `getaddrinfo` and `setrlimit` are
+the only `unsafe`, each block with a `// SAFETY:` comment.
 
 ## Commands
 
