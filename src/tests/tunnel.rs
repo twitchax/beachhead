@@ -184,8 +184,8 @@ impl FakeTunnel {
         Gate(gate)
     }
 
-    /// UDP flow opens of `host:port` succeed with a flow the relay ends at once, as it ends one on
-    /// a socket error it doesn't report.
+    /// UDP flow opens of `host:port` succeed with a flow the relay ends at once, as it ends one
+    /// whose socket fails every time.
     pub fn udp_hangup(&self, host: &str, port: u16) {
         self.script().udp.insert((host.to_owned(), port), UdpDial::Hangup);
     }
@@ -410,11 +410,11 @@ pub struct FakeEnded {
 }
 
 /// A [`FakeFlow::Udp`]: socket errors become flow errors as the relay maps them
-/// ([`FlowErrKind::from_io`]); any other error ends the flow, as it ends the relay's.
+/// ([`FlowErrKind::from_io`]); any other error loses its datagram and the flow lives on, as the
+/// relay's does.
 pub struct FakeUdp {
     link: Arc<UdpLink>,
     buf: Box<[u8]>,
-    ended: bool,
     _live: Live,
 }
 
@@ -466,7 +466,6 @@ impl FakeFlow {
                 wake: Notify::new(),
             }),
             buf: vec![0; 65_535].into_boxed_slice(),
-            ended: false,
             _live: Live::new(live),
         }))
     }
@@ -495,9 +494,6 @@ impl Flow for FakeFlow {
             Self::Ended(_) => return None,
         };
         loop {
-            if udp.ended {
-                return None;
-            }
             let failed = udp.link.failed().take();
             let read = if let Some(e) = failed {
                 Err(e)
@@ -509,10 +505,11 @@ impl Flow for FakeFlow {
             };
             match read {
                 Ok(n) => return Some(FlowEvent::Datagram(Bytes::copy_from_slice(&udp.buf[..n]))),
-                Err(e) => match FlowErrKind::from_io(&e) {
-                    Some(kind) => return Some(FlowEvent::Error(kind)),
-                    None => udp.ended = true,
-                },
+                Err(e) => {
+                    if let Some(kind) = FlowErrKind::from_io(&e) {
+                        return Some(FlowEvent::Error(kind));
+                    }
+                }
             }
         }
     }

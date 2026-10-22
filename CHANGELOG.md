@@ -14,7 +14,9 @@ why the version moved the way it did.
   what doesn't fit rather than stall the pipe, and each end's writer serves the flows round-robin,
   taking turns with stream data.
 - The relay serves UDP flows: a connected socket per flow, datagrams both ways, and socket errors
-  (port unreachable and the like) reported as flow errors.
+  (port unreachable and the like) reported as flow errors. Any other socket error (a path MTU
+  lowered by ICMP, an egress firewall's `EPERM`) loses only its datagram: the flow and its source
+  port live on, unless 64 come in a row with nothing getting through.
 - The relay answers raw DNS queries from its own `/etc/resolv.conf`, and reports in its `Hello`
   whether it may ping over IPv4 and IPv6.
 - UDP forwards: `sshunnel forward -L [bind:]port:host:hostport/udp`. Each local sender gets a flow

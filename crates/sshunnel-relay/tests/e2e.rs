@@ -205,6 +205,37 @@ async fn e2e_stdio_reports_a_closed_udp_port_as_a_flow_error() {
     }
 }
 
+/// Over IPv4's 65 507-byte limit, so a send of it to an IPv4 address fails with EMSGSIZE, as a send
+/// past a path's MTU does once ICMP has lowered it.
+const OVERSIZED: usize = 65_520;
+
+#[tokio::test]
+async fn e2e_stdio_drops_a_udp_datagram_its_socket_refuses_and_the_flow_lives_on() {
+    let port = udp_echo().await;
+    let (mux, _child) = connect().await;
+    let mut flow = timeout(Duration::from_secs(30), mux.open_udp("127.0.0.1", port)).await.unwrap().unwrap();
+    let sender = flow.sender();
+    assert!(sender.try_send(Bytes::from(vec![0; OVERSIZED])));
+    let after = Bytes::from_static(b"after");
+    assert!(sender.try_send(after.clone()));
+    assert_eq!(next_event(&mut flow).await, FlowEvent::Datagram(after));
+}
+
+#[tokio::test]
+async fn e2e_stdio_drops_an_echo_request_its_socket_refuses_and_the_flow_lives_on() {
+    if !sshunnel_relay::ping::probe().ping4 {
+        eprintln!("skipped: this machine may not open ping sockets");
+        return;
+    }
+    let (mux, _child) = connect().await;
+    let mut flow = timeout(Duration::from_secs(30), mux.open_echo("127.0.0.1")).await.unwrap().unwrap();
+    let sender = flow.sender();
+    assert!(sender.try_send(Bytes::from(vec![0; OVERSIZED])));
+    let after = Bytes::from_static(&[0, 8, b'y']);
+    assert!(sender.try_send(after.clone()));
+    assert_eq!(next_event(&mut flow).await, FlowEvent::Datagram(after));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_stdio_opens_tcp_by_name_through_the_lookup_path() {
     let port = echo_server().await;

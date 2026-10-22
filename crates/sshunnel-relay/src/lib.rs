@@ -236,46 +236,79 @@ where
     I: Fn(&[u8]) -> Option<Bytes>,
 {
     let sender = flow.sender();
+    let mut errors = SocketErrors::default();
     // A datagram can be 65 535 bytes; untouched pages of this buffer cost nothing.
     let mut buf = vec![0u8; 65_535];
     loop {
-        tokio::select! {
+        let result = tokio::select! {
             event = flow.recv() => match event {
-                Some(FlowEvent::Datagram(datagram)) => {
-                    if let Some(packet) = outbound(&datagram)
-                        && let Err(e) = socket.send(&packet).await
-                        && !report(&sender, &e)
-                    {
-                        return;
-                    }
-                }
+                Some(FlowEvent::Datagram(datagram)) => match outbound(&datagram) {
+                    Some(packet) => socket.send(&packet).await.map(drop),
+                    None => continue,
+                },
                 // The relay's end has no use for the peer's errors.
-                Some(FlowEvent::Error(_)) => {}
+                Some(FlowEvent::Error(_)) => continue,
                 None => return,
             },
-            read = socket.recv(&mut buf) => match read {
-                Ok(n) => {
-                    // A full queue drops the datagram: UDP may lose it, and the relay mustn't wait.
-                    if let Some(datagram) = inbound(&buf[..n]) {
-                        sender.try_send(datagram);
-                    }
+            read = socket.recv(&mut buf) => read.map(|n| {
+                // A full queue drops the datagram: UDP may lose it, and the relay mustn't wait.
+                if let Some(datagram) = inbound(&buf[..n]) {
+                    sender.try_send(datagram);
                 }
-                Err(e) => {
-                    if !report(&sender, &e) {
-                        return;
-                    }
-                }
+            }),
+        };
+        match result {
+            Ok(()) => errors.succeeded(),
+            Err(e) => match errors.failed(&e) {
+                OnError::Report(kind) => sender.report(kind),
+                // What failed is lost, as UDP may lose any datagram.
+                OnError::Drop => {}
+                OnError::End => return,
             },
         }
     }
 }
 
-/// Tells the client about a socket error it can act on; `false` when the error ends the flow.
-fn report(sender: &sshunnel_mux::FlowSender, e: &std::io::Error) -> bool {
-    FlowErrKind::from_io(e).is_some_and(|kind| {
-        sender.report(kind);
-        true
-    })
+/// Socket errors in a row, with no send or receive working between them, that a flow outlives
+/// unreported. Linux clears a socket's pending error once a call returns it, so a run this long
+/// means the socket fails every time.
+const MAX_UNREPORTED: u32 = 64;
+
+/// What a flow does about a socket error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnError {
+    /// Tells the client, which can act on it, and carries on.
+    Report(FlowErrKind),
+    /// Carries on without the datagram.
+    Drop,
+    /// Ends the flow.
+    End,
+}
+
+/// A flow's run of socket errors the client can't be told about. One of those (`EMSGSIZE` once
+/// ICMP lowers the path's MTU, `EPERM` from the remote's egress firewall) loses only its datagram:
+/// ending the flow would lose the app's next datagrams too and move its remote source port. The
+/// relay has no log to note the loss in, since its stderr is the user's terminal.
+#[derive(Default)]
+struct SocketErrors {
+    unreported: u32,
+}
+
+impl SocketErrors {
+    /// A send or receive worked: the socket isn't failing for good.
+    fn succeeded(&mut self) {
+        self.unreported = 0;
+    }
+
+    /// What to do about `e`: report it if the client can act on it, else drop the datagram, until
+    /// [`MAX_UNREPORTED`] such errors in a row end the flow.
+    fn failed(&mut self, e: &std::io::Error) -> OnError {
+        if let Some(kind) = FlowErrKind::from_io(e) {
+            return OnError::Report(kind);
+        }
+        self.unreported += 1;
+        if self.unreported > MAX_UNREPORTED { OnError::End } else { OnError::Drop }
+    }
 }
 
 /// A UDP socket connected to the first address that accepts one, on the unspecified address of
@@ -417,6 +450,32 @@ mod unit {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn a_flow_outlives_a_run_of_unreported_socket_errors_up_to_the_cap() {
+        let mut errors = SocketErrors::default();
+        let unreported = || Error::from_raw_os_error(libc::EMSGSIZE);
+        for _ in 0..MAX_UNREPORTED {
+            assert_eq!(errors.failed(&unreported()), OnError::Drop);
+        }
+        // An error the client is told about neither counts nor breaks the run.
+        assert_eq!(errors.failed(&Error::from(ErrorKind::ConnectionRefused)), OnError::Report(FlowErrKind::PortUnreachable));
+        assert_eq!(errors.failed(&unreported()), OnError::End);
+    }
+
+    #[test]
+    fn a_working_send_or_receive_restarts_the_run() {
+        let mut errors = SocketErrors::default();
+        let unreported = || Error::from_raw_os_error(libc::EPERM);
+        for _ in 0..MAX_UNREPORTED {
+            assert_eq!(errors.failed(&unreported()), OnError::Drop);
+        }
+        errors.succeeded();
+        for _ in 0..MAX_UNREPORTED {
+            assert_eq!(errors.failed(&unreported()), OnError::Drop);
+        }
+        assert_eq!(errors.failed(&unreported()), OnError::End);
+    }
 
     #[test]
     fn connect_errors_map_to_kinds() {

@@ -408,6 +408,24 @@ pub fn udp_echo_on(socket: UdpSocket) -> Res<SocketAddr> {
     Ok(addr)
 }
 
+/// A loopback UDP server that answers every datagram with the address it came from, so a test sees
+/// which socket sent it; returns its address.
+///
+/// # Errors
+///
+/// Fails when no loopback port can be bound.
+pub async fn udp_peer_server() -> Res<SocketAddr> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.context("binding the peer server")?;
+    let addr = socket.local_addr().context("reading the peer server's address")?;
+    tokio::spawn(async move {
+        let mut buf = [0; 64];
+        while let Ok((_, from)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(from.to_string().as_bytes(), from).await;
+        }
+    });
+    Ok(addr)
+}
+
 /// A loopback UDP server that answers anything with `stale`, so a reply through it shows; returns
 /// its address.
 ///

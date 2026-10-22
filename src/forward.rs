@@ -612,6 +612,24 @@ mod unit {
         eventually(|| tunnel.flows().len() == 2).await;
     }
 
+    #[tokio::test]
+    async fn udp_a_flow_the_relay_ended_reopens_on_the_next_datagram() {
+        let tunnel = FakeTunnel::new();
+        tunnel.udp_hangup("dns.corp.example", 53);
+        let forwards = UdpForwards::new(tunnel.clone());
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        app.connect(listener.local_addr().unwrap()).await.unwrap();
+        tokio::spawn(forwards.clone().serve(listener, Arc::from("dns.corp.example"), 53));
+
+        app.send(b"one").await.unwrap();
+        eventually(|| tunnel.flows().len() == 1 && tunnel.live_flows() == 0 && forwards.len() == 0).await;
+        // Its entry went with it, so the sender's next datagram opens a fresh flow rather than
+        // feeding the dead one.
+        app.send(b"two").await.unwrap();
+        eventually(|| tunnel.flows().len() == 2).await;
+    }
+
     /// Review Focus 1: an open whose flow idles out first is cancelled with it, so opens in flight
     /// stay within the table's cap and can't take a newer flow's place, and the sender's next
     /// datagram opens a fresh flow. (The generation check in `open` covers only an open already

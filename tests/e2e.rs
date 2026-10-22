@@ -18,7 +18,7 @@ use sshunnel::{
     arch::Arch,
     forward::Forward,
     relays::Relays,
-    tests::{FakeRemote, echo_server, host_arch, pattern, relay_dir, udp_echo_server},
+    tests::{FakeRemote, echo_server, host_arch, pattern, relay_dir, udp_echo_server, udp_peer_server},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -308,38 +308,25 @@ async fn e2e_forward_udp_replies_leave_through_the_senders_listener() {
     }
 }
 
-/// A flow the relay ends leaves no dead entry behind: the sender's next datagram opens a fresh one.
+/// A datagram the relay's socket refuses is dropped and the flow lives on: the remote sees the
+/// sender's next datagram come from the same relay port.
 #[tokio::test]
-async fn e2e_forward_udp_reopens_a_flow_the_relay_ended() {
+async fn e2e_forward_udp_drops_a_datagram_the_relay_cannot_send_and_keeps_the_flow() {
     if std::net::UdpSocket::bind("[::1]:0").is_err() {
         return assert!(std::env::var_os("CI").is_none(), "CI runners have an IPv6 loopback");
     }
     let dir = TempDir::new().unwrap();
-    let echo = udp_echo_server().await.unwrap();
-    let target = format!("127.0.0.1:{}/udp", echo.port());
+    let server = udp_peer_server().await.unwrap();
+    let target = format!("127.0.0.1:{}/udp", server.port());
     let (_child, _, mut stderr) = start_forwards(sshunnel(&dir), &dir, &[&format!("0:{target}")]).await;
     let socket = udp_to("[::1]:0", &listening_on(&mut stderr, "[::1]:", &target).await).await;
-    assert_eq!(udp_exchange(&socket, b"before", Duration::from_secs(10)).await, b"before");
+    let before = udp_exchange(&socket, b"before", Duration::from_secs(10)).await;
 
     // IPv6 carries this datagram to the listener, but it's over IPv4's 65 507-byte limit, so the
-    // relay's send to the echo fails (EMSGSIZE) and the relay ends the flow.
+    // relay's send to the server fails (EMSGSIZE), as a send past a path's lowered MTU does.
     socket.send(&pattern(5, 65_520)).await.unwrap();
-    // A datagram that beats the flow's end to the client is lost with the flow: keep asking.
-    let reopened = async {
-        let mut buf = [0; 16];
-        loop {
-            socket.send(b"after").await.unwrap();
-            if let Ok(Ok(n)) = timeout(Duration::from_millis(200), socket.recv(&mut buf)).await
-                && &buf[..n] == b"after"
-            {
-                return;
-            }
-        }
-    };
-    let stderr = stderr.borrow().join("\n");
-    timeout(Duration::from_secs(10), reopened)
-        .await
-        .unwrap_or_else(|_| panic!("the sender never got a fresh flow; stderr:\n{stderr}"));
+    let after = udp_exchange(&socket, b"after", Duration::from_secs(10)).await;
+    assert_eq!(String::from_utf8_lossy(&after), String::from_utf8_lossy(&before), "the relay's source port moved");
 }
 
 /// Floods `to` with 1 200-byte datagrams in a tight loop until dropped, reading and discarding the
