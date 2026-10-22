@@ -55,7 +55,7 @@ resolvectl from a fixed `PATH`, and at teardown deletes the device itself while 
 it (any fd's holder can make the device persistent, so the last fd closing proves nothing). It and
 `route::system` (the system calls behind it) are Linux only. In product code, the two TUN ioctls
 (`route::system`: creating the device, clearing its persist flag), registering the device's fd with
-tokio (`route::device`; tokio offers no safe way) and the relay's `getaddrinfo` are the only
+tokio (`route::device`; tokio offers no safe way) and the relay's `getaddrinfo` and `setrlimit` are the only
 `unsafe`, each block with a `// SAFETY:` comment.
 
 ## Commands

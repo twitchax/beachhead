@@ -9,15 +9,15 @@ use std::{process::Stdio, time::Duration};
 use bytes::{Bytes, BytesMut};
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
-    Config, Mux, Role,
-    frame::Capabilities,
+    Config, Flow, FlowEvent, Mux, Role,
+    frame::{Capabilities, FlowErrKind, OpenErrKind},
     frame::{ResolveErrKind, Transport},
     hello::{recv_hello, send_hello},
     pump, start,
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _, duplex, split},
-    net::TcpListener,
+    net::{TcpListener, UdpSocket},
     process::{Child, Command},
     time::timeout,
 };
@@ -128,10 +128,117 @@ async fn e2e_stdio_answers_a_resolve() {
 #[tokio::test]
 async fn e2e_stdio_refuses_flows_and_queries_it_does_not_serve_yet() {
     let (mux, _child) = connect().await;
-    let err = timeout(Duration::from_secs(30), mux.open_udp("127.0.0.1", 9)).await.unwrap().unwrap_err();
-    assert_eq!(err.kind, sshunnel_mux::frame::OpenErrKind::Other, "{err}");
+    let err = timeout(Duration::from_secs(30), mux.open_echo("127.0.0.1")).await.unwrap().unwrap_err();
+    assert_eq!(err.kind, OpenErrKind::Other, "{err}");
     let err = timeout(Duration::from_secs(30), mux.query(Bytes::from_static(b"q"), Transport::Udp)).await.unwrap().unwrap_err();
     assert_eq!(err.reason, "not answered");
+}
+
+/// A loopback UDP echo; returns its port.
+async fn udp_echo() -> u16 {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+            socket.send_to(&buf[..n], from).await.unwrap();
+        }
+    });
+    port
+}
+
+async fn next_event(flow: &mut Flow) -> FlowEvent {
+    timeout(Duration::from_secs(30), flow.recv()).await.expect("an event in time").expect("the flow is open")
+}
+
+#[tokio::test]
+async fn e2e_stdio_carries_udp_both_ways() {
+    let port = udp_echo().await;
+    let (mux, _child) = connect().await;
+    let mut flow = timeout(Duration::from_secs(30), mux.open_udp("127.0.0.1", port)).await.unwrap().unwrap();
+    let sender = flow.sender();
+    for i in 0..5u8 {
+        let datagram = Bytes::from(vec![i; 100 + usize::from(i)]);
+        assert!(sender.try_send(datagram.clone()));
+        assert_eq!(next_event(&mut flow).await, FlowEvent::Datagram(datagram));
+    }
+}
+
+#[tokio::test]
+async fn e2e_stdio_reports_a_closed_udp_port_as_a_flow_error() {
+    let port = {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.local_addr().unwrap().port()
+    };
+    let (mux, _child) = connect().await;
+    let mut flow = timeout(Duration::from_secs(30), mux.open_udp("127.0.0.1", port)).await.unwrap().unwrap();
+    let sender = flow.sender();
+    // The flow outlives its errors: the second send is answered the same way.
+    for _ in 0..2 {
+        assert!(sender.try_send(Bytes::from_static(b"anyone?")));
+        assert_eq!(next_event(&mut flow).await, FlowEvent::Error(FlowErrKind::PortUnreachable));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_stdio_opens_tcp_by_name_through_the_lookup_path() {
+    let port = echo_server().await;
+    let (mux, _child) = connect().await;
+    let stream = timeout(Duration::from_secs(30), mux.open("localhost", port)).await.unwrap().unwrap();
+    let (near, far) = duplex(1024);
+    tokio::spawn(pump(stream, near));
+    let (mut r, mut w) = split(far);
+    w.write_all(b"by name").await.unwrap();
+    let mut reply = [0u8; 7];
+    timeout(Duration::from_secs(30), r.read_exact(&mut reply)).await.unwrap().unwrap();
+    assert_eq!(&reply, b"by name");
+}
+
+#[tokio::test]
+async fn e2e_stdio_a_udp_open_out_of_descriptors_is_an_open_err() {
+    let port = udp_echo().await;
+    // `ulimit -n` lowers the soft and hard limits together, so the relay's raise cannot undo it.
+    let mut child = Command::new("sh")
+        .args(["-c", "ulimit -n 32 && exec \"$0\" --stdio", env!("CARGO_BIN_EXE_sshunnel-relay")])
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = BytesMut::new();
+    let hello = recv_hello(&mut stdout, &mut buf).await.unwrap();
+    send_hello(&mut stdin, Config::default().window(), Capabilities::default()).await.unwrap();
+    let (mux, _incoming, driver) = start(stdout, buf, stdin, Role::Client, Config::default(), hello);
+    tokio::spawn(driver);
+
+    let mut open = Vec::new();
+    let mut refused = 0;
+    for _ in 0..64 {
+        match timeout(Duration::from_secs(30), mux.open_udp("127.0.0.1", port)).await.unwrap() {
+            Ok(flow) => open.push(flow),
+            Err(e) => {
+                assert_eq!(e.kind, OpenErrKind::Other, "{e}");
+                refused += 1;
+            }
+        }
+    }
+    assert!(!open.is_empty() && refused > 0, "{} open, {refused} refused", open.len());
+    drop(open);
+    // The relay closes a flow's socket once it sees the client's end; retry while it does.
+    let mut reopened = None;
+    for _ in 0..50 {
+        match timeout(Duration::from_secs(30), mux.open_udp("127.0.0.1", port)).await.unwrap() {
+            Ok(flow) => {
+                reopened = Some(flow);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    assert!(reopened.is_some(), "descriptors never came back");
 }
 
 #[tokio::test]

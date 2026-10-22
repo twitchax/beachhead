@@ -13,9 +13,13 @@ why the version moved the way it did.
   capabilities in its `Hello`. Each flow queues at most 32 datagrams (64 KiB) each way and drops
   what doesn't fit rather than stall the pipe, and each end's writer serves the flows round-robin,
   taking turns with stream data.
+- The relay serves UDP flows: a connected socket per flow, datagrams both ways, and socket errors
+  (port unreachable and the like) reported as flow errors.
 
 ### Changed
 
+- The relay resolves every open through its bounded lookup path, and raises its open-file limit to
+  the hard limit.
 - A published package refuses to build with relays from a commit other than its own.
 
 ## [0.1.0] - 2026-10-21
