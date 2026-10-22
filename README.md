@@ -6,9 +6,9 @@
 
 A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 
-> **Status: milestone 2 done.** sshunnel forwards TCP ports (the way `ssh -L` does) and, on
-> Linux, routes subnets and domain names over a TUN device (`sshunnel route`), through a relay it
-> installs on the remote by itself. UDP and ICMP come later.
+> **Status: milestone 2 done.** sshunnel forwards TCP ports (the way `ssh -L` does) and UDP
+> ports and, on Linux, routes subnets and domain names over a TUN device (`sshunnel route`),
+> through a relay it installs on the remote by itself. UDP and ICMP through `route` come later.
 
 ## Why
 
@@ -68,9 +68,26 @@ sshunnel: forwarding [::1]:8080 -> server.lan:80
 The relay resolves and dials `server.lan` on the remote, so names that only exist inside that
 network work. `-L` repeats, and every connection rides the one SSH session.
 
+A `/udp` suffix forwards UDP instead (`/tcp`, the default, may be written too):
+
+```text
+$ sshunnel forward -L 5353:dns.corp.example:53/udp server
+sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
+sshunnel: forwarding 127.0.0.1:5353 -> dns.corp.example:53/udp
+sshunnel: forwarding [::1]:5353 -> dns.corp.example:53/udp
+```
+
+Each local sender (an address and port) gets a flow of its own: its first datagram opens a UDP
+socket on the remote, connected to `dns.corp.example:53`, and replies come back to it from the port
+it sent to. A flow idles out after 30 s without traffic, or 120 s once it has carried more than one
+reply (conntrack's timeouts), and a session holds at most 4096 flows across its UDP forwards,
+closing the least recently used to open another. Each flow queues at most 32 datagrams (64 KiB)
+each way and drops what doesn't fit, so a flood on one flow stalls neither another flow nor TCP on
+the same session.
+
 ```text
 $ sshunnel forward --help
-Forward local TCP ports through a relay on DESTINATION, like `ssh -L`
+Forward local TCP and UDP ports through a relay on DESTINATION, like `ssh -L`
 
 Usage: sshunnel forward [OPTIONS] --local <SPEC> <DESTINATION>
 
@@ -78,7 +95,7 @@ Arguments:
   <DESTINATION>  Where to run the relay, exactly as you'd pass it to ssh (config aliases work)
 
 Options:
-  -L, --local <SPEC>       `[bind_address:]port:host:hostport`. The relay resolves and dials host; the bind address defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port
+  -L, --local <SPEC>       `[bind_address:]port:host:hostport[/udp]`. The relay resolves and dials host; the bind address defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port. With `/udp`, each local sender gets a flow of its own
       --ssh-cmd <COMMAND>  The ssh program and its leading arguments, split like a shell would [env: SSHUNNEL_SSH=] [default: ssh]
       --relay-dir <DIR>    Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay) [env: SSHUNNEL_RELAY_DIR=]
   -h, --help               Print help
@@ -219,6 +236,8 @@ in the [PRD log](.prds/PRD-0004.log.md).
   don't.
 - The memfd fallback is defeated by `vm.memfd_noexec=2` (Linux 6.3+).
 - There are no reverse (`-R`) forwards yet, and a dropped session isn't re-established.
+- A UDP forward has no ICMP to pass on: when the remote reports a closed port or an unreachable
+  host, the flow just ends, and the local sender hears nothing.
 - `route` carries TCP only; UDP and ICMP to a routed address get ICMP administratively prohibited.
   One `route` runs at a time.
 - Apps that resolve names themselves bypass domain patterns: a browser using DNS over HTTPS never

@@ -18,6 +18,10 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   checkout's, and fails when its directory's `SHA256SUMS` and relays disagree either way, or when a
   package's `relays/COMMIT` isn't the commit cargo packaged. A package
   (`Cargo.toml.orig` beside the manifest) with neither fails to build, so cargo won't publish it.
+- `src/forward.rs`: `sshunnel forward`, on every platform (no Linux-only API). TCP pumps a stream
+  per connection; `UdpForwards` keeps one flow table across the session's UDP listeners, a flow per
+  local sender. Its listeners never wait (a full queue drops), and each entry's generation keeps an
+  open that finishes late from taking a newer flow's place.
 - `src/flows.rs`: the flow table `forward`'s UDP and `route`'s UDP and echo share (conntrack's
   timeouts, a 4096 cap, LRU eviction). Plain data: no locks, no awaits.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,

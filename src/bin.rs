@@ -10,14 +10,17 @@ use std::{io::IsTerminal as _, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand};
-use tokio::task::JoinSet;
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    task::JoinSet,
+};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(target_os = "linux")]
 use sshunnel::route;
 use sshunnel::{
     base::{Res, Void},
-    forward::{self, Forward},
+    forward::{self, Forward, Proto, UdpForwards},
     relays::Relays,
     session::{Session, SshCommand},
 };
@@ -32,10 +35,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Forward local TCP ports through a relay on DESTINATION, like `ssh -L`.
+    /// Forward local TCP and UDP ports through a relay on DESTINATION, like `ssh -L`.
     Forward {
-        /// `[bind_address:]port:host:hostport`. The relay resolves and dials host; the bind address
-        /// defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port.
+        /// `[bind_address:]port:host:hostport[/udp]`. The relay resolves and dials host; the bind
+        /// address defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port. With
+        /// `/udp`, each local sender gets a flow of its own.
         #[arg(short = 'L', long = "local", value_name = "SPEC", required = true)]
         forwards: Vec<Forward>,
         #[command(flatten)]
@@ -161,22 +165,49 @@ fn print_relays(relays: &Relays) {
     }
 }
 
+/// One spec's local sockets.
+enum Listeners {
+    Tcp(Vec<TcpListener>),
+    Udp(Vec<UdpSocket>),
+}
+
 async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, relays: &Relays) -> Void {
     // Bind first, so a port no address can take fails before ssh runs.
     let mut listeners = Vec::with_capacity(forwards.len());
     for spec in forwards {
-        listeners.push(spec.bind().await?);
+        listeners.push(match spec.proto {
+            Proto::Tcp => Listeners::Tcp(spec.bind().await?),
+            Proto::Udp => Listeners::Udp(spec.bind_udp().await?),
+        });
     }
 
     let session = Session::connect(ssh, destination, relays).await?;
     eprintln!("sshunnel: {}", session.describe());
 
+    // One flow table for every UDP listener, so the cap is the session's.
+    let udp = UdpForwards::new(session.mux().clone());
     let mut serving = JoinSet::new();
+    serving.spawn(udp.clone().sweep());
     for (spec, bound) in forwards.iter().zip(listeners) {
         let host: Arc<str> = Arc::from(spec.host.as_str());
-        for listener in bound {
-            eprintln!("sshunnel: forwarding {} -> {}:{}", listener.local_addr().context("reading a listener's address")?, spec.host, spec.port);
-            serving.spawn(forward::serve(session.mux().clone(), listener, Arc::clone(&host), spec.port));
+        match bound {
+            Listeners::Tcp(bound) => {
+                for listener in bound {
+                    eprintln!("sshunnel: forwarding {} -> {}:{}", listener.local_addr().context("reading a listener's address")?, spec.host, spec.port);
+                    serving.spawn(forward::serve(session.mux().clone(), listener, Arc::clone(&host), spec.port));
+                }
+            }
+            Listeners::Udp(bound) => {
+                for socket in bound {
+                    eprintln!(
+                        "sshunnel: forwarding {} -> {}:{}/udp",
+                        socket.local_addr().context("reading a listener's address")?,
+                        spec.host,
+                        spec.port
+                    );
+                    serving.spawn(udp.clone().serve(socket, Arc::clone(&host), spec.port));
+                }
+            }
         }
     }
     tokio::select! {

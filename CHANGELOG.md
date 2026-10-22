@@ -17,12 +17,18 @@ why the version moved the way it did.
   (port unreachable and the like) reported as flow errors.
 - The relay answers raw DNS queries from its own `/etc/resolv.conf`, and reports in its `Hello`
   whether it may ping over IPv4 and IPv6.
+- UDP forwards: `sshunnel forward -L [bind:]port:host:hostport/udp`. Each local sender gets a flow
+  of its own, opened by its first datagram and answered from the port it sent to; flows idle out
+  after 30 s (120 s once they've carried more than one reply), and a session holds at most 4096,
+  closing the least recently used to open another.
 
 ### Changed
 
 - The relay resolves every open through its bounded lookup path, and raises its open-file limit to
   the hard limit.
 - A published package refuses to build with relays from a commit other than its own.
+- `Forward` gains `proto` (a public field, `Proto::Tcp` unless the spec ends in `/udp`) and
+  `bind_udp`; `bind` refuses a UDP forward, and `bind_udp` a TCP one.
 
 ## [0.1.0] - 2026-10-21
 

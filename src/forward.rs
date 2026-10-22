@@ -1,22 +1,47 @@
-//! Local TCP forwards, `ssh -L` style: listen locally, open a stream through the relay for each
-//! connection, and pump it.
+//! Local forwards, `ssh -L` style: listen locally; for TCP, open a stream through the relay for
+//! each connection and pump it; for UDP, open a flow for each local sender and carry its datagrams
+//! both ways.
 
 use std::{
+    future::Future,
     io::ErrorKind,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
-use anyhow::{Context as _, anyhow, bail};
-use sshunnel_mux::base::{Err, Res, Void};
-use tokio::net::TcpListener;
+use anyhow::{Context as _, anyhow, bail, ensure};
+use bytes::Bytes;
+use sshunnel_mux::{
+    FLOW_QUEUE, FLOW_QUEUE_BYTES, FlowEvent,
+    base::{Err, Res, Void},
+};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    sync::Notify,
+    task::AbortHandle,
+    time::Instant,
+};
 use tracing::{debug, warn};
 
-use crate::tunnel::{Conn as _, Tunnel};
+use crate::{
+    flows::FlowTable,
+    tunnel::{Conn as _, Flow, FlowSender as _, Tunnel},
+};
 
-/// One `-L [bind_address:]port:host:hostport` spec.
+/// What a forward carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Proto {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// One `-L [bind_address:]port:host:hostport[/udp]` spec.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Forward {
     /// Where to listen locally; `localhost` (each family's loopback) unless the spec names one.
@@ -27,17 +52,26 @@ pub struct Forward {
     pub host: String,
     /// The port the relay dials.
     pub port: u16,
+    /// What the forward carries.
+    pub proto: Proto,
 }
 
 impl FromStr for Forward {
     type Err = Err;
 
     fn from_str(spec: &str) -> Res<Self> {
-        let parts = split_outside_brackets(spec);
+        // Docker's suffix: no address or host has a `/` in it.
+        let (body, proto) = match spec.split_once('/') {
+            None => (spec, Proto::Tcp),
+            Some((body, "tcp")) => (body, Proto::Tcp),
+            Some((body, "udp")) => (body, Proto::Udp),
+            Some((_, suffix)) => bail!("`{spec}` ends in `/{suffix}`, not /tcp or /udp"),
+        };
+        let parts = split_outside_brackets(body);
         let (bind, bind_port, host, port) = match parts.as_slice() {
             [bind_port, host, port] => ("localhost", *bind_port, *host, *port),
             [bind, bind_port, host, port] => (*bind, *bind_port, *host, *port),
-            _ => bail!("`{spec}` is not [bind_address:]port:host:hostport"),
+            _ => bail!("`{spec}` is not [bind_address:]port:host:hostport[/udp]"),
         };
         let port_of = |s: &str| s.parse::<u16>().map_err(|e| anyhow!("`{s}` in `{spec}` is not a port: {e}"));
         let unbracket = |s: &str| s.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(s).to_owned();
@@ -50,13 +84,18 @@ impl FromStr for Forward {
             bind_port: port_of(bind_port)?,
             host,
             port: port_of(port)?,
+            proto,
         })
     }
 }
 
 impl std::fmt::Display for Forward {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{} -> {}:{}", self.bind, self.bind_port, self.host, self.port)
+        write!(f, "{}:{} -> {}:{}", self.bind, self.bind_port, self.host, self.port)?;
+        match self.proto {
+            Proto::Tcp => Ok(()),
+            Proto::Udp => f.write_str("/udp"),
+        }
     }
 }
 
@@ -87,8 +126,23 @@ impl Forward {
     ///
     /// # Errors
     ///
-    /// Fails when the name doesn't resolve or no address binds.
+    /// Fails for a UDP forward, or when the name doesn't resolve or no address binds.
     pub async fn bind(&self) -> Res<Vec<TcpListener>> {
+        ensure!(self.proto == Proto::Tcp, "`{self}` is a UDP forward");
+        self.listen().await
+    }
+
+    /// Binds the local UDP sockets, one per address and all on one port, by [`Self::bind`]'s rules.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a TCP forward, or when the name doesn't resolve or no address binds.
+    pub async fn bind_udp(&self) -> Res<Vec<UdpSocket>> {
+        ensure!(self.proto == Proto::Udp, "`{self}` is a TCP forward");
+        self.listen().await
+    }
+
+    async fn listen<S: Listen>(&self) -> Res<Vec<S>> {
         let addrs: Vec<SocketAddr> = if self.bind.eq_ignore_ascii_case("localhost") {
             vec![(Ipv4Addr::LOCALHOST, self.bind_port).into(), (Ipv6Addr::LOCALHOST, self.bind_port).into()]
         } else {
@@ -97,14 +151,14 @@ impl Forward {
                 .with_context(|| format!("resolving {}", self.bind))?
                 .collect()
         };
-        let mut listeners: Vec<TcpListener> = Vec::with_capacity(addrs.len());
+        let mut listeners: Vec<S> = Vec::with_capacity(addrs.len());
         let mut failed = None;
         for mut addr in addrs {
             // Port 0 picks a free port once; every other address shares it.
             if let Some(first) = listeners.first() {
                 addr.set_port(first.local_addr().context("reading a listener's address")?.port());
             }
-            match TcpListener::bind(addr).await {
+            match S::bind(addr).await {
                 Ok(listener) => listeners.push(listener),
                 Err(e) => {
                     // A port taken on one family is worth a word, since a client may well reach
@@ -124,6 +178,32 @@ impl Forward {
             _ if listeners.is_empty() => bail!("{} resolves to no address", self.bind),
             _ => Ok(listeners),
         }
+    }
+}
+
+/// What a forward listens with, bound alike whatever it carries.
+trait Listen: Sized {
+    fn bind(addr: SocketAddr) -> impl Future<Output = std::io::Result<Self>> + Send;
+    fn local_addr(&self) -> std::io::Result<SocketAddr>;
+}
+
+impl Listen for TcpListener {
+    fn bind(addr: SocketAddr) -> impl Future<Output = std::io::Result<Self>> + Send {
+        Self::bind(addr)
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        Self::local_addr(self)
+    }
+}
+
+impl Listen for UdpSocket {
+    fn bind(addr: SocketAddr) -> impl Future<Output = std::io::Result<Self>> + Send {
+        Self::bind(addr)
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        Self::local_addr(self)
     }
 }
 
@@ -170,6 +250,241 @@ pub async fn serve<T: Tunnel>(tunnel: T, listener: TcpListener, host: Arc<str>, 
     }
 }
 
+/// A UDP forward's flow: the listener a datagram came in on, and the local sender it came from.
+type FlowKey = (SocketAddr, SocketAddr);
+
+/// The sending half of a tunnel's flows.
+type SenderOf<T> = <<T as Tunnel>::Flow as Flow>::Sender;
+
+/// The session's UDP forwards: one flow table across every UDP listener, keyed by (listener
+/// address, sender address), so the cap counts every flow the session holds.
+#[derive(Clone)]
+pub struct UdpForwards<T: Tunnel> {
+    tunnel: T,
+    shared: Arc<Shared<SenderOf<T>>>,
+}
+
+struct Shared<S> {
+    table: Mutex<FlowTable<FlowKey, Entry<S>>>,
+    /// Tells an entry from earlier ones under its key, so an open that finishes after its entry
+    /// went can't take a newer entry's place.
+    generations: AtomicU64,
+    /// Wakes the sweep for a new flow, whose deadline may come first.
+    added: Notify,
+}
+
+struct Entry<S> {
+    generation: u64,
+    state: State<S>,
+}
+
+enum State<S> {
+    /// The relay hasn't answered yet: the sender's datagrams wait here.
+    Opening(Held),
+    /// Datagrams go straight to the flow, and a task carries its replies back.
+    Open { sender: S, _replies: ReplyTask },
+}
+
+/// Datagrams waiting for their flow to open, bounded as a flow's own queue is.
+#[derive(Default)]
+struct Held {
+    datagrams: Vec<Bytes>,
+    bytes: usize,
+}
+
+impl Held {
+    /// Holds `datagram`, or drops it when the hold is full. An empty hold takes one of any size.
+    fn push(&mut self, datagram: Bytes) {
+        let over_bytes = !self.datagrams.is_empty() && self.bytes + datagram.len() > FLOW_QUEUE_BYTES;
+        if self.datagrams.len() < FLOW_QUEUE && !over_bytes {
+            self.bytes += datagram.len();
+            self.datagrams.push(datagram);
+        }
+    }
+}
+
+/// A flow's reply task, aborted when its entry goes: that drops the flow, which resets it.
+struct ReplyTask(AbortHandle);
+
+impl Drop for ReplyTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T: Tunnel> UdpForwards<T> {
+    #[must_use]
+    pub fn new(tunnel: T) -> Self {
+        Self {
+            tunnel,
+            shared: Arc::new(Shared {
+                table: Mutex::new(FlowTable::new()),
+                generations: AtomicU64::new(0),
+                added: Notify::new(),
+            }),
+        }
+    }
+
+    fn table(&self) -> MutexGuard<'_, FlowTable<FlowKey, Entry<SenderOf<T>>>> {
+        self.shared.table.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Carries datagrams between `socket`, one of the session's UDP listeners, and `host:port`
+    /// on the remote. Each local sender is a flow, opened by its first datagram; its replies go
+    /// back to it from `socket`.
+    ///
+    /// # Errors
+    ///
+    /// Fails only when `socket` has no address. Like [`serve`], it outlives a failed receive by
+    /// logging it and retrying after a backoff, and a failed open is logged and its datagrams
+    /// dropped.
+    pub async fn serve(self, socket: UdpSocket, host: Arc<str>, port: u16) -> Void {
+        let listener = socket.local_addr().context("reading a UDP listener's address")?;
+        let socket = Arc::new(socket);
+        // A datagram can be 65 535 bytes; untouched pages of this buffer cost nothing.
+        let mut buf = vec![0u8; 65_535];
+        let mut backoff = MIN_BACKOFF;
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, sender)) => {
+                    backoff = MIN_BACKOFF;
+                    self.datagram(&socket, (listener, sender), Bytes::copy_from_slice(&buf[..n]), &host, port);
+                }
+                Err(e) => {
+                    warn!("receiving on {listener}: {e}; retrying in {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
+
+    /// Idles flows out at the table's deadline, for as long as the session runs. An idle flow
+    /// resets as it drops.
+    ///
+    /// # Errors
+    ///
+    /// None: it runs until dropped.
+    pub async fn sweep(self) -> Void {
+        loop {
+            let added = self.shared.added.notified();
+            let deadline = self.table().deadline();
+            match deadline {
+                Some(deadline) => tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => {
+                        // A deadline that passed may since have moved later: nothing expires.
+                        let idle = self.table().expire(Instant::now());
+                        if !idle.is_empty() {
+                            debug!(flows = idle.len(), "idled out");
+                        }
+                    }
+                    () = added => {}
+                },
+                None => added.await,
+            }
+        }
+    }
+
+    /// Sends `key`'s datagram on: through its open flow, into the hold of one still opening, or
+    /// opening a flow for it. Never waits: a full queue or hold drops it.
+    fn datagram(&self, socket: &Arc<UdpSocket>, key: FlowKey, datagram: Bytes, host: &Arc<str>, port: u16) {
+        let now = Instant::now();
+        let mut table = self.table();
+        if let Some(entry) = table.get_mut(&key) {
+            match &mut entry.state {
+                State::Opening(held) => held.push(datagram),
+                State::Open { sender, .. } => {
+                    sender.try_send(datagram);
+                    table.sent(&key, now);
+                }
+            }
+            return;
+        }
+        let generation = self.shared.generations.fetch_add(1, Ordering::Relaxed);
+        let mut held = Held::default();
+        held.push(datagram);
+        let evicted = table.insert(key, Entry { generation, state: State::Opening(held) }, now);
+        drop(table);
+        // The least recently used flow, at the cap: it resets as it drops, outside the lock.
+        drop(evicted);
+        self.shared.added.notify_one();
+        tokio::spawn(self.clone().open(Arc::clone(socket), key, generation, Arc::clone(host), port));
+    }
+
+    /// Opens `key`'s flow and, when its entry is still the one that asked, sends what it holds
+    /// and starts carrying replies.
+    async fn open(self, socket: Arc<UdpSocket>, key: FlowKey, generation: u64, host: Arc<str>, port: u16) {
+        let opened = self.tunnel.open_udp(&host, port).await;
+        let mut table = self.table();
+        // Its entry may have idled out or been evicted meanwhile, and its sender may have opened
+        // another since. The flow drops either way, which resets it.
+        let Some(entry) = table.get_mut(&key).filter(|entry| entry.generation == generation) else {
+            return;
+        };
+        match opened {
+            Ok(flow) => {
+                let State::Opening(held) = &mut entry.state else { return };
+                let held = std::mem::take(&mut held.datagrams);
+                let sender = flow.sender();
+                for datagram in held {
+                    sender.try_send(datagram);
+                }
+                let replies = tokio::spawn(self.clone().replies(flow, socket, key, generation));
+                entry.state = State::Open {
+                    sender,
+                    _replies: ReplyTask(replies.abort_handle()),
+                };
+                table.sent(&key, Instant::now());
+            }
+            Err(e) => {
+                table.remove(&key);
+                drop(table);
+                warn!(sender = %key.1, "{e:#}");
+            }
+        }
+    }
+
+    /// Carries `flow`'s replies to `key`'s sender, from the listener it sent to, until the flow
+    /// ends. Its entry goes with it, so the sender's next datagram opens a fresh flow.
+    async fn replies(self, mut flow: T::Flow, socket: Arc<UdpSocket>, key: FlowKey, generation: u64) {
+        let (listener, sender) = key;
+        loop {
+            match flow.recv().await {
+                Some(FlowEvent::Datagram(datagram)) => {
+                    if let Err(e) = socket.send_to(&datagram, sender).await {
+                        debug!(%listener, %sender, "replying: {e}");
+                    }
+                    let mut table = self.table();
+                    if table.get_mut(&key).is_some_and(|entry| entry.generation == generation) {
+                        table.replied(&key, Instant::now());
+                    }
+                }
+                // User space has no ICMP to tell a local sender with, so the flow just ends.
+                Some(FlowEvent::Error(kind)) => {
+                    debug!(%listener, %sender, "the flow failed: {kind:?}");
+                    break;
+                }
+                None => {
+                    debug!(%listener, %sender, "the relay ended the flow");
+                    break;
+                }
+            }
+        }
+        let ended = {
+            let mut table = self.table();
+            let current = table.get_mut(&key).is_some_and(|entry| entry.generation == generation);
+            current.then(|| table.remove(&key))
+        };
+        // Its reply task is this one, which is finishing anyway.
+        drop(ended);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.table().len()
+    }
+}
+
 #[cfg(test)]
 mod unit {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -177,6 +492,7 @@ mod unit {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::tests::{self, FakeTunnel};
 
     fn fwd(bind: &str, bind_port: u16, host: &str, port: u16) -> Forward {
         Forward {
@@ -184,6 +500,14 @@ mod unit {
             bind_port,
             host: host.to_owned(),
             port,
+            proto: Proto::Tcp,
+        }
+    }
+
+    fn udp(bind: &str, bind_port: u16, host: &str, port: u16) -> Forward {
+        Forward {
+            proto: Proto::Udp,
+            ..fwd(bind, bind_port, host, port)
         }
     }
 
@@ -239,5 +563,137 @@ mod unit {
         for spec in ["8080", "8080:host", "a:b:c:d:e", "x:host:80", "8080:host:99999", "8080::80", ":8080:host:80"] {
             assert!(spec.parse::<Forward>().is_err(), "{spec} parsed");
         }
+    }
+
+    #[test]
+    fn udp_specs_parse_with_a_suffix() {
+        assert_eq!("5353:dns.corp.example:53/udp".parse::<Forward>().unwrap(), udp("localhost", 5353, "dns.corp.example", 53));
+        assert_eq!("8080:server.lan:80/tcp".parse::<Forward>().unwrap(), fwd("localhost", 8080, "server.lan", 80));
+        assert_eq!("[::1]:5353:[fd99::5]:53/udp".parse::<Forward>().unwrap(), udp("::1", 5353, "fd99::5", 53));
+    }
+
+    #[test]
+    fn bad_suffixes_are_rejected() {
+        for suffix in ["/sctp", "/", "/UDP", "/udp/udp"] {
+            let err = format!("8080:server.lan:80{suffix}").parse::<Forward>().unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("`{suffix}`")), "{suffix}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn a_udp_spec_displays_its_suffix() {
+        assert_eq!(udp("localhost", 5353, "dns.corp.example", 53).to_string(), "localhost:5353 -> dns.corp.example:53/udp");
+        assert_eq!(fwd("localhost", 8080, "server.lan", 80).to_string(), "localhost:8080 -> server.lan:80");
+    }
+
+    #[tokio::test]
+    async fn bind_udp_listens_on_each_loopback_on_one_port() {
+        let sockets = "0:h:1/udp".parse::<Forward>().unwrap().bind_udp().await.unwrap();
+        let port = sockets[0].local_addr().unwrap().port();
+        let mut want = vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))];
+        if has_ipv6_loopback() {
+            want.push((Ipv6Addr::LOCALHOST, port).into());
+        }
+        assert_eq!(sockets.iter().map(|s| s.local_addr().unwrap()).collect::<Vec<_>>(), want);
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_the_other_protocol() {
+        assert!("0:h:1/udp".parse::<Forward>().unwrap().bind().await.is_err());
+        assert!("0:h:1".parse::<Forward>().unwrap().bind_udp().await.is_err());
+        assert!("0:h:1/tcp".parse::<Forward>().unwrap().bind_udp().await.is_err());
+    }
+
+    /// Yields until `done` holds, which lets the runtime poll its I/O without moving a paused
+    /// clock; panics if it never does.
+    async fn until(mut done: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the condition never held");
+    }
+
+    /// A UDP server that answers anything with `stale`, so a reply through it shows.
+    async fn stale_server() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0; 64];
+            while let Ok((_, from)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(b"stale", from).await;
+            }
+        });
+        addr
+    }
+
+    /// Waits up to 5 s of real time for `done` to hold.
+    async fn eventually(mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the condition never held");
+    }
+
+    #[tokio::test]
+    async fn udp_a_flow_error_ends_the_flow() {
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let tunnel = FakeTunnel::new();
+        tunnel.udp("dns.corp.example", 53, closed);
+        let forwards = UdpForwards::new(tunnel.clone());
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        app.connect(listener.local_addr().unwrap()).await.unwrap();
+        tokio::spawn(forwards.clone().serve(listener, Arc::from("dns.corp.example"), 53));
+
+        // The closed port's ICMP comes back as a flow error, which ends the flow and its entry.
+        app.send(b"one").await.unwrap();
+        eventually(|| tunnel.flows().len() == 1 && tunnel.live_flows() == 0 && forwards.len() == 0).await;
+        // So the sender's next datagram opens a fresh flow rather than feeding the dead one.
+        app.send(b"two").await.unwrap();
+        eventually(|| tunnel.flows().len() == 2).await;
+    }
+
+    /// Review Focus 1: an open that finishes after its flow idled out, with the same sender's next
+    /// flow still opening, must not take that flow's place.
+    #[tokio::test(start_paused = true)]
+    async fn udp_an_open_finishing_after_its_flow_idled_out_is_dropped() {
+        let tunnel = FakeTunnel::new();
+        let first = tunnel.udp_gate("dns.corp.example", 53, stale_server().await);
+        let forwards = UdpForwards::new(tunnel.clone());
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        app.connect(listener.local_addr().unwrap()).await.unwrap();
+        tokio::spawn(forwards.clone().serve(listener, Arc::from("dns.corp.example"), 53));
+        let sweep = tokio::spawn(forwards.clone().sweep());
+
+        app.send(b"one").await.unwrap();
+        until(|| tunnel.flows().len() == 1).await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        until(|| forwards.len() == 0).await;
+        // Past here the test waits on real sockets, and a paused clock jumps to any pending timer
+        // whenever the runtime idles: the sweep would idle the second flow out mid-exchange.
+        sweep.abort();
+
+        let second = tunnel.udp_gate("dns.corp.example", 53, tests::udp_echo_server().await.unwrap());
+        app.send(b"two").await.unwrap();
+        until(|| tunnel.flows().len() == 2).await;
+        first.open();
+        // The first open runs before this task resumes.
+        tokio::task::yield_now().await;
+        second.open();
+
+        let mut buf = [0; 64];
+        let n = app.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"two");
+        app.send(b"three").await.unwrap();
+        let n = app.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"three");
+        assert_eq!(tunnel.live_flows(), 1);
     }
 }

@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context as _, bail};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     process::{Child, Command},
     sync::watch,
     task::JoinHandle,
@@ -47,7 +47,7 @@ mod tunnel;
 pub use app::{AppConn, AppStack, Connect, Icmp, Sent};
 #[cfg(target_os = "linux")]
 pub use netns::{Namespaces, RemoteNs, netns};
-pub use tunnel::{FakeConn, FakeTunnel, Gate, NoFlow};
+pub use tunnel::{FakeConn, FakeFlow, FakeTunnel, Gate, NoFlow};
 
 /// A stand-in for a remote machine: a fake `ssh` that ignores its options and destination and runs
 /// the remote command here, through a chosen login shell, with `HOME` and every cache candidate
@@ -354,6 +354,33 @@ pub fn echo_on(listener: TcpListener) -> Res<SocketAddr> {
                     let _ = w.shutdown().await;
                 }
             });
+        }
+    });
+    Ok(addr)
+}
+
+/// A loopback UDP echo server; returns its address.
+///
+/// # Errors
+///
+/// Fails when no loopback port can be bound.
+pub async fn udp_echo_server() -> Res<SocketAddr> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.context("binding the UDP echo server")?;
+    udp_echo_on(socket)
+}
+
+/// Sends every datagram `socket` receives back to its sender, on the current runtime; returns its
+/// address.
+///
+/// # Errors
+///
+/// Fails when the socket has no address.
+pub fn udp_echo_on(socket: UdpSocket) -> Res<SocketAddr> {
+    let addr = socket.local_addr().context("reading the UDP echo server's address")?;
+    tokio::spawn(async move {
+        let mut buf = vec![0; 65_535];
+        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(&buf[..n], from).await;
         }
     });
     Ok(addr)

@@ -1,22 +1,26 @@
-//! [`FakeTunnel`]: a [`Tunnel`] scripted per target, standing in for the relay in the route tests;
-//! and [`NoFlow`], the flow of test tunnels that open none.
+//! [`FakeTunnel`]: a [`Tunnel`] scripted per target, standing in for the relay in the route and
+//! forward tests; and [`NoFlow`], the flow of test tunnels that open none.
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    io::ErrorKind,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::{Context as _, bail};
 use bytes::Bytes;
 use sshunnel_mux::{
-    FlowEvent, OpenError, QueryError, ResolveError, Traffic,
+    FlowEvent, FlowKind, OpenError, QueryError, ResolveError, Traffic,
     base::Res,
-    frame::{Capabilities, OpenErrKind, ResolveErrKind, Transport},
+    frame::{Capabilities, FlowErrKind, OpenErrKind, ResolveErrKind, Transport},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, copy, copy_bidirectional, sink, split},
-    net::TcpStream,
+    net::{TcpStream, UdpSocket},
     sync::{Notify, watch},
 };
 
@@ -39,20 +43,35 @@ enum Dial {
     FailLate(watch::Receiver<bool>),
 }
 
+/// What a UDP flow open of one `(host, port)` does.
+#[derive(Clone)]
+enum UdpDial {
+    /// Connects a local UDP socket to this address.
+    To(SocketAddr),
+    /// Fails with this kind.
+    Reject(OpenErrKind),
+    /// Waits for the gate, then connects to this address.
+    Gated(watch::Receiver<bool>, SocketAddr),
+}
+
 #[derive(Default)]
 struct Script {
     dials: HashMap<(String, u16), Dial>,
+    udp: HashMap<(String, u16), UdpDial>,
     names: HashMap<String, Result<(), ResolveErrKind>>,
     opens: Vec<(String, u16)>,
+    flows: Vec<(FlowKind, String, u16)>,
     resolves: Vec<String>,
 }
 
 /// A tunnel whose opens and lookups follow a script, recording every target it is asked for. An
-/// unscripted open fails with [`OpenErrKind::Other`]; an unscripted name doesn't exist.
+/// unscripted open (of a connection or a flow) fails with [`OpenErrKind::Other`]; an unscripted
+/// name doesn't exist.
 #[derive(Clone, Default)]
 pub struct FakeTunnel {
     script: Arc<Mutex<Script>>,
     asked: Arc<Notify>,
+    live: Arc<AtomicUsize>,
 }
 
 /// Holds the opens of one gated target until [`Gate::open`].
@@ -113,6 +132,25 @@ impl FakeTunnel {
         Gate(gate)
     }
 
+    /// UDP flows to `host:port` reach the local address `to`, through a socket connected to it.
+    pub fn udp(&self, host: &str, port: u16, to: SocketAddr) {
+        self.script().udp.insert((host.to_owned(), port), UdpDial::To(to));
+    }
+
+    /// UDP flow opens of `host:port` fail with `kind`.
+    pub fn udp_reject(&self, host: &str, port: u16, kind: OpenErrKind) {
+        self.script().udp.insert((host.to_owned(), port), UdpDial::Reject(kind));
+    }
+
+    /// UDP flow opens of `host:port` wait until the returned gate opens, then reach `to` as
+    /// [`Self::udp`]'s do. Scripting the target again leaves opens already waiting on this gate.
+    #[must_use]
+    pub fn udp_gate(&self, host: &str, port: u16, to: SocketAddr) -> Gate {
+        let (gate, waiting) = watch::channel(false);
+        self.script().udp.insert((host.to_owned(), port), UdpDial::Gated(waiting, to));
+        Gate(gate)
+    }
+
     /// Lookups of `name` answer `answer`.
     pub fn name(&self, name: &str, answer: Result<(), ResolveErrKind>) {
         self.script().names.insert(name.to_owned(), answer);
@@ -122,6 +160,18 @@ impl FakeTunnel {
     #[must_use]
     pub fn opens(&self) -> Vec<(String, u16)> {
         self.script().opens.clone()
+    }
+
+    /// Every flow open asked for so far, in order: its kind, host and port (0 for echo).
+    #[must_use]
+    pub fn flows(&self) -> Vec<(FlowKind, String, u16)> {
+        self.script().flows.clone()
+    }
+
+    /// How many flows this tunnel opened that haven't been dropped.
+    #[must_use]
+    pub fn live_flows(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
     }
 
     /// Every lookup asked for so far, in order.
@@ -162,7 +212,7 @@ pub enum FakeConn {
 
 impl Tunnel for FakeTunnel {
     type Conn = FakeConn;
-    type Flow = NoFlow;
+    type Flow = FakeFlow;
 
     async fn open(&self, host: &str, port: u16) -> Result<FakeConn, OpenError> {
         let dial = {
@@ -198,12 +248,31 @@ impl Tunnel for FakeTunnel {
         }))
     }
 
-    fn open_udp(&self, host: &str, port: u16) -> impl Future<Output = Result<NoFlow, OpenError>> + Send {
-        NoFlow::refuse(&format!("UDP {host}:{port}"))
+    async fn open_udp(&self, host: &str, port: u16) -> Result<FakeFlow, OpenError> {
+        let dial = {
+            let mut script = self.script();
+            script.flows.push((FlowKind::Udp, host.to_owned(), port));
+            script.udp.get(&(host.to_owned(), port)).cloned()
+        };
+        let fail = |kind, reason: String| OpenError { kind, reason };
+        let to = match dial {
+            None => return Err(fail(OpenErrKind::Other, format!("nothing scripted for UDP {host}:{port}"))),
+            Some(UdpDial::Reject(kind)) => return Err(fail(kind, format!("opening UDP {host}:{port}: scripted {kind:?}"))),
+            Some(UdpDial::To(to)) => to,
+            Some(UdpDial::Gated(mut gate, to)) => {
+                gate.wait_for(|open| *open).await.map_err(|_| fail(OpenErrKind::Other, "the gate was dropped".to_owned()))?;
+                to
+            }
+        };
+        FakeFlow::udp(to, &self.live).map_err(|e| fail(OpenErrKind::Other, format!("connecting to {to}: {e}")))
     }
 
-    fn open_echo(&self, host: &str) -> impl Future<Output = Result<NoFlow, OpenError>> + Send {
-        NoFlow::refuse(&format!("echo {host}"))
+    fn open_echo(&self, host: &str) -> impl Future<Output = Result<FakeFlow, OpenError>> + Send {
+        self.script().flows.push((FlowKind::Echo, host.to_owned(), 0));
+        std::future::ready(Err(OpenError {
+            kind: OpenErrKind::Other,
+            reason: format!("nothing scripted for echo {host}"),
+        }))
     }
 
     fn query(&self, _message: Bytes, _transport: Transport) -> impl Future<Output = Result<Bytes, QueryError>> + Send {
@@ -212,6 +281,130 @@ impl Tunnel for FakeTunnel {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()
+    }
+}
+
+/// A [`FakeTunnel`] flow.
+pub enum FakeFlow {
+    /// A local UDP socket connected to the scripted address.
+    Udp(FakeUdp),
+}
+
+/// A [`FakeFlow::Udp`]: socket errors become flow errors as the relay maps them
+/// ([`FlowErrKind::from_io`]); any other error ends the flow, as it ends the relay's.
+pub struct FakeUdp {
+    link: Arc<UdpLink>,
+    buf: Box<[u8]>,
+    ended: bool,
+    _live: Live,
+}
+
+/// A [`FakeUdp`]'s socket, shared with its senders. A send's error waits here for `recv`, since
+/// the relay reports a failed send on the flow too.
+struct UdpLink {
+    socket: UdpSocket,
+    /// The same socket, for sending: tokio's `try_send` refuses until the runtime has seen the
+    /// socket writable, which would drop the datagrams flushed the moment a flow opens.
+    sending: std::net::UdpSocket,
+    failed: Mutex<Option<std::io::Error>>,
+    wake: Notify,
+}
+
+impl UdpLink {
+    fn failed(&self) -> MutexGuard<'_, Option<std::io::Error>> {
+        self.failed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Counts a flow in [`FakeTunnel::live_flows`] until it drops.
+struct Live(Arc<AtomicUsize>);
+
+impl Live {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl FakeFlow {
+    fn udp(to: SocketAddr, live: &Arc<AtomicUsize>) -> std::io::Result<Self> {
+        let any = if to.is_ipv6() { IpAddr::V6(Ipv6Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
+        let sending = std::net::UdpSocket::bind((any, 0))?;
+        sending.connect(to)?;
+        sending.set_nonblocking(true)?;
+        let socket = UdpSocket::from_std(sending.try_clone()?)?;
+        Ok(Self::Udp(FakeUdp {
+            link: Arc::new(UdpLink {
+                socket,
+                sending,
+                failed: Mutex::new(None),
+                wake: Notify::new(),
+            }),
+            buf: vec![0; 65_535].into_boxed_slice(),
+            ended: false,
+            _live: Live::new(live),
+        }))
+    }
+}
+
+impl Flow for FakeFlow {
+    type Sender = FakeSender;
+
+    fn sender(&self) -> FakeSender {
+        match self {
+            Self::Udp(udp) => FakeSender(Arc::downgrade(&udp.link)),
+        }
+    }
+
+    async fn recv(&mut self) -> Option<FlowEvent> {
+        let Self::Udp(udp) = self;
+        loop {
+            if udp.ended {
+                return None;
+            }
+            let failed = udp.link.failed().take();
+            let read = if let Some(e) = failed {
+                Err(e)
+            } else {
+                tokio::select! {
+                    read = udp.link.socket.recv(&mut udp.buf) => read,
+                    () = udp.link.wake.notified() => continue,
+                }
+            };
+            match read {
+                Ok(n) => return Some(FlowEvent::Datagram(Bytes::copy_from_slice(&udp.buf[..n]))),
+                Err(e) => match FlowErrKind::from_io(&e) {
+                    Some(kind) => return Some(FlowEvent::Error(kind)),
+                    None => udp.ended = true,
+                },
+            }
+        }
+    }
+}
+
+/// A [`FakeFlow`]'s sending half; it sends nothing once its flow has dropped.
+#[derive(Clone)]
+pub struct FakeSender(Weak<UdpLink>);
+
+impl FlowSender for FakeSender {
+    fn try_send(&self, datagram: Bytes) -> bool {
+        let Some(link) = self.0.upgrade() else { return false };
+        match link.sending.send(&datagram) {
+            Ok(_) => true,
+            Err(e) => {
+                if e.kind() != ErrorKind::WouldBlock {
+                    *link.failed() = Some(e);
+                    link.wake.notify_one();
+                }
+                false
+            }
+        }
     }
 }
 
