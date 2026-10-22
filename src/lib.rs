@@ -8,6 +8,7 @@
 pub mod arch;
 pub mod base;
 pub mod bootstrap;
+pub mod flows;
 pub mod forward;
 pub mod relays;
 pub mod route;

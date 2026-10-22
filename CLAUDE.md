@@ -18,6 +18,8 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   checkout's, and fails when its directory's `SHA256SUMS` and relays disagree either way, or when a
   package's `relays/COMMIT` isn't the commit cargo packaged. A package
   (`Cargo.toml.orig` beside the manifest) with neither fails to build, so cargo won't publish it.
+- `src/flows.rs`: the flow table `forward`'s UDP and `route`'s UDP and echo share (conntrack's
+  timeouts, a 4096 cap, LRU eviction). Plain data: no locks, no awaits.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
   matching, refusals), `names` (the fake-address map), `router` (the per-connection decision,
   sharing the map), `stack` (the smoltcp netstack) with `dns` on it, `device` (the TUN fd as the
