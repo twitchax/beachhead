@@ -27,9 +27,9 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   timeouts, a 4096 cap, LRU eviction), and the hold and tasks (the open, then the replies) their
   entries both keep, aborted when an entry goes. Plain data: no locks, no awaits.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
-  matching, refusals), `names` (the fake-address map), `router` (the per-connection decision,
-  sharing the map), `stack` (the smoltcp netstack) with `dns` and `datagrams` (routed UDP's and
-  echo's flows) on it, `device` (the TUN fd as the stack's packets), `peers` and `system` (what the
+  matching, refusals), `names` (the fake-address map), `reverse` (the fake ranges' reverse names
+  and zones), `router` (the per-connection decision, sharing the map), `stack` (the smoltcp
+  netstack) with `dns` and `datagrams` (routed UDP's and echo's flows) on it, `device` (the TUN fd as the stack's packets), `peers` and `system` (what the
   machine depends on, and the commands and syscalls behind it), `helper` (the root side, run as the
   hidden `sshunnel helper` through sudo), `thread` (the netstack's own thread: `device`, `stack` and
   `dns` on a runtime of their own), and `lifecycle`, which runs them in the spec's order and, on

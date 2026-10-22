@@ -37,11 +37,21 @@ why the version moved the way it did.
   address. `2001:2::/96` is reserved like `198.18.0.0/15`: a target inside it is refused, one
   containing it is routed around it with a warning, and with a domain pattern a connected subnet
   overlapping it is refused.
+- Every DNS record type for names under a pattern: SRV, MX, TXT and the rest come from the remote's
+  resolver through the relay, with every A and AAAA record removed from the answer so none hands out
+  a real address. A remote NXDOMAIN for a name the relay finds (one only in the remote's
+  `/etc/hosts`) becomes NODATA, and HTTPS and SVCB are NODATA, since their address hints would
+  bypass the fakes.
+- Reverse lookups of fake addresses, v4 and v6, answer the name each was handed out for (NXDOMAIN
+  for one no name holds). The root helper routes the fake ranges' reverse zones to the device's
+  resolver link, next to the patterns' domains.
 
 ### Changed
 
 - AAAA for a name under a pattern is no longer always empty (NODATA): it stays empty only where the
   machine has no IPv6.
+- Record types other than A and AAAA for a name under a pattern are no longer always empty
+  (NODATA): they come from the remote's resolver.
 - The relay resolves every open through its bounded lookup path, and raises its open-file limit to
   the hard limit.
 - A published package refuses to build with relays from a commit other than its own.

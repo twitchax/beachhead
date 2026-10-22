@@ -125,6 +125,16 @@ answer: the v4 fake in the low 32 bits of `2001:2::/96` (`198.18.1.2` is `2001:2
 the two always pair. Without IPv6, AAAA is empty (NODATA) and apps use the v4 fake. Connections
 refused or unreachable on the remote look the same to the app.
 
+Every other record type for those names comes from the remote's resolver: the relay asks its own
+nameservers the query as it was asked, and the answer comes back with every A and AAAA record taken
+out, so the glue in an SRV or MX answer can't hand out a real address; the app asks for the
+target's A and gets its fake. A name only the remote's `/etc/hosts` knows is NXDOMAIN to its
+nameservers, so for a name the relay finds, that answer becomes NODATA, and the name's fake address
+stays visible. HTTPS and SVCB are always empty (NODATA): their address hints would send browsers to
+real addresses, and browsers fall back to A and AAAA. A reverse lookup of a fake address
+(`getent hosts 198.18.1.2`, or its v6 fake) answers the name it was handed out for, and one no name
+holds is NXDOMAIN.
+
 UDP goes as flows, as in a UDP forward: each app socket and destination it sends to is a flow, a
 UDP socket on the remote connected to that destination and opened by the first datagram. Datagrams
 wait while the relay opens it, up to 32 of them or 64 KiB. Flows idle out as UDP forwards' do, and
@@ -201,8 +211,10 @@ security boundary.
 **systemd-resolved.** Domain patterns need systemd-resolved, and the system has to actually ask it:
 `/etc/resolv.conf` points at its stub (`127.0.0.53`), or `nss-resolve` is on the `hosts:` line of
 `/etc/nsswitch.conf`. Otherwise a run with any pattern fails, CIDR targets included, rather than
-half-working. sshunnel sets only its own link's DNS: a `~domain` routing domain per pattern and no
-default route, so resolved hands it the queries under those domains and nothing else.
+half-working. sshunnel sets only its own link's DNS: a `~domain` routing domain per pattern and per
+reverse zone of the fake ranges (`18.198.in-addr.arpa`, `19.198.in-addr.arpa`, and with IPv6
+`2001:2::/96`'s), and no default route, so resolved hands it the queries under those domains and
+nothing else.
 
 **What it leaves behind: nothing.** Ctrl-C, SIGTERM, a closed terminal (unless started under
 `nohup`), the session ending and the helper dying all end the run. Before `route` returns, the

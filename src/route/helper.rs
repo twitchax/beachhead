@@ -44,7 +44,7 @@ use tokio::{
 use crate::{
     base::{Res, Void},
     route::{
-        DEVICE, DNS_ADDR, FAKE_RANGE, FAKE_RANGE6, MTU, PIN_PROTO, TUN_ADDR, TUN_ADDR6,
+        DEVICE, DNS_ADDR, FAKE_RANGE, FAKE_RANGE6, MTU, PIN_PROTO, TUN_ADDR, TUN_ADDR6, reverse,
         system::{self, Via},
         targets::{MAX_ROUTES, Targets},
     },
@@ -513,8 +513,8 @@ struct Plan {
 
 /// Everything the helper does to the machine, in order: the device's addresses, MTU and link; the
 /// pins, before a route could capture what they keep; the routes, and [`FAKE_RANGE6`]'s with fake v6
-/// on; and with names, the resolver's link config, DNS server last, so resolved never takes the link
-/// for a default route.
+/// on; and with names, the resolver's link config (the patterns' domains and the fake ranges' reverse
+/// zones), DNS server last, so resolved never takes the link for a default route.
 ///
 /// A pin whose address the machine delivers locally needs nothing (the local table outranks main),
 /// and a route that is exactly a pinned host is left out: the pin wins.
@@ -560,6 +560,8 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)], fake_v6: bo
         steps.push(Step::new("resolvectl", ["dnsovertls", DEVICE, "no"]));
         let mut domain = Step::new("resolvectl", ["domain", DEVICE]);
         domain.args.extend(targets.domains().into_iter().map(|d| format!("~{d}")));
+        // The fake ranges' reverse zones, so a PTR lookup of a fake address reaches the DNS server.
+        domain.args.extend(reverse::zones(fake_v6).into_iter().map(|zone| format!("~{zone}")));
         steps.push(domain);
         steps.push(Step::new("resolvectl", ["dns", DEVICE, &DNS_ADDR.to_string()]));
     }
@@ -1170,7 +1172,7 @@ mod tests {
                 "resolvectl default-route sshunnel0 false",
                 "resolvectl dnssec sshunnel0 no",
                 "resolvectl dnsovertls sshunnel0 no",
-                "resolvectl domain sshunnel0 ~corp.example ~host.other.example",
+                "resolvectl domain sshunnel0 ~corp.example ~host.other.example ~18.198.in-addr.arpa ~19.198.in-addr.arpa ~0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.0.0.1.0.0.2.ip6.arpa",
                 "resolvectl dns sshunnel0 198.18.0.2",
             ]
         );
@@ -1191,12 +1193,27 @@ mod tests {
                 "resolvectl default-route sshunnel0 false",
                 "resolvectl dnssec sshunnel0 no",
                 "resolvectl dnsovertls sshunnel0 no",
-                "resolvectl domain sshunnel0 ~corp.example",
+                "resolvectl domain sshunnel0 ~corp.example ~18.198.in-addr.arpa ~19.198.in-addr.arpa ~0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.0.0.1.0.0.2.ip6.arpa",
                 "resolvectl dns sshunnel0 198.18.0.2",
             ]
         );
         let off = rendered(&plan(&targets, &targets.routes(), &[], false).steps);
         assert!(!off.iter().any(|step| step.contains("2001:2::") || step.contains("fd73:")), "{off:#?}");
+    }
+
+    #[test]
+    fn ptr_zones_are_routed_on_the_link() {
+        let targets = Targets::parse(&strings(&["*.corp.example"]), &[]).unwrap();
+        let domain = |fake_v6| {
+            let steps = rendered(&plan(&targets, &targets.routes(), &[], fake_v6).steps);
+            steps.into_iter().filter(|step| step.starts_with("resolvectl domain")).collect::<Vec<_>>()
+        };
+
+        assert_eq!(domain(false), ["resolvectl domain sshunnel0 ~corp.example ~18.198.in-addr.arpa ~19.198.in-addr.arpa"]);
+        assert_eq!(
+            domain(true),
+            ["resolvectl domain sshunnel0 ~corp.example ~18.198.in-addr.arpa ~19.198.in-addr.arpa ~0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.0.0.1.0.0.2.ip6.arpa"]
+        );
     }
 
     const ADDR6: &str = "ip addr add fd73:7368::1/64 dev sshunnel0";
@@ -1268,7 +1285,7 @@ mod tests {
                 "resolvectl default-route sshunnel0 false",
                 "resolvectl dnssec sshunnel0 no",
                 "resolvectl dnsovertls sshunnel0 no",
-                "resolvectl domain sshunnel0 ~corp.example",
+                "resolvectl domain sshunnel0 ~corp.example ~18.198.in-addr.arpa ~19.198.in-addr.arpa ~0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.0.0.1.0.0.2.ip6.arpa",
                 "resolvectl dns sshunnel0 198.18.0.2",
             ]
         );

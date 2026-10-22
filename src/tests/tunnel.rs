@@ -68,6 +68,18 @@ enum EchoDial {
 /// What a relay that may ping over both families reports: the scripted default.
 const PING_BOTH: Capabilities = Capabilities { ping4: true, ping6: true };
 
+/// A scripted answer to a raw DNS query, given the message and its transport.
+type Answer = dyn Fn(&[u8], Transport) -> Result<Bytes, QueryError> + Send + Sync;
+
+/// What a raw DNS query gets.
+#[derive(Clone)]
+enum Answers {
+    /// What this returns.
+    With(Arc<Answer>),
+    /// Nothing, ever: a relay whose nameservers never answer.
+    Never,
+}
+
 #[derive(Default)]
 struct Script {
     dials: HashMap<(String, u16), Dial>,
@@ -76,14 +88,17 @@ struct Script {
     /// What the relay says it can do; `None` is [`PING_BOTH`].
     capabilities: Option<Capabilities>,
     names: HashMap<String, Result<(), ResolveErrKind>>,
+    answers: Option<Answers>,
     opens: Vec<(String, u16)>,
     flows: Vec<(FlowKind, String, u16)>,
     resolves: Vec<String>,
+    queries: Vec<(Bytes, Transport)>,
 }
 
-/// A tunnel whose opens and lookups follow a script, recording every target it is asked for. An
-/// unscripted open (of a connection or a flow) fails with [`OpenErrKind::Other`]; an unscripted
-/// name doesn't exist. Its relay may ping over both families until [`Self::set_capabilities`].
+/// A tunnel whose opens, lookups and queries follow a script, recording every target it is asked
+/// for. An unscripted open (of a connection or a flow) fails with [`OpenErrKind::Other`]; an
+/// unscripted name doesn't exist; an unscripted query fails. Its relay may ping over both families
+/// until [`Self::set_capabilities`].
 #[derive(Clone, Default)]
 pub struct FakeTunnel {
     script: Arc<Mutex<Script>>,
@@ -196,6 +211,17 @@ impl FakeTunnel {
         self.script().names.insert(name.to_owned(), answer);
     }
 
+    /// Raw DNS queries get what `answer` returns for the message and the transport it was asked
+    /// over, as the relay's nameservers would answer them.
+    pub fn answer_queries(&self, answer: impl Fn(&[u8], Transport) -> Result<Bytes, QueryError> + Send + Sync + 'static) {
+        self.script().answers = Some(Answers::With(Arc::new(answer)));
+    }
+
+    /// Raw DNS queries never get an answer, so only the asker's timeout ends them.
+    pub fn stall_queries(&self) {
+        self.script().answers = Some(Answers::Never);
+    }
+
     /// Every open asked for so far, in order.
     #[must_use]
     pub fn opens(&self) -> Vec<(String, u16)> {
@@ -225,6 +251,12 @@ impl FakeTunnel {
     #[must_use]
     pub fn resolves(&self) -> Vec<String> {
         self.script().resolves.clone()
+    }
+
+    /// Every raw DNS query asked so far, in order, with its transport.
+    #[must_use]
+    pub fn queries(&self) -> Vec<(Bytes, Transport)> {
+        self.script().queries.clone()
     }
 
     /// Returns once at least `n` opens have been asked for.
@@ -334,8 +366,19 @@ impl Tunnel for FakeTunnel {
         })
     }
 
-    fn query(&self, _message: Bytes, _transport: Transport) -> impl Future<Output = Result<Bytes, QueryError>> + Send {
-        NoFlow::unanswered()
+    fn query(&self, message: Bytes, transport: Transport) -> impl Future<Output = Result<Bytes, QueryError>> + Send {
+        let answers = {
+            let mut script = self.script();
+            script.queries.push((message.clone(), transport));
+            script.answers.clone()
+        };
+        async move {
+            match answers {
+                None => NoFlow::unanswered().await,
+                Some(Answers::With(answer)) => answer(&message, transport),
+                Some(Answers::Never) => std::future::pending().await,
+            }
+        }
     }
 
     fn capabilities(&self) -> Capabilities {

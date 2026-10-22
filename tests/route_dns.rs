@@ -4,28 +4,38 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 
 use bytes::Bytes;
 use pretty_assertions::assert_eq;
-use simple_dns::{CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, TYPE, rdata::RData};
+use simple_dns::{
+    CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE,
+    rdata::{A, AAAA, MX, NS, PTR, RData, SOA, SRV, TXT},
+};
 use sshunnel::{
     route::{
         FAKE_RANGE6,
-        dns::{Server, TTL},
+        dns::{QUERY_TIMEOUT, Server, TTL},
         names::{self, FakeMap, today},
+        reverse,
         router::Router,
         stack::Dns,
         targets::Targets,
     },
     tests::FakeTunnel,
 };
-use sshunnel_mux::frame::ResolveErrKind;
+use sshunnel_mux::{
+    QueryError,
+    frame::{ResolveErrKind, Transport},
+};
 use tempfile::TempDir;
-use tokio::{net::UdpSocket, time::advance};
+use tokio::{
+    net::UdpSocket,
+    time::{Instant, advance},
+};
 
 struct Fixture {
     tunnel: FakeTunnel,
@@ -128,19 +138,6 @@ async fn fake_v6_aaaa_is_nodata_when_off() {
     f.tunnel.name("wiki.corp.example", Ok(()));
 
     let bytes = ask(&f.server, 1, "wiki.corp.example", TYPE::AAAA).await;
-    let reply = Packet::parse(&bytes).unwrap();
-
-    assert_eq!(reply.rcode(), RCODE::NoError);
-    assert_eq!(reply.answers.len(), 0);
-    assert_eq!(soa_minimum(&reply), Some(5));
-}
-
-#[tokio::test]
-async fn mx_for_a_matched_name_is_nodata() {
-    let f = corp();
-    f.tunnel.name("wiki.corp.example", Ok(()));
-
-    let bytes = ask(&f.server, 1, "wiki.corp.example", TYPE::MX).await;
     let reply = Packet::parse(&bytes).unwrap();
 
     assert_eq!(reply.rcode(), RCODE::NoError);
@@ -346,4 +343,339 @@ async fn responses_and_multi_question_packets_get_no_answer() {
     assert!(f.server.answer(two).await.is_none());
 
     assert_eq!(f.tunnel.resolves().len(), 0);
+}
+
+/// A record as the remote's resolver would send it, with a TTL of its own.
+fn record(name: &'static str, rdata: RData<'static>) -> ResourceRecord<'static> {
+    ResourceRecord::new(Name::new_unchecked(name), CLASS::IN, 300, rdata)
+}
+
+fn a(addr: &str) -> RData<'static> {
+    RData::A(A::from(addr.parse::<Ipv4Addr>().unwrap()))
+}
+
+fn aaaa(addr: &str) -> RData<'static> {
+    RData::AAAA(AAAA::from(addr.parse::<Ipv6Addr>().unwrap()))
+}
+
+fn txt(text: &'static str) -> RData<'static> {
+    RData::TXT(TXT::new().with_string(text).unwrap())
+}
+
+fn remote_soa() -> ResourceRecord<'static> {
+    let rdata = SOA {
+        mname: Name::new_unchecked("ns1.corp.example"),
+        rname: Name::new_unchecked("hostmaster.corp.example"),
+        serial: 7,
+        refresh: 3600,
+        retry: 600,
+        expire: 86400,
+        minimum: 300,
+    };
+    record("corp.example", RData::SOA(rdata))
+}
+
+/// The remote's resolver, for [`FakeTunnel::answer_queries`]: it answers each query with its id
+/// and question, and whatever `fill` adds given the question's type.
+fn resolver(fill: impl Fn(QTYPE, &mut Packet<'_>) + Send + Sync + 'static) -> impl Fn(&[u8], Transport) -> Result<Bytes, QueryError> + Send + Sync + 'static {
+    move |query, _| {
+        let query = Packet::parse(query).unwrap();
+        let mut answer = Packet::new_reply(query.id());
+        answer.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
+        answer.questions.clone_from(&query.questions);
+        fill(query.questions[0].qtype, &mut answer);
+        Ok(Bytes::from(answer.build_bytes_vec().unwrap()))
+    }
+}
+
+fn has_addresses(records: &[ResourceRecord<'_>]) -> bool {
+    records.iter().any(|rr| matches!(rr.rdata, RData::A(_) | RData::AAAA(_)))
+}
+
+#[tokio::test]
+async fn dns_records_srv_comes_from_the_remote() {
+    let f = corp();
+    f.tunnel.answer_queries(resolver(|_, answer| {
+        let target = Name::new_unchecked("dc1.corp.example");
+        answer.answers.push(record(
+            "_ldap._tcp.corp.example",
+            RData::SRV(SRV {
+                priority: 0,
+                weight: 100,
+                port: 389,
+                target,
+            }),
+        ));
+        answer.additional_records.push(record("dc1.corp.example", a("10.99.0.5")));
+    }));
+    let asked = query(0x5151, "_ldap._tcp.corp.example", TYPE::SRV);
+
+    let bytes = f.server.answer(asked.clone()).await.expect("an answer");
+    let reply = Packet::parse(&bytes).unwrap();
+
+    assert_eq!(reply.id(), 0x5151);
+    assert_eq!(reply.rcode(), RCODE::NoError);
+    assert_eq!(reply.answers.len(), 1);
+    let RData::SRV(srv) = &reply.answers[0].rdata else {
+        panic!("not an SRV record: {:?}", reply.answers[0])
+    };
+    assert_eq!((srv.target.to_string().as_str(), srv.port), ("dc1.corp.example", 389));
+    assert!(!has_addresses(&reply.additional_records), "{:?}", reply.additional_records);
+    assert_eq!(f.tunnel.queries(), vec![(asked, Transport::Udp)]);
+    // The remote answered, so its verdict stands without a lookup.
+    assert_eq!(f.tunnel.resolves().len(), 0);
+}
+
+#[tokio::test]
+async fn dns_records_txt_and_mx_come_from_the_remote() {
+    let f = corp();
+    f.tunnel.answer_queries(resolver(|qtype, answer| {
+        if qtype == QTYPE::TYPE(TYPE::TXT) {
+            answer.answers.push(record("corp.example", txt("v=spf1 -all")));
+        } else {
+            let exchange = Name::new_unchecked("mail.corp.example");
+            answer.answers.push(record("corp.example", RData::MX(MX { preference: 10, exchange })));
+        }
+    }));
+
+    let txt_reply = ask(&f.server, 1, "corp.example", TYPE::TXT).await;
+    let mx_reply = ask(&f.server, 2, "corp.example", TYPE::MX).await;
+    let (txt_reply, mx_reply) = (Packet::parse(&txt_reply).unwrap(), Packet::parse(&mx_reply).unwrap());
+
+    assert_eq!((txt_reply.id(), txt_reply.rcode()), (1, RCODE::NoError));
+    let RData::TXT(text) = &txt_reply.answers[0].rdata else {
+        panic!("not a TXT record: {:?}", txt_reply.answers[0])
+    };
+    assert_eq!(String::try_from(text.clone()).unwrap(), "v=spf1 -all");
+    assert_eq!((mx_reply.id(), mx_reply.rcode()), (2, RCODE::NoError));
+    let RData::MX(mx) = &mx_reply.answers[0].rdata else {
+        panic!("not an MX record: {:?}", mx_reply.answers[0])
+    };
+    assert_eq!((mx.preference, mx.exchange.to_string().as_str()), (10, "mail.corp.example"));
+    assert_eq!(f.tunnel.queries().len(), 2);
+}
+
+#[tokio::test]
+async fn dns_records_https_and_svcb_are_nodata() {
+    let f = corp();
+    f.tunnel.name("wiki.corp.example", Ok(()));
+    f.tunnel.answer_queries(resolver(|_, _| panic!("HTTPS and SVCB never reach the remote")));
+
+    for qtype in [TYPE::HTTPS, TYPE::SVCB] {
+        let bytes = ask(&f.server, 1, "wiki.corp.example", qtype).await;
+        let reply = Packet::parse(&bytes).unwrap();
+
+        assert_eq!(reply.rcode(), RCODE::NoError, "{qtype:?}");
+        assert_eq!(reply.answers.len(), 0, "{qtype:?}");
+        assert_eq!(soa_minimum(&reply), Some(5), "{qtype:?}");
+    }
+    assert_eq!(f.tunnel.queries().len(), 0);
+}
+
+#[tokio::test]
+async fn dns_records_strip_a_and_aaaa_everywhere() {
+    let f = corp();
+    f.tunnel.answer_queries(resolver(|_, answer| {
+        let exchange = Name::new_unchecked("mail.corp.example");
+        answer.answers.push(record("corp.example", RData::MX(MX { preference: 10, exchange })));
+        answer.answers.push(record("corp.example", a("10.99.0.1")));
+        answer.answers.push(record("corp.example", aaaa("fd99::1")));
+        answer.name_servers.push(record("corp.example", RData::NS(NS(Name::new_unchecked("ns1.corp.example")))));
+        answer.name_servers.push(record("ns1.corp.example", a("10.99.0.53")));
+        answer.name_servers.push(record("ns1.corp.example", aaaa("fd99::53")));
+        answer.additional_records.push(record("mail.corp.example", a("10.99.0.25")));
+        answer.additional_records.push(record("mail.corp.example", aaaa("fd99::25")));
+        answer.additional_records.push(record("mail.corp.example", txt("kept")));
+    }));
+
+    let bytes = ask(&f.server, 1, "corp.example", TYPE::MX).await;
+    let reply = Packet::parse(&bytes).unwrap();
+
+    assert_eq!(reply.rcode(), RCODE::NoError);
+    let kinds = |records: &[ResourceRecord<'_>]| records.iter().map(|rr| rr.rdata.type_code()).collect::<Vec<_>>();
+    assert_eq!(kinds(&reply.answers), [TYPE::MX]);
+    assert_eq!(kinds(&reply.name_servers), [TYPE::NS]);
+    assert_eq!(kinds(&reply.additional_records), [TYPE::TXT]);
+}
+
+#[tokio::test]
+async fn dns_records_remote_nxdomain_for_a_found_name_is_nodata() {
+    let f = corp();
+    // Only in the remote's /etc/hosts: the relay finds it, its nameservers don't.
+    f.tunnel.name("hosts-only.corp.example", Ok(()));
+    f.tunnel.answer_queries(resolver(|_, answer| {
+        *answer.rcode_mut() = RCODE::NameError;
+        answer.name_servers.push(remote_soa());
+    }));
+
+    let bytes = ask(&f.server, 4, "hosts-only.corp.example", TYPE::TXT).await;
+    let reply = Packet::parse(&bytes).unwrap();
+
+    assert_eq!((reply.id(), reply.rcode()), (4, RCODE::NoError));
+    assert_eq!(reply.answers.len(), 0);
+    assert_eq!(f.tunnel.queries().len(), 1);
+    assert_eq!(f.tunnel.resolves(), vec!["hosts-only.corp.example"]);
+}
+
+#[tokio::test]
+async fn dns_records_remote_nxdomain_for_a_missing_name_stays_nxdomain() {
+    let f = corp();
+    f.tunnel.answer_queries(resolver(|_, answer| {
+        *answer.rcode_mut() = RCODE::NameError;
+        answer.name_servers.push(remote_soa());
+    }));
+
+    let bytes = ask(&f.server, 5, "nope.corp.example", TYPE::TXT).await;
+    let reply = Packet::parse(&bytes).unwrap();
+
+    assert_eq!((reply.id(), reply.rcode()), (5, RCODE::NameError));
+    assert_eq!(reply.answers.len(), 0);
+    assert_eq!(f.tunnel.queries().len(), 1);
+    assert_eq!(f.tunnel.resolves(), vec!["nope.corp.example"]);
+}
+
+#[tokio::test]
+async fn dns_records_remote_nxdomain_with_a_failed_lookup_is_servfail() {
+    let f = corp();
+    f.tunnel.name("flaky.corp.example", Err(ResolveErrKind::Failed));
+    f.tunnel.answer_queries(resolver(|_, answer| *answer.rcode_mut() = RCODE::NameError));
+
+    let bytes = ask(&f.server, 5, "flaky.corp.example", TYPE::TXT).await;
+    let reply = Packet::parse(&bytes).unwrap();
+
+    // The remote's NXDOMAIN could be cached for as long as its SOA says, hiding the name's fake A.
+    assert_eq!((reply.id(), reply.rcode()), (5, RCODE::ServerFailure));
+    assert_eq!(f.tunnel.resolves(), vec!["flaky.corp.example"]);
+}
+
+#[tokio::test]
+async fn dns_records_other_rcodes_pass_through() {
+    let f = corp();
+    f.tunnel.answer_queries(resolver(|_, answer| *answer.rcode_mut() = RCODE::Refused));
+
+    let bytes = ask(&f.server, 6, "wiki.corp.example", TYPE::TXT).await;
+    let reply = Packet::parse(&bytes).unwrap();
+
+    assert_eq!((reply.id(), reply.rcode()), (6, RCODE::Refused));
+    assert_eq!(f.tunnel.resolves().len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dns_records_a_failed_query_is_servfail() {
+    let f = corp();
+    let servfail = async |id| {
+        let bytes = ask(&f.server, id, "wiki.corp.example", TYPE::TXT).await;
+        let reply = Packet::parse(&bytes).unwrap();
+        assert_eq!((reply.id(), reply.rcode()), (id, RCODE::ServerFailure));
+        assert_eq!(reply.questions.len(), 1);
+    };
+
+    f.tunnel.answer_queries(|_, _| Err(QueryError { reason: "no nameserver answered".into() }));
+    servfail(1).await;
+
+    f.tunnel.answer_queries(|_, _| Ok(Bytes::from_static(b"\x00\x02\x81\x80 not DNS")));
+    servfail(2).await;
+
+    f.tunnel.stall_queries();
+    let start = Instant::now();
+    servfail(3).await;
+    assert!(start.elapsed() >= QUERY_TIMEOUT, "{:?}", start.elapsed());
+
+    assert_eq!(f.tunnel.queries().len(), 3);
+}
+
+#[tokio::test]
+async fn dns_records_truncated_answers_pass_back_truncated() {
+    let f = corp();
+    f.tunnel.answer_queries(resolver(|_, answer| {
+        answer.set_flags(PacketFlag::TRUNCATION);
+        answer.answers.push(record("corp.example", txt("the first of many")));
+    }));
+
+    let bytes = ask(&f.server, 7, "corp.example", TYPE::TXT).await;
+    let reply = Packet::parse(&bytes).unwrap();
+
+    assert_eq!((reply.id(), reply.rcode()), (7, RCODE::NoError));
+    assert!(reply.has_flags(PacketFlag::TRUNCATION));
+    assert_eq!(reply.answers.len(), 1);
+}
+
+/// The fake addresses `name` gets, v4 and v6, by asking for them.
+async fn fakes(server: &Server<FakeTunnel>, name: &str) -> (IpAddr, IpAddr) {
+    let a = Packet::parse(&ask(server, 1, name, TYPE::A).await).unwrap().answers[0].rdata.clone().into_owned();
+    let aaaa = Packet::parse(&ask(server, 2, name, TYPE::AAAA).await).unwrap().answers[0].rdata.clone().into_owned();
+    let (RData::A(a), RData::AAAA(aaaa)) = (a, aaaa) else { panic!("not fake addresses") };
+    (IpAddr::V4(a.address.into()), IpAddr::V6(aaaa.address.into()))
+}
+
+#[tokio::test]
+async fn ptr_of_an_assigned_fake_answers_its_name() {
+    let f = corp();
+    f.tunnel.name("wiki.corp.example", Ok(()));
+    let (v4, v6) = fakes(&f.server, "wiki.corp.example").await;
+
+    for addr in [v4, v6] {
+        let reverse = reverse::name(addr);
+        let bytes = ask(&f.server, 9, &reverse, TYPE::PTR).await;
+        let reply = Packet::parse(&bytes).unwrap();
+
+        assert_eq!((reply.id(), reply.rcode()), (9, RCODE::NoError), "{addr}");
+        assert_eq!(reply.answers.len(), 1, "{addr}");
+        assert_eq!(reply.answers[0].name.to_string(), reverse);
+        assert_eq!(u64::from(reply.answers[0].ttl), TTL.as_secs());
+        let RData::PTR(PTR(name)) = &reply.answers[0].rdata else {
+            panic!("not a PTR record: {:?}", reply.answers[0])
+        };
+        assert_eq!(name.to_string(), "wiki.corp.example");
+
+        // Any other type at the address's name is NODATA: the name exists, with a PTR only.
+        let bytes = ask(&f.server, 10, &reverse, TYPE::TXT).await;
+        let reply = Packet::parse(&bytes).unwrap();
+        assert_eq!((reply.rcode(), reply.answers.len()), (RCODE::NoError, 0), "{addr}");
+        assert_eq!(soa_minimum(&reply), Some(5));
+    }
+    assert_eq!(f.tunnel.queries().len(), 0);
+}
+
+#[tokio::test]
+async fn ptr_of_an_unassigned_fake_is_nxdomain() {
+    let f = corp();
+
+    let unassigned = ["198.19.255.254".parse().unwrap(), IpAddr::V6(names::fake_v6("198.19.255.254".parse().unwrap()))];
+    // Inside 2001:2::/96, but with low bits no v4 fake has.
+    let outside_v4 = "2001:2::1".parse().unwrap();
+    for addr in unassigned.into_iter().chain([outside_v4]) {
+        let bytes = ask(&f.server, 3, &reverse::name(addr), TYPE::PTR).await;
+        let reply = Packet::parse(&bytes).unwrap();
+
+        assert_eq!((reply.id(), reply.rcode()), (3, RCODE::NameError), "{addr}");
+        assert_eq!(soa_minimum(&reply), Some(5));
+    }
+    assert_eq!(f.tunnel.queries().len(), 0);
+}
+
+#[tokio::test]
+async fn ptr_zone_names_short_of_an_address_are_nodata() {
+    let f = corp();
+    let zone6 = reverse::zones(true).pop().unwrap();
+
+    for name in ["18.198.in-addr.arpa", "0.19.198.in-addr.arpa", zone6.as_str(), &format!("c.6.{zone6}")] {
+        let bytes = ask(&f.server, 8, name, TYPE::PTR).await;
+        let reply = Packet::parse(&bytes).unwrap();
+
+        assert_eq!((reply.rcode(), reply.answers.len()), (RCODE::NoError, 0), "{name}");
+        assert_eq!(soa_minimum(&reply), Some(5), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn ptr_outside_the_fake_ranges_goes_upstream() {
+    let (upstream, mut queries) = stub(CANNED).await;
+    let f = fixture(&["*.corp.example"], &[], vec![upstream], true);
+    let asked = query(0xbeef, "10.2.0.192.in-addr.arpa", TYPE::PTR);
+
+    let answer = f.server.answer(asked.clone()).await.unwrap();
+
+    assert_eq!(&answer[2..], &CANNED[2..]);
+    assert_eq!(queries.recv().await.unwrap(), asked.to_vec());
 }
