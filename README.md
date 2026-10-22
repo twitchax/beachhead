@@ -135,6 +135,10 @@ real addresses, and browsers fall back to A and AAAA. A reverse lookup of a fake
 (`getent hosts 198.18.1.2`, or its v6 fake) answers the name it was handed out for, and one no name
 holds is NXDOMAIN.
 
+sshunnel's DNS server answers over TCP as well as UDP, and passes a query on (to the remote's
+resolver, or to your normal DNS servers for a name it doesn't route) over the transport it came by.
+An answer too large for UDP comes back truncated, and the resolver's retry over TCP gets it whole.
+
 UDP goes as flows, as in a UDP forward: each app socket and destination it sends to is a flow, a
 UDP socket on the remote connected to that destination and opened by the first datagram. Datagrams
 wait while the relay opens it, up to 32 of them or 64 KiB. Flows idle out as UDP forwards' do, and
@@ -276,10 +280,6 @@ in the [PRD log](.prds/PRD-0004.log.md).
   asks the system resolver. CIDR targets still catch their traffic.
 - Fake addresses only mean something while `route` runs. Answers carry a 5-second TTL, so a cached
   one fades soon after an exit.
-- Names under a pattern's domain that `route` doesn't send through the relay (an excluded name, or
-  `a.host.corp.example` under the exact `host.corp.example`) go to your normal DNS servers over UDP
-  only. An answer too large for UDP comes back truncated, and the lookup fails rather than retrying
-  over TCP.
 - `route` adds its routes to the main table and no `ip rule` of its own. A more specific route, or
   another tool's policy routing (Tailscale's subnet routes, say), can still win a target; `route`
   warns, naming the device that won, and leaves it be.

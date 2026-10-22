@@ -48,12 +48,13 @@ flows, with stream data after control. `route::stack` (the TUN netstack) keeps t
 through a bounded pipe, so a slow stream closes only that socket's window, and routed UDP and echo
 become flows through the flow table: datagrams go out with `try_send`, and replies come back
 through one bounded channel the loop reads only while the device keeps up, so a flood drops at its
-own flow's queue. The packet loop, its connections' and flows' tasks, the device's reader and
-writer and the DNS server share one current-thread runtime on a thread of their own
-(`route::thread`, named `sshunnel-stack`), so the netstack's own hops stay on one thread. The mux
-and everything else stay on the main runtime, and each segment still crosses to the mux there and
-back, through tokio's channels. **Nothing on that thread may block**: a blocking call there stalls
-every connection.
+own flow's queue. A connection to the DNS server is bridged the same way, to a task of its own
+(`dns::serve_tcp`), so a slow answer holds up only that connection. The packet loop, its
+connections' and flows' tasks, the device's reader and writer and the DNS server share one
+current-thread runtime on a thread of their own (`route::thread`, named `sshunnel-stack`), so the
+netstack's own hops stay on one thread. The mux and everything else stay on the main runtime, and
+each segment still crosses to the mux there and back, through tokio's channels. **Nothing on that
+thread may block**: a blocking call there stalls every connection.
 
 `route::helper` is the privilege boundary, not the client. `sshunnel route` starts it through sudo,
 and with a `NOPASSWD` sudoers line anything running as the user can too, so it trusts nothing the

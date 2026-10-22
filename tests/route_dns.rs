@@ -1,5 +1,6 @@
-//! The DNS server against a scripted tunnel (`FakeTunnel`) and a local UDP stub standing in for the
-//! normal upstream. Every test is a top-level function, so the PRD's filters see the bare names.
+//! The DNS server against a scripted tunnel (`FakeTunnel`) and local UDP and TCP stubs standing in
+//! for the normal upstream. Every test is a top-level function, so the PRD's filters see the bare
+//! names.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -18,14 +19,14 @@ use simple_dns::{
 use sshunnel::{
     route::{
         FAKE_RANGE6,
-        dns::{QUERY_TIMEOUT, Server, TTL},
+        dns::{QUERY_TIMEOUT, Server, TCP_IDLE, TTL, serve_tcp},
         names::{self, FakeMap, today},
         reverse,
         router::Router,
         stack::Dns,
         targets::Targets,
     },
-    tests::FakeTunnel,
+    tests::{FakeTunnel, framed_dns, read_framed_dns},
 };
 use sshunnel_mux::{
     QueryError,
@@ -33,13 +34,15 @@ use sshunnel_mux::{
 };
 use tempfile::TempDir;
 use tokio::{
-    net::UdpSocket,
-    time::{Instant, advance},
+    io::AsyncWriteExt as _,
+    net::{TcpListener, UdpSocket},
+    sync::mpsc::{UnboundedReceiver, unbounded_channel},
+    time::{Instant, advance, timeout},
 };
 
 struct Fixture {
     tunnel: FakeTunnel,
-    server: Server<FakeTunnel>,
+    server: Arc<Server<FakeTunnel>>,
     _state: TempDir,
 }
 
@@ -51,7 +54,7 @@ fn fixture(include: &[&str], exclude: &[&str], upstreams: Vec<SocketAddr>, fake_
     let names = FakeMap::load(state.path().join("names"), today()).unwrap();
     let router = Arc::new(Router::new(targets, names));
     let tunnel = FakeTunnel::new();
-    let server = Server::new(tunnel.clone(), router, upstreams, fake_v6);
+    let server = Arc::new(Server::new(tunnel.clone(), router, upstreams, fake_v6));
     Fixture { tunnel, server, _state: state }
 }
 
@@ -79,7 +82,7 @@ fn raw_query(id: u16, name: &str) -> Bytes {
 }
 
 async fn ask(server: &Server<FakeTunnel>, id: u16, name: &str, qtype: TYPE) -> Vec<u8> {
-    server.answer(query(id, name, qtype)).await.expect("an answer").to_vec()
+    server.answer(query(id, name, qtype), Transport::Udp).await.expect("an answer").to_vec()
 }
 
 fn soa_minimum(packet: &Packet<'_>) -> Option<u32> {
@@ -198,10 +201,13 @@ async fn a_missing_name_is_cached_too() {
 
 /// A UDP stub that answers every query with `canned`, its id swapped for the query's, and reports
 /// the queries it saw.
-async fn stub(canned: &'static [u8]) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn stub(canned: &'static [u8]) -> (SocketAddr, UnboundedReceiver<Vec<u8>>) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = socket.local_addr().unwrap();
-    let (seen, queries) = tokio::sync::mpsc::unbounded_channel();
+    (socket.local_addr().unwrap(), udp_stub_on(socket, canned))
+}
+
+fn udp_stub_on(socket: UdpSocket, canned: &'static [u8]) -> UnboundedReceiver<Vec<u8>> {
+    let (seen, queries) = unbounded_channel();
     tokio::spawn(async move {
         let mut buf = [0_u8; 512];
         while let Ok((n, from)) = socket.recv_from(&mut buf).await {
@@ -211,7 +217,32 @@ async fn stub(canned: &'static [u8]) -> (SocketAddr, tokio::sync::mpsc::Unbounde
             socket.send_to(&reply, from).await.ok();
         }
     });
-    (addr, queries)
+    queries
+}
+
+/// [`stub`] over UDP and over TCP on one port, as an upstream serves both: `udp` answers the
+/// first, `tcp` the second (RFC 7766's framing, a connection per query). Returns the port's address
+/// and the queries each saw.
+async fn stubs(udp: &'static [u8], tcp: &'static [u8]) -> (SocketAddr, UnboundedReceiver<Vec<u8>>, UnboundedReceiver<Vec<u8>>) {
+    let (listener, socket) = loop {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Another test may hold the UDP side of the port; then try another.
+        if let Ok(socket) = UdpSocket::bind(listener.local_addr().unwrap()).await {
+            break (listener, socket);
+        }
+    };
+    let addr = listener.local_addr().unwrap();
+    let (seen, tcp_queries) = unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            let Ok(query) = read_framed_dns(&mut conn).await else { continue };
+            let mut reply = tcp.to_vec();
+            reply[..2].copy_from_slice(&query[..2]);
+            seen.send(query.to_vec()).ok();
+            conn.write_all(&framed_dns(&reply).unwrap()).await.ok();
+        }
+    });
+    (addr, udp_stub_on(socket, udp), tcp_queries)
 }
 
 const CANNED: &[u8] = b"\x00\x00\x81\x80\x00\x00\x00\x00\x00\x00\x00\x00 the stub's own bytes";
@@ -222,7 +253,7 @@ async fn an_excluded_name_is_answered_by_the_upstream() {
     let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream], true);
     let asked = query(0xbeef, "private.corp.example", TYPE::A);
 
-    let answer = f.server.answer(asked.clone()).await.unwrap();
+    let answer = f.server.answer(asked.clone(), Transport::Udp).await.unwrap();
 
     let mut expected = CANNED.to_vec();
     expected[..2].copy_from_slice(&[0xbe, 0xef]);
@@ -239,7 +270,7 @@ async fn a_large_upstream_answer_is_relayed_whole() {
     let (upstream, _queries) = stub(&LARGE).await;
     let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream], true);
 
-    let answer = f.server.answer(query(0xbeef, "private.corp.example", TYPE::TXT)).await.unwrap();
+    let answer = f.server.answer(query(0xbeef, "private.corp.example", TYPE::TXT), Transport::Udp).await.unwrap();
 
     assert_eq!(answer.len(), LARGE.len());
     assert!(answer[2..] == LARGE[2..], "the answer changed on the way");
@@ -250,7 +281,7 @@ async fn an_unmatched_name_under_an_exact_target_goes_upstream() {
     let (upstream, _queries) = stub(CANNED).await;
     let f = fixture(&["host.corp.example"], &[], vec![upstream], true);
 
-    let answer = f.server.answer(query(5, "a.host.corp.example", TYPE::A)).await.unwrap();
+    let answer = f.server.answer(query(5, "a.host.corp.example", TYPE::A), Transport::Udp).await.unwrap();
 
     assert_eq!(&answer[2..], &CANNED[2..]);
     assert_eq!(f.tunnel.resolves().len(), 0);
@@ -289,8 +320,8 @@ async fn no_upstream_answers_is_servfail() {
 async fn garbage_gets_no_answer() {
     let f = corp();
 
-    assert!(f.server.answer(Bytes::from_static(b"\x01\x02\x03")).await.is_none());
-    assert!(f.server.answer(Bytes::new()).await.is_none());
+    assert!(f.server.answer(Bytes::from_static(b"\x01\x02\x03"), Transport::Udp).await.is_none());
+    assert!(f.server.answer(Bytes::new(), Transport::Udp).await.is_none());
 }
 
 #[tokio::test]
@@ -298,7 +329,7 @@ async fn an_implausible_name_is_nxdomain_without_a_lookup() {
     let f = corp();
 
     for name in ["bad name.corp.example", "new\nline.corp.example", "caf\u{e9}.corp.example", "a\tb.corp.example"] {
-        let bytes = f.server.answer(raw_query(1, name)).await.expect("an answer");
+        let bytes = f.server.answer(raw_query(1, name), Transport::Udp).await.expect("an answer");
         let reply = Packet::parse(&bytes).unwrap();
         assert_eq!(reply.rcode(), RCODE::NameError, "{name:?}");
     }
@@ -333,14 +364,14 @@ async fn responses_and_multi_question_packets_get_no_answer() {
         .questions
         .push(Question::new(Name::new_unchecked("wiki.corp.example"), QTYPE::TYPE(TYPE::A), QCLASS::CLASS(CLASS::IN), false));
     let response = Bytes::from(response.build_bytes_vec().unwrap());
-    assert!(f.server.answer(response).await.is_none());
+    assert!(f.server.answer(response, Transport::Udp).await.is_none());
 
     let mut two = Packet::new_query(2);
     for name in ["wiki.corp.example", "other.corp.example"] {
         two.questions.push(Question::new(Name::new_unchecked(name), QTYPE::TYPE(TYPE::A), QCLASS::CLASS(CLASS::IN), false));
     }
     let two = Bytes::from(two.build_bytes_vec().unwrap());
-    assert!(f.server.answer(two).await.is_none());
+    assert!(f.server.answer(two, Transport::Udp).await.is_none());
 
     assert_eq!(f.tunnel.resolves().len(), 0);
 }
@@ -410,7 +441,7 @@ async fn dns_records_srv_comes_from_the_remote() {
     }));
     let asked = query(0x5151, "_ldap._tcp.corp.example", TYPE::SRV);
 
-    let bytes = f.server.answer(asked.clone()).await.expect("an answer");
+    let bytes = f.server.answer(asked.clone(), Transport::Udp).await.expect("an answer");
     let reply = Packet::parse(&bytes).unwrap();
 
     assert_eq!(reply.id(), 0x5151);
@@ -516,7 +547,7 @@ async fn dns_records_strip_https_and_svcb_everywhere() {
     let mut any = Packet::new_query(1);
     any.questions.push(Question::new(Name::new_unchecked("wiki.corp.example"), QTYPE::ANY, QCLASS::CLASS(CLASS::IN), false));
 
-    let bytes = f.server.answer(Bytes::from(any.build_bytes_vec().unwrap())).await.expect("an answer");
+    let bytes = f.server.answer(Bytes::from(any.build_bytes_vec().unwrap()), Transport::Udp).await.expect("an answer");
     let reply = Packet::parse(&bytes).unwrap();
 
     assert_eq!(reply.rcode(), RCODE::NoError);
@@ -703,8 +734,94 @@ async fn ptr_outside_the_fake_ranges_goes_upstream() {
     let f = fixture(&["*.corp.example"], &[], vec![upstream], true);
     let asked = query(0xbeef, "10.2.0.192.in-addr.arpa", TYPE::PTR);
 
-    let answer = f.server.answer(asked.clone()).await.unwrap();
+    let answer = f.server.answer(asked.clone(), Transport::Udp).await.unwrap();
 
     assert_eq!(&answer[2..], &CANNED[2..]);
     assert_eq!(queries.recv().await.unwrap(), asked.to_vec());
+}
+
+/// What the TCP stub answers, so an answer shows which transport it came over.
+const OVER_TCP: &[u8] = b"\x00\x00\x81\x80\x00\x00\x00\x00\x00\x00\x00\x00 the stub's bytes over TCP";
+/// A truncated answer (TC), as an upstream sends one too large for UDP.
+const TRUNCATED: &[u8] = b"\x00\x00\x83\x80\x00\x00\x00\x00\x00\x00\x00\x00";
+
+/// `canned` with `id` in place of its own.
+fn with_id(id: u16, canned: &[u8]) -> Vec<u8> {
+    [&id.to_be_bytes()[..], &canned[2..]].concat()
+}
+
+#[tokio::test]
+async fn dns_over_tcp_forwards_upstream_over_tcp() {
+    let (upstream, mut udp_queries, mut tcp_queries) = stubs(CANNED, OVER_TCP).await;
+    let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream], true);
+    let asked = query(0xbeef, "private.corp.example", TYPE::A);
+
+    let answer = f.server.answer(asked.clone(), Transport::Tcp).await.unwrap();
+
+    assert_eq!(answer.to_vec(), with_id(0xbeef, OVER_TCP));
+    assert_eq!(tcp_queries.recv().await.unwrap(), asked.to_vec());
+    assert!(udp_queries.try_recv().is_err(), "the query went over UDP too");
+    assert_eq!(f.tunnel.resolves().len(), 0);
+}
+
+#[tokio::test]
+async fn dns_over_tcp_retries_a_truncated_answer() {
+    let (upstream, _udp_queries, _tcp_queries) = stubs(TRUNCATED, &LARGE).await;
+    let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream], true);
+    let asked = query(0x7c7c, "private.corp.example", TYPE::TXT);
+
+    let over_udp = f.server.answer(asked.clone(), Transport::Udp).await.unwrap();
+    let over_tcp = f.server.answer(asked, Transport::Tcp).await.unwrap();
+
+    // The resolver sees TC over UDP and retries over TCP, which gets the whole answer.
+    assert_eq!(over_udp.to_vec(), with_id(0x7c7c, TRUNCATED));
+    assert_eq!(over_tcp.len(), LARGE.len());
+    assert!(over_tcp[..2] == [0x7c, 0x7c] && over_tcp[2..] == LARGE[2..], "the answer changed on the way");
+}
+
+#[tokio::test]
+async fn dns_over_tcp_queries_a_matched_name_over_tcp() {
+    let f = corp();
+    let truncated = resolver(|_, answer| {
+        answer.set_flags(PacketFlag::TRUNCATION);
+        answer.answers.push(record("corp.example", txt("the first of many")));
+    });
+    let whole = resolver(|_, answer| {
+        for text in ["the first of many", "the second", "the third"] {
+            answer.answers.push(record("corp.example", txt(text)));
+        }
+    });
+    // The remote's resolver truncates over UDP and answers in full over TCP.
+    f.tunnel.answer_queries(move |query, transport| match transport {
+        Transport::Udp => truncated(query, transport),
+        Transport::Tcp => whole(query, transport),
+    });
+    let asked = query(7, "corp.example", TYPE::TXT);
+
+    let over_udp = f.server.answer(asked.clone(), Transport::Udp).await.expect("an answer");
+    let over_tcp = f.server.answer(asked.clone(), Transport::Tcp).await.expect("an answer");
+    let (over_udp, over_tcp) = (Packet::parse(&over_udp).unwrap(), Packet::parse(&over_tcp).unwrap());
+
+    assert!(over_udp.has_flags(PacketFlag::TRUNCATION));
+    assert_eq!(over_udp.answers.len(), 1);
+    assert!(!over_tcp.has_flags(PacketFlag::TRUNCATION));
+    assert_eq!((over_tcp.id(), over_tcp.rcode(), over_tcp.answers.len()), (7, RCODE::NoError, 3));
+    assert_eq!(f.tunnel.queries(), vec![(asked.clone(), Transport::Udp), (asked, Transport::Tcp)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dns_over_tcp_ends_a_connection_whose_asker_stops_reading() {
+    let f = corp();
+    f.tunnel.name("wiki.corp.example", Ok(()));
+    // Room for all six queries but only four answers, so the server waits on the asker.
+    let (mut asker, io) = tokio::io::duplex(256);
+    let served = tokio::spawn(serve_tcp(Arc::clone(&f.server), io));
+    let queries: Vec<u8> = (0..6).flat_map(|id| framed_dns(&query(id, "wiki.corp.example", TYPE::A)).unwrap()).collect();
+    asker.write_all(&queries).await.unwrap();
+
+    tokio::time::sleep(TCP_IDLE.saturating_sub(Duration::from_secs(1))).await;
+    assert!(!served.is_finished(), "gave up on the asker early");
+
+    let ended = timeout(Duration::from_secs(2), served).await.expect("ended once the asker took nothing for TCP_IDLE").unwrap();
+    assert!(ended.is_err(), "{ended:?}");
 }

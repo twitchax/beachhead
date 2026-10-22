@@ -13,8 +13,9 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
+use bytes::Bytes;
 use tokio::{
-    io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+    io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::{TcpListener, TcpStream, UdpSocket},
     process::{Child, Command},
     sync::watch,
@@ -402,6 +403,28 @@ pub async fn udp_stale_server() -> Res<SocketAddr> {
         }
     });
     Ok(addr)
+}
+
+/// `message` as DNS over TCP carries it (RFC 7766): its length in two bytes, then itself.
+///
+/// # Errors
+///
+/// Fails when `message` is over 65535 bytes, which no DNS message is.
+pub fn framed_dns(message: &[u8]) -> Res<Vec<u8>> {
+    let len = u16::try_from(message.len()).context("a DNS message over 65535 bytes")?;
+    Ok([&len.to_be_bytes()[..], message].concat())
+}
+
+/// One DNS message off a TCP stream (RFC 7766): its two-byte length, then that many bytes.
+///
+/// # Errors
+///
+/// Fails when the stream ends first.
+pub async fn read_framed_dns(io: &mut (impl AsyncRead + Unpin)) -> Res<Bytes> {
+    let len = io.read_u16().await.context("reading a DNS message's length")?;
+    let mut message = vec![0; usize::from(len)];
+    io.read_exact(&mut message).await.context("reading a DNS message")?;
+    Ok(message.into())
 }
 
 /// Yields until `done` holds, which lets the runtime poll its I/O without moving a paused clock.

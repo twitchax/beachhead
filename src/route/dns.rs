@@ -5,9 +5,14 @@
 //! on an `AAAA` query gets its v6 fake; `HTTPS` and `SVCB` get nothing, and every other type goes to
 //! the remote's resolver, with any real address taken out of its answer. Every other name goes,
 //! byte for byte, to the normal upstream servers.
+//!
+//! Queries come over UDP, or over TCP through [`serve_tcp`], and go on (to the upstreams or the
+//! remote's resolver) over the transport they came by, so a resolver that gets a truncated answer
+//! over UDP retries over TCP and gets it whole.
 
 use std::{
     collections::HashMap,
+    io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
@@ -21,12 +26,13 @@ use simple_dns::{
 };
 use sshunnel_mux::frame::{ResolveErrKind, Transport};
 use tokio::{
-    net::UdpSocket,
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+    net::{TcpStream, UdpSocket},
     time::{Instant, timeout},
 };
 
 use crate::{
-    base::Res,
+    base::{Res, Void},
     route::{
         FAKE_RANGE, FAKE_RANGE6,
         names::{fake_v4, fake_v6, today},
@@ -45,11 +51,13 @@ pub const TTL: Duration = Duration::from_secs(5);
 pub const CACHE: Duration = Duration::from_secs(60);
 /// How long the remote's resolver gets to answer a matched name's query, through the relay.
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long each upstream gets to answer a forwarded query.
+/// How long a TCP connection may go without a query before it closes, and how long its asker may
+/// leave an answer unread.
+pub const TCP_IDLE: Duration = Duration::from_secs(10);
+/// How long each upstream gets to answer a forwarded query, a TCP connection's setup included.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
-/// The largest DNS message UDP can carry, so no upstream answer is cut short. Forwarding is UDP
-/// only: an answer too large for it comes back truncated (TC), and the resolver's retry over TCP
-/// fails.
+/// The largest DNS message UDP can carry, so no upstream answer is cut short. One too large for
+/// the upstream to send over UDP comes back truncated (TC), and the resolver retries over TCP.
 const UPSTREAM_BUF: usize = 65535;
 /// The zone negative answers claim to come from; `.invalid` can never exist, so it can't clash.
 const SOA_ZONE: &str = "sshunnel.invalid";
@@ -84,7 +92,7 @@ impl<T: Tunnel> Server<T> {
         }
     }
 
-    async fn respond(&self, query: &Bytes) -> Option<Bytes> {
+    async fn respond(&self, query: &Bytes, transport: Transport) -> Option<Bytes> {
         let packet = Packet::parse(query).ok()?;
         if packet.has_flags(PacketFlag::RESPONSE) {
             return None;
@@ -101,7 +109,7 @@ impl<T: Tunnel> Server<T> {
         }
 
         if !self.router.targets().routes_name(&name) {
-            return match self.forward(query).await {
+            return match self.forward(query, transport).await {
                 Some(answer) => Some(answer),
                 None => reply(&packet, RCODE::ServerFailure, Vec::new(), false),
             };
@@ -117,7 +125,7 @@ impl<T: Tunnel> Server<T> {
         if LOCAL.into_iter().any(|local| question.qtype == QTYPE::TYPE(local)) {
             self.fake(&packet, question, &name).await
         } else {
-            self.remote(query, &packet, &name).await
+            self.remote(query, &packet, &name, transport).await
         }
     }
 
@@ -163,9 +171,9 @@ impl<T: Tunnel> Server<T> {
     /// asks for the target's A and gets its fake. The
     /// remote's nameservers don't know a name only its `/etc/hosts` has, so their NXDOMAIN for a
     /// name the relay finds becomes NODATA, which keeps that name's fake A from hiding behind it.
-    async fn remote(&self, query: &Bytes, packet: &Packet<'_>, name: &str) -> Option<Bytes> {
+    async fn remote(&self, query: &Bytes, packet: &Packet<'_>, name: &str, transport: Transport) -> Option<Bytes> {
         let servfail = || reply(packet, RCODE::ServerFailure, Vec::new(), false);
-        let answer = match timeout(QUERY_TIMEOUT, self.tunnel.query(query.clone(), Transport::Udp)).await {
+        let answer = match timeout(QUERY_TIMEOUT, self.tunnel.query(query.clone(), transport)).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(e)) => {
                 tracing::debug!(name, error = %e.reason, "the remote's resolver failed");
@@ -230,10 +238,16 @@ impl<T: Tunnel> Server<T> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The first answer to the unchanged query from any upstream, tried in turn.
-    async fn forward(&self, query: &Bytes) -> Option<Bytes> {
+    /// The first answer to the unchanged query from any upstream, tried in turn over `transport`.
+    async fn forward(&self, query: &Bytes, transport: Transport) -> Option<Bytes> {
         for &upstream in &self.upstreams {
-            match timeout(UPSTREAM_TIMEOUT, ask_upstream(upstream, query)).await {
+            let asked = async {
+                match transport {
+                    Transport::Udp => ask_upstream(upstream, query).await,
+                    Transport::Tcp => ask_upstream_tcp(upstream, query).await,
+                }
+            };
+            match timeout(UPSTREAM_TIMEOUT, asked).await {
                 Ok(Ok(answer)) => return Some(answer),
                 Ok(Err(e)) => tracing::debug!(%upstream, error = %format!("{e:#}"), "the upstream failed"),
                 Err(_) => tracing::debug!(%upstream, "the upstream timed out"),
@@ -244,8 +258,34 @@ impl<T: Tunnel> Server<T> {
 }
 
 impl<T: Tunnel> Dns for Server<T> {
-    async fn answer(&self, query: Bytes) -> Option<Bytes> {
-        self.respond(&query).await
+    async fn answer(&self, query: Bytes, transport: Transport) -> Option<Bytes> {
+        self.respond(&query, transport).await
+    }
+}
+
+/// RFC 7766 on one connection: a 2-byte length before each message, answered in order, closed
+/// after [`TCP_IDLE`] without a query.
+///
+/// It ends without error when the asker closes its end or goes quiet, and after a message `dns`
+/// gives no answer to: the asker would only wait out its own timeout for one, and a stream that
+/// carried something other than one query may have lost its framing.
+///
+/// # Errors
+///
+/// Fails when the connection does, or its asker leaves an answer unread for [`TCP_IDLE`].
+pub async fn serve_tcp<D: Dns, IO: AsyncRead + AsyncWrite + Unpin>(dns: Arc<D>, mut io: IO) -> Void {
+    loop {
+        let query = match timeout(TCP_IDLE, read_message(&mut io)).await {
+            Ok(Ok(query)) => query,
+            // The asker closed its end.
+            Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(e)) => return Err(e).context("reading a query"),
+            // Idle.
+            Err(_) => return Ok(()),
+        };
+        let Some(answer) = dns.answer(query, Transport::Tcp).await else { return Ok(()) };
+        // So an asker that stops reading can't hold one of the stack's few connections for good.
+        timeout(TCP_IDLE, write_message(&mut io, &answer)).await.context("the asker left an answer unread")??;
     }
 }
 
@@ -268,6 +308,38 @@ async fn ask_upstream(upstream: SocketAddr, query: &[u8]) -> Res<Bytes> {
             return Ok(Bytes::copy_from_slice(&buf[..n]));
         }
     }
+}
+
+/// Sends `query` to `upstream` over a fresh TCP connection, one per attempt, and returns the first
+/// answer whose id matches.
+async fn ask_upstream_tcp(upstream: SocketAddr, query: &[u8]) -> Res<Bytes> {
+    let mut stream = TcpStream::connect(upstream).await.context("connecting to the upstream")?;
+    write_message(&mut stream, query).await.context("sending the query to the upstream")?;
+    loop {
+        let answer = read_message(&mut stream).await.context("reading the upstream's answer")?;
+        if answer.len() >= 2 && answer[..2] == query[..2] {
+            return Ok(answer);
+        }
+    }
+}
+
+/// One DNS message off a TCP stream (RFC 7766): its 2-byte length, then that many bytes.
+async fn read_message(io: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Bytes> {
+    let len = io.read_u16().await?;
+    let mut message = vec![0; usize::from(len)];
+    io.read_exact(&mut message).await?;
+    Ok(message.into())
+}
+
+/// Writes `message` to a TCP stream behind its 2-byte length, in one write so it can leave in one
+/// segment.
+async fn write_message(io: &mut (impl AsyncWrite + Unpin), message: &[u8]) -> Res<()> {
+    let len = u16::try_from(message.len()).context("a DNS message over 65535 bytes")?;
+    let mut framed = Vec::with_capacity(2 + message.len());
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(message);
+    io.write_all(&framed).await.context("writing a DNS message")?;
+    io.flush().await.context("flushing a DNS message")
 }
 
 /// Builds the reply to `query`: its id and question echoed, `answers`, and for a negative answer

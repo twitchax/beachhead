@@ -20,16 +20,17 @@ use sshunnel::{
     flows::MAX_FLOWS,
     route::{
         DNS_ADDR, TUN_ADDR, TUN_ADDR6,
+        dns::TCP_IDLE,
         names::{FakeMap, fake_v6, today},
         router::Router,
-        stack::{self, Dns, MAX_HELD, MAX_QUERIES, Packets},
+        stack::{self, Dns, MAX_DNS_CONNS, MAX_HELD, MAX_QUERIES, Packets},
         targets::Targets,
     },
-    tests::{AppStack, Connect, FakeTunnel, Icmp, Sent, echo_server, pattern, udp_echo_server, udp_stale_server, until},
+    tests::{AppStack, Connect, FakeTunnel, Icmp, Sent, echo_server, framed_dns, pattern, read_framed_dns, udp_echo_server, udp_stale_server, until},
 };
 use sshunnel_mux::{
     FlowKind,
-    frame::{Capabilities, OpenErrKind},
+    frame::{Capabilities, OpenErrKind, Transport},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -43,20 +44,23 @@ use tokio::{
 struct NoDns;
 
 impl Dns for NoDns {
-    fn answer(&self, _query: Bytes) -> impl Future<Output = Option<Bytes>> + Send {
+    fn answer(&self, _query: Bytes, _transport: Transport) -> impl Future<Output = Option<Bytes>> + Send {
         std::future::ready(None)
     }
 }
 
+/// The queries a [`FixedDns`] was asked, with the transport each came over.
+type Asked = Arc<Mutex<Vec<(Bytes, Transport)>>>;
+
 /// Answers every query with the same bytes and records the queries.
 struct FixedDns {
     answer: Bytes,
-    asked: Arc<Mutex<Vec<Bytes>>>,
+    asked: Asked,
 }
 
 impl Dns for FixedDns {
-    fn answer(&self, query: Bytes) -> impl Future<Output = Option<Bytes>> + Send {
-        self.asked.lock().unwrap().push(query);
+    fn answer(&self, query: Bytes, transport: Transport) -> impl Future<Output = Option<Bytes>> + Send {
+        self.asked.lock().unwrap().push((query, transport));
         std::future::ready(Some(self.answer.clone()))
     }
 }
@@ -68,7 +72,7 @@ struct GatedDns {
 }
 
 impl Dns for GatedDns {
-    async fn answer(&self, query: Bytes) -> Option<Bytes> {
+    async fn answer(&self, query: Bytes, _transport: Transport) -> Option<Bytes> {
         self.asked.send_modify(|asked| *asked += 1);
         self.release.clone().wait_for(|open| *open).await.ok()?;
         Some(query)
@@ -666,7 +670,7 @@ async fn dns_queries_reach_the_dns_server() {
     let answer = rig.app.exchange(SocketAddr::new(DNS_ADDR.into(), 53), b"a query").await;
 
     assert_eq!(answer.as_deref(), Some(&b"a fixed answer"[..]));
-    assert_eq!(*asked.lock().unwrap(), [Bytes::from_static(b"a query")]);
+    assert_eq!(*asked.lock().unwrap(), [(Bytes::from_static(b"a query"), Transport::Udp)]);
     // Only port 53 is the DNS server.
     let elsewhere = rig.app.udp(SocketAddr::new(DNS_ADDR.into(), 5353), b"a query").await.map(|i| (i.kind, i.code));
     assert_eq!(elsewhere, Some((3, 13)));
@@ -697,6 +701,87 @@ async fn dns_queries_beyond_the_cap_are_dropped() {
         answered += usize::from(exchange.await.unwrap().is_some());
     }
     assert_eq!(answered, MAX_QUERIES);
+}
+
+/// The DNS server's address, for TCP.
+fn dns_tcp() -> SocketAddr {
+    SocketAddr::new(DNS_ADDR.into(), 53)
+}
+
+/// A rig whose DNS server answers every query with `answer`, and the queries it was asked.
+fn fixed_dns_rig(answer: &'static [u8]) -> (Rig, Asked) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let dns = FixedDns {
+        answer: Bytes::from_static(answer),
+        asked: Arc::clone(&asked),
+    };
+    (rig_with(&["*.corp.example"], dns), asked)
+}
+
+#[tokio::test]
+async fn dns_over_tcp_answers_framed_queries() {
+    let (rig, asked) = fixed_dns_rig(b"a fixed answer");
+    let mut conn = rig.app.connect(dns_tcp()).await.unwrap();
+
+    // Both in one write, as a resolver pipelines them.
+    let queries = [framed_dns(b"the first query").unwrap(), framed_dns(b"the second").unwrap()].concat();
+    conn.write_all(&queries).await.unwrap();
+    let first = timeout(Duration::from_secs(5), read_framed_dns(&mut conn)).await.expect("the first answer").unwrap();
+    let second = timeout(Duration::from_secs(5), read_framed_dns(&mut conn)).await.expect("the second answer").unwrap();
+
+    assert_eq!([first, second], [Bytes::from_static(b"a fixed answer"), Bytes::from_static(b"a fixed answer")]);
+    let expected = [(Bytes::from_static(b"the first query"), Transport::Tcp), (Bytes::from_static(b"the second"), Transport::Tcp)];
+    assert_eq!(*asked.lock().unwrap(), expected);
+    assert_eq!(rig.tunnel.opens(), []);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dns_over_tcp_closes_an_idle_connection() {
+    let (rig, _asked) = fixed_dns_rig(b"a fixed answer");
+    let mut conn = rig.app.connect(dns_tcp()).await.unwrap();
+
+    // A query restarts the clock.
+    tokio::time::sleep(TCP_IDLE.saturating_sub(Duration::from_secs(1))).await;
+    conn.write_all(&framed_dns(b"a query").unwrap()).await.unwrap();
+    read_framed_dns(&mut conn).await.unwrap();
+    tokio::time::sleep(TCP_IDLE.saturating_sub(Duration::from_secs(1))).await;
+    let early = timeout(Duration::from_millis(10), conn.read(&mut [0; 1])).await;
+    assert!(early.is_err(), "closed within {TCP_IDLE:?} of a query: {early:?}");
+
+    // TCP_IDLE without one, and the server closes its end.
+    let closed = timeout(Duration::from_secs(2), conn.read(&mut [0; 1])).await.expect("closed by now");
+    assert_eq!(closed.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn dns_over_tcp_closes_after_a_message_it_cannot_answer() {
+    // `NoDns` answers nothing, as the server answers nothing that isn't one query.
+    let rig = rig(&["*.corp.example"]);
+    let mut conn = rig.app.connect(dns_tcp()).await.unwrap();
+
+    conn.write_all(&framed_dns(b"not a query").unwrap()).await.unwrap();
+    let mut rest = Vec::new();
+    // Well inside TCP_IDLE: closed for the message, not for idling.
+    timeout(Duration::from_secs(5), conn.read_to_end(&mut rest)).await.expect("closed").unwrap();
+
+    assert_eq!(rest, b"");
+}
+
+#[tokio::test]
+async fn dns_over_tcp_connections_beyond_the_cap_are_reset() {
+    let rig = rig(&["*.corp.example"]);
+
+    let mut open = Vec::new();
+    for _ in 0..MAX_DNS_CONNS {
+        open.push(rig.app.connect(dns_tcp()).await.unwrap());
+    }
+    assert_eq!(rig.app.connect(dns_tcp()).await.err(), Some(Connect::Refused));
+
+    // The server ends a connection on the asker's FIN, which frees its place.
+    let mut first = open.swap_remove(0);
+    first.shutdown().await.unwrap();
+    assert_eq!(timeout(Duration::from_secs(5), first.read(&mut [0; 1])).await.expect("closed").unwrap(), 0);
+    assert!(rig.app.connect(dns_tcp()).await.is_ok());
 }
 
 #[tokio::test(start_paused = true)]

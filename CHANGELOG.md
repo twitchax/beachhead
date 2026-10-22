@@ -45,6 +45,10 @@ why the version moved the way it did.
 - Reverse lookups of fake addresses, v4 and v6, answer the name each was handed out for (NXDOMAIN
   for one no name holds). The root helper routes the fake ranges' reverse zones to the device's
   resolver link, next to the patterns' domains.
+- DNS over TCP on `route`'s DNS server (`198.18.0.2:53`, RFC 7766): a query that comes over TCP
+  goes on over TCP, to the remote's resolver for a name under a pattern and to the normal DNS
+  servers for any other, so a truncated answer's retry over TCP now succeeds. A connection closes
+  after 10 s without a query, and the server serves at most 64 at once, resetting the rest.
 
 ### Changed
 
@@ -52,6 +56,7 @@ why the version moved the way it did.
   machine has no IPv6.
 - Record types other than A and AAAA for a name under a pattern are no longer always empty
   (NODATA): they come from the remote's resolver.
+- `route::stack::Dns::answer` takes the transport the query came over.
 - The relay resolves every open through its bounded lookup path, and raises its open-file limit to
   the hard limit.
 - A published package refuses to build with relays from a commit other than its own.

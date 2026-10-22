@@ -4,17 +4,18 @@
 //! Every packet is classified before smoltcp sees it. A SYN that opens a connection is held while
 //! the relay dials, so the app sees the remote's answer rather than ours: a dial that succeeds
 //! replays the SYN into a fresh listening socket, a refused one becomes an RST, an unreachable host
-//! ICMP host unreachable, and a timed-out one silence (the app's own timeout fires). UDP to the DNS
-//! address goes to [`Dns`], other routed UDP and echo requests to their flows through the relay
-//! (`route::datagrams`), and unrouted UDP and every other ICMP query get ICMP administratively
-//! prohibited. smoltcp only ever sees TCP.
+//! ICMP host unreachable, and a timed-out one silence (the app's own timeout fires). A SYN to the
+//! DNS server's port has nothing to dial: it is accepted at once, and its connection is served by
+//! [`serve_tcp`]. UDP to the DNS address goes to [`Dns`], other routed UDP and echo requests to
+//! their flows through the relay (`route::datagrams`), and unrouted UDP and every other ICMP query
+//! get ICMP administratively prohibited. smoltcp only ever sees TCP.
 //!
 //! One task runs it all from one `poll_fn`: the device's packets, the dials, DNS answers and flow
 //! opens in flight, the flows' replies, smoltcp's timer and the flows' idle timer, and every
-//! connection's end of the duplex pipe its relay stream pumps, so a pump's write wakes it. Back-pressure is per
-//! connection, as in the mux: a slow relay stream fills its pipe and then its socket's receive
-//! window, never the packet path. Flows' replies are read only while the device keeps up, so a
-//! flood waits in its own flow's bounded queue, and drops there.
+//! connection's end of the duplex pipe its relay stream (or the DNS server) pumps, so a pump's
+//! write wakes it. Back-pressure is per connection, as in the mux: a slow relay stream fills its
+//! pipe and then its socket's receive window, never the packet path. Flows' replies are read only
+//! while the device keeps up, so a flood waits in its own flow's bounded queue, and drops there.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -38,7 +39,10 @@ use smoltcp::{
         HardwareAddress, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpCidr, IpListenEndpoint, IpProtocol, IpRepr, Ipv4Packet, Ipv6Packet, TcpPacket, UDP_HEADER_LEN, UdpPacket, UdpRepr, checksum,
     },
 };
-use sshunnel_mux::{OpenError, Traffic, frame::OpenErrKind};
+use sshunnel_mux::{
+    OpenError, Traffic,
+    frame::{OpenErrKind, Transport},
+};
 use tokio::{
     io::{AsyncRead as _, AsyncWrite as _, DuplexStream, ReadBuf, duplex},
     sync::mpsc::{self, OwnedPermit, error::SendError, error::TrySendError},
@@ -52,6 +56,7 @@ use crate::{
     route::{
         DNS_ADDR, FAKE_RANGE, MTU, TUN_ADDR, TUN_ADDR6,
         datagrams::{Datagrams, echo_id},
+        dns::serve_tcp,
         router::Router,
     },
     tunnel::{Conn as _, Tunnel},
@@ -62,6 +67,9 @@ use crate::{
 pub const MAX_HELD: usize = 256;
 /// DNS queries answered at once; past this a query is dropped, and the client retries it.
 pub const MAX_QUERIES: usize = 256;
+/// TCP connections the DNS server serves at once; past this a new one is reset, so a burst of them
+/// costs bounded memory and tasks.
+pub const MAX_DNS_CONNS: usize = 64;
 /// Each socket's receive and send buffer: four full-size segments at the default MTU, which lets
 /// window scaling keep a fast app busy without much memory per connection.
 const SOCKET_BUFFER: usize = 256 * 1024;
@@ -88,9 +96,10 @@ pub struct Packets {
     pub tx: mpsc::Sender<Bytes>,
 }
 
-/// The DNS server behind [`DNS_ADDR`]: a query's UDP payload in, at most one answer out.
+/// The DNS server behind [`DNS_ADDR`]: a query in (a UDP payload, or one message off a TCP
+/// connection) with the transport it came over, at most one answer out.
 pub trait Dns: Send + Sync + 'static {
-    fn answer(&self, query: Bytes) -> impl Future<Output = Option<Bytes>> + Send;
+    fn answer(&self, query: Bytes, transport: Transport) -> impl Future<Output = Option<Bytes>> + Send;
 }
 
 /// Runs the stack until the device's packets end.
@@ -117,6 +126,7 @@ pub async fn run<T: Tunnel, D: Dns>(packets: Packets, tunnel: T, router: Arc<Rou
         dials: JoinSet::new(),
         queries: JoinSet::new(),
         pumps: JoinSet::new(),
+        dns_conns: JoinSet::new(),
     };
     poll_fn(|cx| stack.poll(cx)).await
 }
@@ -151,6 +161,8 @@ struct Stack<T: Tunnel, D: Dns> {
     /// Answers to send: the asker and the answer.
     queries: JoinSet<Option<(SocketAddr, Bytes)>>,
     pumps: JoinSet<(Flow, Res<Traffic>)>,
+    /// The DNS server's TCP connections, each serving the far end of its pipe.
+    dns_conns: JoinSet<(Flow, Void)>,
     /// Routed UDP's flows.
     datagrams: Datagrams<T>,
 }
@@ -248,6 +260,9 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
             // A retransmit while the dial runs.
             return;
         }
+        if flow.remote == SocketAddr::new(DNS_ADDR.into(), DNS_PORT) {
+            return self.dns_conn(flow, packet);
+        }
         let Some(host) = self.router.destination(flow.remote.ip()) else {
             debug!(%flow, "not routed; resetting");
             // No socket for it: smoltcp answers with an RST.
@@ -265,6 +280,23 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         });
     }
 
+    /// Accepts a connection to the DNS server and serves it from a task of its own. Past
+    /// [`MAX_DNS_CONNS`] the SYN goes to smoltcp with no socket for it, which resets it.
+    fn dns_conn(&mut self, flow: Flow, syn: Bytes) {
+        if self.dns_conns.len() >= MAX_DNS_CONNS {
+            debug!(%flow, "{MAX_DNS_CONNS} DNS connections already open; resetting one");
+            return self.engine.inject(syn);
+        }
+        let Some(handle) = self.engine.accept(flow.remote, flow.app, syn) else {
+            debug!(%flow, "the DNS connection's SYN wasn't taken");
+            return;
+        };
+        let (near, far) = duplex(PIPE);
+        let dns = Arc::clone(&self.dns);
+        let server = self.dns_conns.spawn(async move { (flow, serve_tcp(dns, far).await) });
+        self.bridged(flow, handle, near, server);
+    }
+
     fn query(&mut self, packet: &Bytes, ip: &Ip) {
         if self.queries.len() >= MAX_QUERIES {
             debug!("{MAX_QUERIES} DNS queries in flight; dropping one");
@@ -274,10 +306,10 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         let asker = SocketAddr::new(ip.src, udp.src_port());
         let Some(query) = ip.udp_payload(packet) else { return };
         let dns = Arc::clone(&self.dns);
-        self.queries.spawn(async move { dns.answer(query).await.map(|answer| (asker, answer)) });
+        self.queries.spawn(async move { dns.answer(query, Transport::Udp).await.map(|answer| (asker, answer)) });
     }
 
-    /// Acts on the dials, DNS answers, flow opens and pumps that finished.
+    /// Acts on the dials, DNS answers, flow opens, pumps and DNS connections that finished.
     fn finish(&mut self, cx: &mut Context<'_>) -> Void {
         self.datagrams.opened(cx, |packet| self.engine.send_opt(packet))?;
         while let Poll::Ready(Some(dialed)) = self.dials.poll_join_next(cx) {
@@ -310,6 +342,20 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
                 }
             }
         }
+        self.served(cx)
+    }
+
+    /// Reaps the DNS server's connections that ended, freeing their places.
+    fn served(&mut self, cx: &mut Context<'_>) -> Void {
+        while let Poll::Ready(Some(served)) = self.dns_conns.poll_join_next(cx) {
+            match served {
+                Ok((_, Ok(()))) => {}
+                Ok((flow, Err(e))) => debug!(%flow, "DNS connection failed: {e:#}"),
+                // The stack aborted it when the app reset the connection.
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => return Err(e).context("a DNS connection's task failed"),
+            }
+        }
         Ok(())
     }
 
@@ -333,6 +379,11 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         };
         let (near, far) = duplex(PIPE);
         let pump = self.pumps.spawn(async move { (flow, conn.pump(far).await) });
+        self.bridged(flow, handle, near, pump);
+    }
+
+    /// Joins `flow`'s accepted socket to its end of a pipe, whose far end `pump` serves.
+    fn bridged(&mut self, flow: Flow, handle: SocketHandle, near: DuplexStream, pump: AbortHandle) {
         self.engine.bridge(handle, near, Some(pump));
         self.flows.insert(flow, handle);
         self.handles.insert(handle, flow);
