@@ -13,7 +13,7 @@ use bytes::Bytes;
 use pretty_assertions::assert_eq;
 use simple_dns::{
     CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE,
-    rdata::{A, AAAA, MX, NS, PTR, RData, SOA, SRV, TXT},
+    rdata::{A, AAAA, HTTPS, MX, NS, PTR, RData, SOA, SRV, SVCB, TXT},
 };
 use sshunnel::{
     route::{
@@ -496,6 +496,35 @@ async fn dns_records_strip_a_and_aaaa_everywhere() {
     assert_eq!(kinds(&reply.answers), [TYPE::MX]);
     assert_eq!(kinds(&reply.name_servers), [TYPE::NS]);
     assert_eq!(kinds(&reply.additional_records), [TYPE::TXT]);
+}
+
+#[tokio::test]
+async fn dns_records_strip_https_and_svcb_everywhere() {
+    let f = corp();
+    f.tunnel.answer_queries(resolver(|_, answer| {
+        let mut https = SVCB::new(1, Name::new_unchecked("."));
+        https.set_ipv4hint(&[u32::from("10.99.0.80".parse::<Ipv4Addr>().unwrap())]);
+        let mut svcb = SVCB::new(1, Name::new_unchecked("."));
+        svcb.set_ipv6hint(&[u128::from("fd99::80".parse::<Ipv6Addr>().unwrap())]);
+        answer.answers.push(record("wiki.corp.example", RData::HTTPS(HTTPS(https))));
+        answer.answers.push(record("wiki.corp.example", txt("kept")));
+        answer.name_servers.push(record("wiki.corp.example", RData::SVCB(svcb.clone())));
+        answer.additional_records.push(record("_8443._https.wiki.corp.example", RData::SVCB(svcb)));
+        answer.additional_records.push(record("wiki.corp.example", txt("kept too")));
+    }));
+    // ANY reaches the remote, and its HTTPS and SVCB records carry real addresses in their hints.
+    let mut any = Packet::new_query(1);
+    any.questions.push(Question::new(Name::new_unchecked("wiki.corp.example"), QTYPE::ANY, QCLASS::CLASS(CLASS::IN), false));
+
+    let bytes = f.server.answer(Bytes::from(any.build_bytes_vec().unwrap())).await.expect("an answer");
+    let reply = Packet::parse(&bytes).unwrap();
+
+    assert_eq!(reply.rcode(), RCODE::NoError);
+    let kinds = |records: &[ResourceRecord<'_>]| records.iter().map(|rr| rr.rdata.type_code()).collect::<Vec<_>>();
+    assert_eq!(kinds(&reply.answers), [TYPE::TXT]);
+    assert_eq!(kinds(&reply.name_servers), []);
+    assert_eq!(kinds(&reply.additional_records), [TYPE::TXT]);
+    assert_eq!(f.tunnel.queries().len(), 1);
 }
 
 #[tokio::test]

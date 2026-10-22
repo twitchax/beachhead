@@ -126,9 +126,9 @@ the two always pair. Without IPv6, AAAA is empty (NODATA) and apps use the v4 fa
 refused or unreachable on the remote look the same to the app.
 
 Every other record type for those names comes from the remote's resolver: the relay asks its own
-nameservers the query as it was asked, and the answer comes back with every A and AAAA record taken
-out, so the glue in an SRV or MX answer can't hand out a real address; the app asks for the
-target's A and gets its fake. A name only the remote's `/etc/hosts` knows is NXDOMAIN to its
+nameservers the query as it was asked, and the answer comes back with every A, AAAA, HTTPS and SVCB
+record taken out, so neither the glue in an SRV or MX answer nor an ANY answer can hand out a real
+address; the app asks for the target's A and gets its fake. A name only the remote's `/etc/hosts` knows is NXDOMAIN to its
 nameservers, so for a name the relay finds, that answer becomes NODATA, and the name's fake address
 stays visible. HTTPS and SVCB are always empty (NODATA): their address hints would send browsers to
 real addresses, and browsers fall back to A and AAAA. A reverse lookup of a fake address

@@ -158,8 +158,9 @@ impl<T: Tunnel> Server<T> {
     }
 
     /// Any other type for a matched name, asked of the remote's resolver as it came. The answer
-    /// keeps its id, flags (TC included), rcode and records, but loses every A and AAAA record, so
-    /// glue can't hand out a real address: the app asks for the target's A and gets its fake. The
+    /// keeps its id, flags (TC included), rcode and records, but loses every record that
+    /// [`carries_address`], so neither glue nor an ANY answer can hand out a real address: the app
+    /// asks for the target's A and gets its fake. The
     /// remote's nameservers don't know a name only its `/etc/hosts` has, so their NXDOMAIN for a
     /// name the relay finds becomes NODATA, which keeps that name's fake A from hiding behind it.
     async fn remote(&self, query: &Bytes, packet: &Packet<'_>, name: &str) -> Option<Bytes> {
@@ -184,7 +185,7 @@ impl<T: Tunnel> Server<T> {
         };
 
         for section in [&mut answer.answers, &mut answer.name_servers, &mut answer.additional_records] {
-            section.retain(|record| !matches!(record.rdata, RData::A(_) | RData::AAAA(_)));
+            section.retain(|record| !carries_address(record));
         }
         if answer.rcode() == RCODE::NameError {
             match self.exists(name).await {
@@ -327,4 +328,10 @@ fn is_fake(addr: IpAddr) -> bool {
         IpAddr::V4(v4) => FAKE_RANGE.contains(&v4),
         IpAddr::V6(v6) => FAKE_RANGE6.contains(&v6),
     }
+}
+
+/// Whether `record` can hand out a real address: A and AAAA, and HTTPS and SVCB through their
+/// `ipv4hint` and `ipv6hint`.
+fn carries_address(record: &ResourceRecord<'_>) -> bool {
+    matches!(record.rdata, RData::A(_) | RData::AAAA(_) | RData::HTTPS(_) | RData::SVCB(_))
 }

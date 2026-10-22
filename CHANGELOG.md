@@ -38,10 +38,10 @@ why the version moved the way it did.
   containing it is routed around it with a warning, and with a domain pattern a connected subnet
   overlapping it is refused.
 - Every DNS record type for names under a pattern: SRV, MX, TXT and the rest come from the remote's
-  resolver through the relay, with every A and AAAA record removed from the answer so none hands out
-  a real address. A remote NXDOMAIN for a name the relay finds (one only in the remote's
-  `/etc/hosts`) becomes NODATA, and HTTPS and SVCB are NODATA, since their address hints would
-  bypass the fakes.
+  resolver through the relay, with every A, AAAA, HTTPS and SVCB record removed from the answer so
+  none hands out a real address. A remote NXDOMAIN for a name the relay finds (one only in the
+  remote's `/etc/hosts`) becomes NODATA, and HTTPS and SVCB queries are NODATA, since their address
+  hints would bypass the fakes.
 - Reverse lookups of fake addresses, v4 and v6, answer the name each was handed out for (NXDOMAIN
   for one no name holds). The root helper routes the fake ranges' reverse zones to the device's
   resolver link, next to the patterns' domains.
