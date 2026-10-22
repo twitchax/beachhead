@@ -49,8 +49,10 @@ use crate::{
 pub const TTL: Duration = Duration::from_secs(5);
 /// How long the relay's verdict on a name is reused, found or not.
 pub const CACHE: Duration = Duration::from_secs(60);
-/// How long the remote's resolver gets to answer a matched name's query, through the relay.
-pub const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the remote's resolver gets to answer a matched name's query, through the relay. Above
+/// three of the relay's 2-second `NAMESERVER_TIMEOUT`s, so the third nameserver in the remote's
+/// resolv.conf (as many as a libc resolver uses) gets its full turn.
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(7);
 /// How long a TCP connection may go without a query before it closes, and how long its asker may
 /// leave an answer unread.
 pub const TCP_IDLE: Duration = Duration::from_secs(10);
