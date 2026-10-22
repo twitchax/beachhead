@@ -28,7 +28,7 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::{
-    flows::{FlowTable, Held, ReplyTask},
+    flows::{FlowTable, FlowTask, Held},
     tunnel::{Conn as _, Flow, FlowSender as _, SenderOf, Tunnel},
 };
 
@@ -276,9 +276,9 @@ struct Entry<S> {
 
 enum State<S> {
     /// The relay hasn't answered yet: the sender's datagrams wait here.
-    Opening(Held),
+    Opening { held: Held, _open: FlowTask },
     /// Datagrams go straight to the flow, and a task carries its replies back.
-    Open { sender: S, _replies: ReplyTask },
+    Open { sender: S, _replies: FlowTask },
 }
 
 impl<T: Tunnel> UdpForwards<T> {
@@ -361,7 +361,7 @@ impl<T: Tunnel> UdpForwards<T> {
         let mut table = self.table();
         if let Some(entry) = table.get_mut(&key) {
             match &mut entry.state {
-                State::Opening(held) => held.push(datagram),
+                State::Opening { held, .. } => held.push(datagram),
                 State::Open { sender, .. } => {
                     sender.try_send(datagram);
                     table.sent(&key, now);
@@ -370,14 +370,20 @@ impl<T: Tunnel> UdpForwards<T> {
             return;
         }
         let generation = self.shared.generations.fetch_add(1, Ordering::Relaxed);
+        // Spawned under the lock, so the open can't look for its entry before the entry is in.
+        let open = tokio::spawn(self.clone().open(Arc::clone(socket), key, generation, Arc::clone(host), port));
         let mut held = Held::default();
         held.push(datagram);
-        let evicted = table.insert(key, Entry { generation, state: State::Opening(held) }, now);
+        let state = State::Opening {
+            held,
+            _open: FlowTask(open.abort_handle()),
+        };
+        let evicted = table.insert(key, Entry { generation, state }, now);
         drop(table);
-        // The least recently used flow, at the cap: it resets as it drops, outside the lock.
+        // The least recently used flow, at the cap: it resets as it drops, and so does its open,
+        // outside the lock.
         drop(evicted);
         self.shared.added.notify_one();
-        tokio::spawn(self.clone().open(Arc::clone(socket), key, generation, Arc::clone(host), port));
     }
 
     /// Opens `key`'s flow and, when its entry is still the one that asked, sends what it holds
@@ -385,23 +391,26 @@ impl<T: Tunnel> UdpForwards<T> {
     async fn open(self, socket: Arc<UdpSocket>, key: FlowKey, generation: u64, host: Arc<str>, port: u16) {
         let opened = self.tunnel.open_udp(&host, port).await;
         let mut table = self.table();
-        // Its entry may have idled out or been evicted meanwhile, and its sender may have opened
-        // another since. The flow drops either way, which resets it.
+        // Its entry going aborts this task, but only where it waits: past its open, on another
+        // worker, it can still get here after its entry idled out or was evicted, and its sender
+        // may have opened another since. The flow drops either way, which resets it. No
+        // deterministic test reaches this; the abort is what the tests see.
         let Some(entry) = table.get_mut(&key).filter(|entry| entry.generation == generation) else {
             return;
         };
         match opened {
             Ok(flow) => {
-                let State::Opening(held) = &mut entry.state else { return };
+                let State::Opening { held, .. } = &mut entry.state else { return };
                 let held = held.take();
                 let sender = flow.sender();
                 for datagram in held {
                     sender.try_send(datagram);
                 }
                 let replies = tokio::spawn(self.clone().replies(flow, socket, key, generation));
+                // Dropping the hold aborts this task, which no longer waits, so it finishes.
                 entry.state = State::Open {
                     sender,
-                    _replies: ReplyTask(replies.abort_handle()),
+                    _replies: FlowTask(replies.abort_handle()),
                 };
                 table.sent(&key, Instant::now());
             }
@@ -603,12 +612,14 @@ mod unit {
         eventually(|| tunnel.flows().len() == 2).await;
     }
 
-    /// Review Focus 1: an open that finishes after its flow idled out, with the same sender's next
-    /// flow still opening, must not take that flow's place.
+    /// Review Focus 1: an open whose flow idles out first is cancelled with it, so opens in flight
+    /// stay within the table's cap and can't take a newer flow's place, and the sender's next
+    /// datagram opens a fresh flow. (The generation check in `open` covers only an open already
+    /// past its wait on another worker, which no deterministic test can reach.)
     #[tokio::test(start_paused = true)]
-    async fn udp_an_open_finishing_after_its_flow_idled_out_is_dropped() {
+    async fn udp_an_open_whose_flow_idled_out_is_cancelled() {
         let tunnel = FakeTunnel::new();
-        let first = tunnel.udp_gate("dns.corp.example", 53, tests::udp_stale_server().await.unwrap());
+        let gate = tunnel.udp_gate("dns.corp.example", 53, tests::udp_echo_server().await.unwrap());
         let forwards = UdpForwards::new(tunnel.clone());
         let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -624,20 +635,12 @@ mod unit {
         // whenever the runtime idles: the sweep would idle the second flow out mid-exchange.
         sweep.abort();
 
-        let second = tunnel.udp_gate("dns.corp.example", 53, tests::udp_echo_server().await.unwrap());
+        // The first open never finishes, though its gate opens; the second goes straight through.
+        gate.open();
         app.send(b"two").await.unwrap();
-        until(|| tunnel.flows().len() == 2).await.unwrap();
-        first.open();
-        // The first open runs before this task resumes.
-        tokio::task::yield_now().await;
-        second.open();
-
         let mut buf = [0; 64];
         let n = app.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"two");
-        app.send(b"three").await.unwrap();
-        let n = app.recv(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"three");
-        assert_eq!(tunnel.live_flows(), 1);
+        assert_eq!((tunnel.flows().len(), tunnel.flows_opened(), tunnel.live_flows()), (2, 1, 1));
     }
 }

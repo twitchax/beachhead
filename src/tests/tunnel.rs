@@ -74,6 +74,7 @@ pub struct FakeTunnel {
     script: Arc<Mutex<Script>>,
     asked: Arc<Notify>,
     live: Arc<AtomicUsize>,
+    opened: Arc<AtomicUsize>,
 }
 
 /// Holds the opens of one gated target until [`Gate::open`].
@@ -182,6 +183,13 @@ impl FakeTunnel {
         self.live.load(Ordering::SeqCst)
     }
 
+    /// How many flow opens finished with a flow, dropped since or not; an open cancelled while
+    /// it waited isn't one.
+    #[must_use]
+    pub fn flows_opened(&self) -> usize {
+        self.opened.load(Ordering::SeqCst)
+    }
+
     /// Every lookup asked for so far, in order.
     #[must_use]
     pub fn resolves(&self) -> Vec<String> {
@@ -263,17 +271,19 @@ impl Tunnel for FakeTunnel {
             script.udp.get(&(host.to_owned(), port)).cloned()
         };
         let fail = |kind, reason: String| OpenError { kind, reason };
-        let to = match dial {
+        let connect = |to| FakeFlow::udp(to, &self.live).map_err(|e| fail(OpenErrKind::Other, format!("connecting to {to}: {e}")));
+        let flow = match dial {
             None => return Err(fail(OpenErrKind::Other, format!("nothing scripted for UDP {host}:{port}"))),
             Some(UdpDial::Reject(kind)) => return Err(fail(kind, format!("opening UDP {host}:{port}: scripted {kind:?}"))),
-            Some(UdpDial::To(to)) => to,
-            Some(UdpDial::Hangup) => return Ok(FakeFlow::Ended(FakeEnded { _live: Live::new(&self.live) })),
+            Some(UdpDial::To(to)) => connect(to)?,
+            Some(UdpDial::Hangup) => FakeFlow::Ended(FakeEnded { _live: Live::new(&self.live) }),
             Some(UdpDial::Gated(mut gate, to)) => {
                 gate.wait_for(|open| *open).await.map_err(|_| fail(OpenErrKind::Other, "the gate was dropped".to_owned()))?;
-                to
+                connect(to)?
             }
         };
-        FakeFlow::udp(to, &self.live).map_err(|e| fail(OpenErrKind::Other, format!("connecting to {to}: {e}")))
+        self.opened.fetch_add(1, Ordering::SeqCst);
+        Ok(flow)
     }
 
     fn open_echo(&self, host: &str) -> impl Future<Output = Result<FakeFlow, OpenError>> + Send {

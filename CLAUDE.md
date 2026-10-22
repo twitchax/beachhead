@@ -20,11 +20,12 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   (`Cargo.toml.orig` beside the manifest) with neither fails to build, so cargo won't publish it.
 - `src/forward.rs`: `sshunnel forward`, on every platform (no Linux-only API). TCP pumps a stream
   per connection; `UdpForwards` keeps one flow table across the session's UDP listeners, a flow per
-  local sender. Its listeners never wait (a full queue drops), and each entry's generation keeps an
-  open that finishes late from taking a newer flow's place.
+  local sender. Its listeners never wait (a full queue drops); an entry that goes aborts its open,
+  which keeps the opens in flight within the cap, and each entry's generation keeps an open that
+  finished first from taking a newer flow's place.
 - `src/flows.rs`: the flow table `forward`'s UDP and `route`'s UDP and echo share (conntrack's
-  timeouts, a 4096 cap, LRU eviction), and the hold and reply task their entries both keep. Plain
-  data: no locks, no awaits.
+  timeouts, a 4096 cap, LRU eviction), and the hold and tasks (the open, then the replies) their
+  entries both keep, aborted when an entry goes. Plain data: no locks, no awaits.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
   matching, refusals), `names` (the fake-address map), `router` (the per-connection decision,
   sharing the map), `stack` (the smoltcp netstack) with `dns` and `datagrams` (routed UDP's flows)

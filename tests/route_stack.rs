@@ -17,6 +17,7 @@ use smoltcp::{
     wire::{Icmpv4DstUnreachable, Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr},
 };
 use sshunnel::{
+    flows::MAX_FLOWS,
     route::{
         DNS_ADDR, TUN_ADDR,
         names::{FakeMap, today},
@@ -147,10 +148,15 @@ fn port_unreachable() -> Bytes {
 
 /// A UDP datagram from the device's address and `port` to `10.99.0.5:9999`.
 fn datagram(port: u16) -> Bytes {
+    datagram_to(port, 9999)
+}
+
+/// A UDP datagram from the device's address and `port` to `10.99.0.5:to_port`.
+fn datagram_to(port: u16, to_port: u16) -> Bytes {
     let caps = ChecksumCapabilities::default();
     let (from, to) = (TUN_ADDR, Ipv4Addr::new(10, 99, 0, 5));
     let payload = b"hello";
-    let udp = UdpRepr { src_port: port, dst_port: 9999 };
+    let udp = UdpRepr { src_port: port, dst_port: to_port };
     let ip = Ipv4Repr {
         src_addr: from,
         dst_addr: to,
@@ -445,33 +451,47 @@ async fn a_udp_flow_the_relay_ends_opens_afresh() {
     until(|| rig.tunnel.flows().len() == 2).await.unwrap();
 }
 
-/// Review Focus 1: an open that finishes after its flow idled out, with the same app socket's next
-/// flow still opening, must not take that flow's place.
 #[tokio::test(start_paused = true)]
-async fn udp_an_open_finishing_after_its_flow_idled_out_is_dropped() {
+async fn udp_an_open_whose_flow_idled_out_is_cancelled() {
     let rig = rig(&["10.99.0.0/16"]);
-    let to = at("10.99.0.5", 9999);
-    let first = rig.tunnel.udp_gate("10.99.0.5", 9999, udp_stale_server().await.unwrap());
+    let gate = rig.tunnel.udp_gate("10.99.0.5", 9999, udp_echo_server().await.unwrap());
 
     rig.app.send(datagram(41_000)).await.unwrap();
     until(|| rig.tunnel.flows().len() == 1).await.unwrap();
-    // Its entry idles out while the open is still waiting.
+    // Its entry idles out while the open waits, and takes the open with it.
     tokio::time::sleep(Duration::from_secs(31)).await;
 
-    let second = rig.tunnel.udp_gate("10.99.0.5", 9999, udp_echo_server().await.unwrap());
-    let app = Arc::new(rig.app);
-    let exchange = tokio::spawn({
-        let app = Arc::clone(&app);
-        async move { app.exchange_from(41_000, to, b"two").await }
-    });
-    until(|| rig.tunnel.flows().len() == 2).await.unwrap();
-    first.open();
-    // The first open finishes, and the stack takes it, before the second does.
-    tokio::task::yield_now().await;
-    second.open();
+    // So it never finishes, though its gate opens; the app socket's next datagram opens afresh.
+    gate.open();
+    let back = rig.app.exchange_from(41_000, at("10.99.0.5", 9999), b"two").await;
+    assert_eq!(back.as_deref(), Some(&b"two"[..]));
+    assert_eq!((rig.tunnel.flows().len(), rig.tunnel.flows_opened(), rig.tunnel.live_flows()), (2, 1, 1));
+}
 
-    assert_eq!(exchange.await.unwrap().as_deref(), Some(&b"two"[..]));
-    assert_eq!(app.exchange_from(41_000, to, b"three").await.as_deref(), Some(&b"three"[..]));
+/// Review Focus 1: an open whose result is in before its entry goes is past aborting, so only the
+/// entry's generation keeps it off the flow the app opened under the same key since.
+#[tokio::test(start_paused = true)]
+async fn udp_an_open_finished_before_its_flow_was_evicted_is_dropped() {
+    let rig = rig(&["10.99.0.0/16"]);
+    let to = at("10.99.0.5", 9999);
+    let first = rig.tunnel.udp_gate("10.99.0.5", 9999, udp_stale_server().await.unwrap());
+    // Flows up to the cap whose opens never finish, the first one the least recently used.
+    let _never = rig.tunnel.udp_gate("10.99.0.5", 7, to);
+    rig.app.send(datagram(41_000)).await.unwrap();
+    for port in 1..u16::try_from(MAX_FLOWS).unwrap() {
+        rig.app.send(datagram_to(port, 7)).await.unwrap();
+    }
+    until(|| rig.tunnel.flows().len() == MAX_FLOWS).await.unwrap();
+    rig.tunnel.udp("10.99.0.5", 9999, udp_echo_server().await.unwrap());
+
+    // The first open's task runs before the stack's next pass, which reads a new flow (evicting
+    // the first) and the app socket's next datagram (a fresh entry under its key) before it takes
+    // the open's result.
+    first.open();
+    rig.app.send(datagram_to(5_000, 7)).await.unwrap();
+    let back = rig.app.exchange_from(41_000, to, b"two").await;
+
+    assert_eq!(back.as_deref(), Some(&b"two"[..]));
     assert_eq!(rig.tunnel.live_flows(), 1);
 }
 

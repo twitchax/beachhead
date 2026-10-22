@@ -1,6 +1,6 @@
 //! The table of datagram flows `forward`'s UDP and `route`'s UDP and echo share, and the parts of
-//! their entries both keep: the hold a flow's first datagrams wait in while it opens, and the task
-//! that carries its replies.
+//! their entries both keep: the hold a flow's first datagrams wait in while it opens, and the tasks
+//! (its open, then the one carrying its replies) that go when the entry does.
 //!
 //! Plain data with no locks and no awaits, so the netstack's thread can use it without blocking.
 //! Time comes in as an argument, which is what lets the tests drive it on tokio's paused clock.
@@ -198,10 +198,12 @@ impl Held {
     }
 }
 
-/// A flow's reply task, aborted when its entry goes: that drops the flow, which resets it.
-pub(crate) struct ReplyTask(pub(crate) AbortHandle);
+/// A task working for a flow's entry, aborted when the entry goes: its open, whose future drops and
+/// so resets the flow on the relay, which keeps the opens in flight within the table's cap; then the
+/// task carrying its replies, which drops the flow and so resets it.
+pub(crate) struct FlowTask(pub(crate) AbortHandle);
 
-impl Drop for ReplyTask {
+impl Drop for FlowTask {
     fn drop(&mut self) {
         self.0.abort();
     }

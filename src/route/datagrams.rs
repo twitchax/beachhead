@@ -33,7 +33,7 @@ use tracing::debug;
 
 use crate::{
     base::Void,
-    flows::{FlowTable, Held, ReplyTask},
+    flows::{FlowTable, FlowTask, Held},
     route::{
         router::Router,
         stack::{Ip, Refusal, icmp_error, udp_packet},
@@ -72,9 +72,9 @@ struct Entry<S> {
 enum State<S> {
     /// The relay hasn't answered yet. The app's packets wait here whole, so a failed open can
     /// answer each, and the hold's bound counts their headers too.
-    Opening(Held),
+    Opening { held: Held, _open: FlowTask },
     /// Datagrams go straight to the flow, and a task carries its replies to the stack.
-    Open { sender: S, _replies: ReplyTask },
+    Open { sender: S, _replies: FlowTask },
 }
 
 /// The start of an app's datagram, copied so its buffer can go: the IP header and the 8 bytes after
@@ -147,7 +147,7 @@ impl<T: Tunnel> Datagrams<T> {
         if let Some(entry) = self.table.get_mut(&key) {
             entry.quote = quote;
             match &mut entry.state {
-                State::Opening(held) => held.push(packet),
+                State::Opening { held, .. } => held.push(packet),
                 State::Open { sender, .. } => {
                     if let Some(payload) = ip.udp_payload(&packet) {
                         sender.try_send(payload);
@@ -163,13 +163,13 @@ impl<T: Tunnel> Datagrams<T> {
         };
         let generation = self.generations;
         self.generations += 1;
+        let tunnel = self.tunnel.clone();
+        let open = self.opens.spawn(async move { (key, generation, tunnel.open_udp(&host, port).await) });
         let mut held = Held::default();
         held.push(packet);
-        let state = State::Opening(held);
-        // The least recently used flow, at the cap: it resets as it drops.
+        let state = State::Opening { held, _open: FlowTask(open) };
+        // The least recently used flow, at the cap: it resets as it drops, and so does its open.
         drop(self.table.insert(key, Entry { generation, quote, state }, now));
-        let tunnel = self.tunnel.clone();
-        self.opens.spawn(async move { (key, generation, tunnel.open_udp(&host, port).await) });
         None
     }
 
@@ -180,7 +180,12 @@ impl<T: Tunnel> Datagrams<T> {
     /// Fails when an open's task panicked.
     pub(crate) fn opened(&mut self, cx: &mut Context<'_>, mut send: impl FnMut(Option<Bytes>)) -> Void {
         while let Poll::Ready(Some(opened)) = self.opens.poll_join_next(cx) {
-            let (key, generation, opened) = opened.context("a flow's open failed")?;
+            let (key, generation, opened) = match opened {
+                Ok(opened) => opened,
+                // Its entry went first, which aborted it.
+                Err(e) if e.is_cancelled() => continue,
+                Err(e) => return Err(e).context("a flow's open failed"),
+            };
             self.open(key, generation, opened, &mut send);
         }
         Ok(())
@@ -189,12 +194,13 @@ impl<T: Tunnel> Datagrams<T> {
     /// Sends what a flow's entry holds once it opens and starts carrying its replies, or answers
     /// each held packet the way the open failed (R5), as a connection's dial is answered.
     fn open(&mut self, key: DatagramKey, generation: u64, opened: Result<T::Flow, OpenError>, send: &mut impl FnMut(Option<Bytes>)) {
-        // Its entry may have idled out or been evicted meanwhile, and the app may have opened
-        // another since. The flow drops either way, which resets it.
+        // An open whose entry went is aborted with it, but one whose result was already in gets
+        // here: its entry evicted in the same pass by a new flow, and the app may have opened
+        // another under its key since. The flow drops either way, which resets it.
         let Some(entry) = self.table.get_mut(&key).filter(|entry| entry.generation == generation) else {
             return;
         };
-        let State::Opening(held) = &mut entry.state else { return };
+        let State::Opening { held, .. } = &mut entry.state else { return };
         let held = held.take();
         match opened {
             Ok(flow) => {
@@ -207,7 +213,7 @@ impl<T: Tunnel> Datagrams<T> {
                 let replies = tokio::spawn(carry(flow, key, generation, self.reply_to.clone()));
                 entry.state = State::Open {
                     sender,
-                    _replies: ReplyTask(replies.abort_handle()),
+                    _replies: FlowTask(replies.abort_handle()),
                 };
                 self.table.sent(&key, Instant::now());
             }
