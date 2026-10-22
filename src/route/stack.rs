@@ -340,7 +340,8 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         self.served(cx)
     }
 
-    /// Reaps the DNS server's connections that ended, freeing their places.
+    /// Reaps the DNS server's connections that ended, freeing their places, and resets each that
+    /// failed.
     fn served(&mut self, cx: &mut Context<'_>) -> Void {
         while let Poll::Ready(Some(served)) = self.dns_conns.poll_join_next_with_id(cx) {
             let (server, (flow, result)) = match served {
@@ -351,8 +352,8 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
             };
             if let Err(e) = result {
                 debug!(%flow, "DNS connection failed: {e:#}");
-                // Its asker left an answer unread, and may never act: without a reset, its socket
-                // and pipe would outlive the place it held under MAX_DNS_CONNS.
+                // Most likely its asker left an answer unread, and may never act: without a reset,
+                // its socket and pipe would outlive the place it held under MAX_DNS_CONNS.
                 self.reset(flow, server);
             }
         }
