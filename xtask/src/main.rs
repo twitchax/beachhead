@@ -194,6 +194,7 @@ fn package() -> Result<()> {
     if let Some(arch) = Arch::ALL.into_iter().find(|&arch| relays.get(arch).is_none()) {
         bail!("{} has no {arch} relay", relay_dir.display());
     }
+    write_commit(&relay_dir)?;
 
     // Cargo counts the gitignored relays the `include` list names as uncommitted changes. xtask is
     // `publish = false`, so packaging it would only cost a verify build.
@@ -226,6 +227,15 @@ fn package() -> Result<()> {
 
     print!("{}", check_embedded(&build_dir.join("release").join("sshunnel"), &relays)?);
     Ok(())
+}
+
+/// Records HEAD in `dir`'s COMMIT, which the packaged build compares with the commit cargo packaged.
+fn write_commit(dir: &Path) -> Result<()> {
+    let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(root()).output().context("running `git rev-parse HEAD`")?;
+    ensure!(out.status.success(), "`git rev-parse HEAD` failed: {}", String::from_utf8_lossy(&out.stderr));
+    let head = String::from_utf8(out.stdout).context("`git rev-parse HEAD` printed non-UTF-8")?;
+    let path = dir.join("COMMIT");
+    std::fs::write(&path, format!("{}\n", head.trim())).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Unpacks `cargo package`'s `<name>-<version>.crate` into `into`, returning the crate's directory.

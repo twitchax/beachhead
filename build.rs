@@ -11,9 +11,15 @@
 #[path = "build/embed.rs"]
 mod embed;
 
-use std::{env, error::Error, fmt::Write as _, fs, path::PathBuf};
+use std::{
+    env,
+    error::Error,
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
-use embed::DIR_VAR;
+use embed::{DIR_VAR, RelayDir};
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-env-changed={DIR_VAR}");
@@ -22,9 +28,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("cargo sets CARGO_MANIFEST_DIR for build scripts")?);
 
     let mut entries = String::new();
-    if let Some(dir) = embed::embed_dir(env::var_os(DIR_VAR).map(PathBuf::from), &manifest_dir)? {
+    if let Some(chosen) = embed::embed_dir(env::var_os(DIR_VAR).map(PathBuf::from), &manifest_dir)? {
         // Only paths that exist get a rerun-if-changed: cargo treats a missing one as always stale.
-        let dir = dir.canonicalize()?;
+        let dir = chosen.canonicalize()?;
         println!("cargo::rerun-if-changed={}", dir.display());
         let mut names: Vec<String> = fs::read_dir(&dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?
@@ -47,6 +53,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("cargo::rerun-if-changed={}", sums.display());
             embed::check_sums(&listed, &relays).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
+        if matches!(chosen, RelayDir::Package(_)) && manifest_dir.join("Cargo.toml.orig").exists() {
+            let commit = read_optional(&dir.join(embed::COMMIT_FILE))?;
+            let vcs_info = read_optional(&manifest_dir.join(".cargo_vcs_info.json"))?;
+            embed::check_commit(commit.as_deref(), vcs_info.as_deref()).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
 
         for (name, _) in &relays {
             let path = dir.join(name);
@@ -57,4 +68,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     fs::write(out.join("embedded.rs"), format!("pub(crate) const EMBEDDED: &[(&str, &[u8])] = &[\n{entries}];\n"))?;
     Ok(())
+}
+
+/// The file's text, or none when it isn't there. Only a file that exists gets a rerun-if-changed:
+/// cargo treats a missing one as always stale.
+fn read_optional(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    println!("cargo::rerun-if-changed={}", path.display());
+    Ok(Some(fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?))
 }

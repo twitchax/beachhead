@@ -15,7 +15,8 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   feature. The binary parses arguments and calls the library; everything testable lives in the
   library. `tests` is the shared fixture factory. `build.rs` embeds the relays in
   `SSHUNNEL_EMBED_RELAY_DIR`, else a package's own `relays/` (no `.git` beside the manifest), never a
-  checkout's, and fails when its directory's `SHA256SUMS` and relays disagree either way. A package
+  checkout's, and fails when its directory's `SHA256SUMS` and relays disagree either way, or when a
+  package's `relays/COMMIT` isn't the commit cargo packaged. A package
   (`Cargo.toml.orig` beside the manifest) with neither fails to build, so cargo won't publish it.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
   matching, refusals), `names` (the fake-address map), `router` (the per-connection decision,
@@ -76,7 +77,7 @@ publish at the time. In order (`.prds/PRD-0005.md`'s Shipping section has the re
 
 1. Tag `vX.Y.Z`, then push `main` and the tag. `release.yml` creates the GitHub release (clients,
    relays, `SHA256SUMS`), in place of a `gh release create` by hand.
-2. `cargo xtask package` from the tagged tree: it rebuilds `relays/`, packages the crates, and
+2. `cargo xtask package` from the tagged tree: it rebuilds `relays/` and writes `relays/COMMIT`, packages the crates, and
    proves the stable build embeds both relays.
 3. `git status --porcelain` prints nothing.
 4. `cargo publish -p sshunnel-mux`, then `-p sshunnel-relay`, then `-p sshunnel --allow-dirty`.

@@ -7,6 +7,10 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Changed
+
+- A published package refuses to build with relays from a commit other than its own.
+
 ## [0.1.0] - 2026-10-21
 
 The first release, at 0.1.0 rather than 1.0.0 because the command line and the wire protocol can

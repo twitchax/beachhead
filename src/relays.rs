@@ -350,4 +350,44 @@ mod unit {
         writeln!(sums, "{}  README.md", hex(&Sha256::digest(b"readme"))).unwrap();
         assert_eq!(build_embed::check_sums(&sums, &relays), Ok(()));
     }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    // cargo writes .cargo_vcs_info.json pretty-printed, with "dirty" only for --allow-dirty.
+    fn vcs(sha: &str) -> String {
+        format!("{{\n  \"git\": {{\n    \"sha1\": \"{sha}\",\n    \"dirty\": true\n  }},\n  \"path_in_vcs\": \"\"\n}}")
+    }
+
+    #[test]
+    fn relay_commit_reads_the_packaged_sha() {
+        assert_eq!(build_embed::vcs_sha1(&vcs(SHA)), Some(SHA));
+    }
+
+    #[test]
+    fn relay_commit_matching_the_package_builds() {
+        build_embed::check_commit(Some(&format!("{SHA}\n")), Some(&vcs(SHA))).unwrap();
+    }
+
+    #[test]
+    fn relay_commit_from_another_sha_is_refused() {
+        let other = "fedcba9876543210fedcba9876543210fedcba98";
+        let err = build_embed::check_commit(Some(other), Some(&vcs(SHA))).unwrap_err();
+        assert!(err.contains(other) && err.contains(SHA) && err.contains("cargo xtask package"), "{err}");
+    }
+
+    #[test]
+    fn relay_commit_missing_from_a_package_with_vcs_info_is_refused() {
+        assert!(build_embed::check_commit(None, Some(&vcs(SHA))).unwrap_err().contains("COMMIT"));
+    }
+
+    #[test]
+    fn relay_commit_is_unchecked_without_vcs_info() {
+        build_embed::check_commit(None, None).unwrap();
+    }
+
+    #[test]
+    fn relay_commit_ignores_malformed_vcs_info() {
+        assert_eq!(build_embed::vcs_sha1("{\"git\":{}}"), None);
+        assert!(build_embed::check_commit(Some(SHA), Some("{\"git\":{}}")).is_err());
+    }
 }
