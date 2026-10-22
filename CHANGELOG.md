@@ -67,7 +67,10 @@ why the version moved the way it did.
   `bind_udp`; `bind` refuses a UDP forward, and `bind_udp` a TCP one.
 - For library users: `route::dns::Server::new` takes a `fake_v6` argument,
   `route::helper::Reply::Ready` carries a `fake_v6` field, and the relay's `serve` takes the
-  capabilities it reports in `Hello`. `Tunnel` gains flows and queries.
+  capabilities it reports in `Hello`. `Tunnel` gains flows and queries. In `sshunnel-mux`,
+  `hello::send_hello` takes capabilities, `recv_hello` returns a `PeerHello` that `start` takes,
+  `Frame::Hello` has a `capabilities` field, and `Frame` and `Request` gain variants (neither is
+  `#[non_exhaustive]`).
 
 ## [0.1.0] - 2026-10-21
 
