@@ -22,7 +22,7 @@ use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use sshunnel::{
     route::{PING_WARNING, helper::Setup, peers::process_tree, system::same_netns_as_init},
-    tests::{self, FakeRemote, RemoteNs, Watched, allow_ping, echo_on, netns, pattern, ping, relay_dir, round_trip, route_command, shim_dir, start_helper, udp_echo_on},
+    tests::{self, FakeRemote, Pinged, RemoteNs, Watched, allow_ping, echo_on, netns, pattern, ping, relay_dir, round_trip, route_command, shim_dir, start_helper, udp_echo_on},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -278,7 +278,7 @@ async fn e2e_route_ping_gets_echo_replies_v4_and_v6() {
     // Nothing here reaches either host but the device, so the replies come from the relay's ping
     // sockets on the remote's network.
     for host in [IpAddr::V4(RemoteNs::HOST), IpAddr::V6(RemoteNs::HOST6)] {
-        assert!(ping(host, WITHIN).await.unwrap(), "no echo reply from {host}");
+        assert_eq!(ping(host, WITHIN).await.unwrap(), Pinged::Reply, "{host}");
     }
     stop(route).await;
 }
@@ -290,9 +290,16 @@ async fn e2e_route_ping_refused_remote_is_admin_prohibited_and_warns_once() {
     }
     let world = World::without_ping();
     allow_ping().unwrap();
-    let route = world.start(&["10.99.0.0/16"]).await;
+    let route = world.start(&["10.99.0.0/16", "fd99::/64"]).await;
 
-    assert!(!ping(RemoteNs::HOST.into(), Duration::from_secs(3)).await.unwrap(), "an echo reply came back");
+    // Administratively prohibited reaches the app's ping socket as its family's error: ICMP's as
+    // EHOSTUNREACH, ICMPv6's as EACCES.
+    for (host, error) in [
+        (IpAddr::V4(RemoteNs::HOST), io::ErrorKind::HostUnreachable),
+        (IpAddr::V6(RemoteNs::HOST6), io::ErrorKind::PermissionDenied),
+    ] {
+        assert_eq!(ping(host, WITHIN).await.unwrap(), Pinged::Refused(error), "{host}");
+    }
     let stderr = stop(route).await;
     assert_eq!(stderr.matches(PING_WARNING).count(), 1, "{stderr}");
 }

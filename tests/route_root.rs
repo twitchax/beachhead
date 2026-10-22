@@ -16,7 +16,7 @@ use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, geteuid, kill_process};
 use sshunnel::{
     route::FAKE_RANGE,
-    tests::{FakeRemote, Watched, echo_server, pattern, ping, relay_dir, resolved_leftovers, round_trip, route_command, udp_echo_server},
+    tests::{FakeRemote, Pinged, Watched, echo_server, pattern, ping, relay_dir, resolved_leftovers, round_trip, route_command, udp_echo_server},
 };
 use tempfile::TempDir;
 use tokio::{net::UdpSocket, time::timeout};
@@ -134,7 +134,7 @@ async fn e2e_route_name_ping_gets_echo_replies() {
     assert!(fake.len() == 1 && is_fake(&fake[0]), "{fake:?}");
     // The relay opens the echo flow by name, which the remote's /etc/hosts sends to 127.0.0.1: the
     // remote, this machine, pings itself.
-    assert!(ping(fake[0], WITHIN).await.unwrap(), "no echo reply from {}", fake[0]);
+    assert_eq!(ping(fake[0], WITHIN).await.unwrap(), Pinged::Reply, "{}", fake[0]);
     stop(route).await;
 }
 

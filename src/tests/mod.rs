@@ -35,7 +35,7 @@ use {
     },
     anyhow::ensure,
     rustix::net::{AddressFamily, SocketFlags, SocketType, ipproto, socket_with, socketpair},
-    std::{net::IpAddr, os::fd::OwnedFd},
+    std::{io, net::IpAddr, os::fd::OwnedFd},
     tokio::net::UnixDatagram,
 };
 
@@ -444,16 +444,30 @@ pub fn allow_ping() -> Void {
     std::fs::write(netns::PING_GROUP_RANGE, netns::PING_ROOT).context("opening this namespace's ping_group_range")
 }
 
+/// How one [`ping`] went.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pinged {
+    /// The echo reply came back.
+    Reply,
+    /// An ICMP error answered the request, as the socket reported it: `HostUnreachable`
+    /// (`EHOSTUNREACH`) for an IPv4 administratively prohibited, `PermissionDenied` (`EACCES`) for
+    /// IPv6's.
+    Refused(io::ErrorKind),
+    /// Nothing came back in time.
+    Silence,
+}
+
 /// Pings `to` once, as `ping` does without privileges: an echo request through a `SOCK_DGRAM` ICMP
-/// socket, whose identifier and checksum the kernel fills in. True when the reply comes within
-/// `within`; false on silence or an ICMP error.
+/// socket, whose identifier and checksum the kernel fills in, then waits up to `within` for the
+/// reply or the ICMP error a connected socket reports.
 ///
 /// # Errors
 ///
 /// Fails when the socket can't be opened (this namespace's `ping_group_range` may not include the
 /// caller's group; see [`allow_ping`]) or the request can't be sent.
 #[cfg(target_os = "linux")]
-pub async fn ping(to: IpAddr, within: Duration) -> Res<bool> {
+pub async fn ping(to: IpAddr, within: Duration) -> Res<Pinged> {
     const SEQ: u16 = 7;
     let (family, protocol, request, reply) = match to {
         IpAddr::V4(_) => (AddressFamily::INET, ipproto::ICMP, 8, 0),
@@ -471,15 +485,14 @@ pub async fn ping(to: IpAddr, within: Duration) -> Res<bool> {
         let mut buf = [0; 64];
         loop {
             match socket.recv(&mut buf).await {
-                Ok(n) if buf.get(..n).is_some_and(|icmp| icmp.first() == Some(&reply) && icmp.get(6..8) == Some(&SEQ.to_be_bytes()[..])) => return true,
+                Ok(n) if buf.get(..n).is_some_and(|icmp| icmp.first() == Some(&reply) && icmp.get(6..8) == Some(&SEQ.to_be_bytes()[..])) => return Pinged::Reply,
                 Ok(_) => {}
-                // A connected socket reports the ICMP error that answered the request.
-                Err(_) => return false,
+                Err(e) => return Pinged::Refused(e.kind()),
             }
         }
     })
     .await;
-    Ok(answered.unwrap_or(false))
+    Ok(answered.unwrap_or(Pinged::Silence))
 }
 
 /// Sends `data` to the echo server at `addr` and reads until it closes; returns what came back.
