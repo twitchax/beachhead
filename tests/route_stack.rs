@@ -753,6 +753,34 @@ async fn dns_over_tcp_closes_an_idle_connection() {
     assert_eq!(closed.unwrap(), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn dns_over_tcp_resets_an_asker_that_leaves_its_answers_unread() {
+    // Answers enough to fill the asker's window, both sockets' buffers and both pipes, so the
+    // server's next write waits on an asker that reads nothing.
+    let dns = FixedDns {
+        answer: Bytes::from(vec![0; 60_000]),
+        asked: Arc::default(),
+    };
+    let rig = rig_with(&["*.corp.example"], dns);
+    let mut conn = rig.app.connect(dns_tcp()).await.unwrap();
+    let queries: Vec<u8> = (0..24).flat_map(|_| framed_dns(b"a query").unwrap()).collect();
+    conn.write_all(&queries).await.unwrap();
+
+    let reset = |sent: &Sent| matches!(sent, Sent::Tcp { from, rst: true, .. } if *from == dns_tcp());
+    tokio::time::sleep(TCP_IDLE.saturating_sub(Duration::from_secs(1))).await;
+    assert!(!rig.app.tap().iter().any(reset), "reset before the asker had TCP_IDLE to read");
+    // TCP_IDLE with an answer unread: the server gives up, and the stack resets the connection
+    // rather than keep its socket and pipe for an asker that may never act.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(reset_from(&rig.app, dns_tcp()).await, "the stalled connection was never reset");
+
+    // Its place is free: the cap's worth of new connections all open.
+    let mut open = Vec::new();
+    for _ in 0..MAX_DNS_CONNS {
+        open.push(rig.app.connect(dns_tcp()).await.unwrap());
+    }
+}
+
 #[tokio::test]
 async fn dns_over_tcp_closes_after_a_message_it_cannot_answer() {
     // `NoDns` answers nothing, as the server answers nothing that isn't one query.

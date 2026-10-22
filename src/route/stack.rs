@@ -332,13 +332,8 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
                 Ok(traffic) => debug!(%flow, sent = traffic.sent, received = traffic.received, "connection closed"),
                 Err(e) => {
                     debug!(%flow, "connection failed: {e:#}");
-                    // The remote end reset or the session dropped: reset the app too, unless the
-                    // app has since reused the 4-tuple for a connection of its own.
-                    if let Some(&handle) = self.flows.get(&flow)
-                        && self.engine.pumped_by(handle, pump)
-                    {
-                        self.engine.abort(handle);
-                    }
+                    // The remote end reset or the session dropped: reset the app too.
+                    self.reset(flow, pump);
                 }
             }
         }
@@ -347,16 +342,31 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
 
     /// Reaps the DNS server's connections that ended, freeing their places.
     fn served(&mut self, cx: &mut Context<'_>) -> Void {
-        while let Poll::Ready(Some(served)) = self.dns_conns.poll_join_next(cx) {
-            match served {
-                Ok((_, Ok(()))) => {}
-                Ok((flow, Err(e))) => debug!(%flow, "DNS connection failed: {e:#}"),
+        while let Poll::Ready(Some(served)) = self.dns_conns.poll_join_next_with_id(cx) {
+            let (server, (flow, result)) = match served {
+                Ok(served) => served,
                 // The stack aborted it when the app reset the connection.
-                Err(e) if e.is_cancelled() => {}
+                Err(e) if e.is_cancelled() => continue,
                 Err(e) => return Err(e).context("a DNS connection's task failed"),
+            };
+            if let Err(e) = result {
+                debug!(%flow, "DNS connection failed: {e:#}");
+                // Its asker left an answer unread, and may never act: without a reset, its socket
+                // and pipe would outlive the place it held under MAX_DNS_CONNS.
+                self.reset(flow, server);
             }
         }
         Ok(())
+    }
+
+    /// Resets `flow`'s connection when `task` still serves its pipe, not when the app has since
+    /// reused the 4-tuple for a connection of its own.
+    fn reset(&mut self, flow: Flow, task: task::Id) {
+        if let Some(&handle) = self.flows.get(&flow)
+            && self.engine.pumped_by(handle, task)
+        {
+            self.engine.abort(handle);
+        }
     }
 
     fn dialed(&mut self, flow: Flow, opened: Result<T::Conn, OpenError>) {

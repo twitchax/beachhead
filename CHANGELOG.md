@@ -50,7 +50,8 @@ why the version moved the way it did.
 - DNS over TCP on `route`'s DNS server (`198.18.0.2:53`, RFC 7766): a query that comes over TCP
   goes on over TCP, to the remote's resolver for a name under a pattern and to the normal DNS
   servers for any other, so a truncated answer's retry over TCP now succeeds. A connection closes
-  after 10 s without a query, and the server serves at most 64 at once, resetting the rest.
+  after 10 s without a query, and is reset when its asker leaves an answer unread for 10 s; the
+  server serves at most 64 at once, resetting the rest.
 
 ### Changed
 
