@@ -110,11 +110,9 @@ impl<K: Clone + Eq + Hash, V> FlowTable<K, V> {
     /// Removes and returns every flow whose deadline is at or before `now`.
     pub fn expire(&mut self, now: Instant) -> Vec<(K, V)> {
         let mut gone = Vec::new();
-        while let Some(entry) = self.by_deadline.first_entry() {
-            if entry.key().0 > now {
-                break;
-            }
-            let key = entry.get().clone();
+        while self.deadline().is_some_and(|deadline| deadline <= now) {
+            // Popped, not just read: an index entry with no flow behind it would come up forever.
+            let Some((_, key)) = self.by_deadline.pop_first() else { break };
             if let Some(value) = self.remove_entry(&key) {
                 gone.push((key, value));
             }
