@@ -9,7 +9,10 @@ why the version moved the way it did.
 
 ### Added
 
-- Protocol v4: UDP and echo flows, datagrams outside credit, raw DNS queries, and the relay's capabilities in its `Hello`.
+- Protocol v4: UDP and echo flows, datagrams outside credit, raw DNS queries, and the relay's
+  capabilities in its `Hello`. Each flow queues at most 32 datagrams (64 KiB) each way and drops
+  what doesn't fit rather than stall the pipe, and each end's writer serves the flows round-robin,
+  taking turns with stream data.
 
 ### Changed
 

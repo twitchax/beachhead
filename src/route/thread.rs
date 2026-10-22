@@ -202,8 +202,8 @@ mod tests {
         thread::gettid,
     };
     use sshunnel_mux::{
-        OpenError, ResolveError,
-        frame::{OpenErrKind, ResolveErrKind},
+        OpenError, QueryError, ResolveError,
+        frame::{Capabilities, OpenErrKind, ResolveErrKind, Transport},
     };
     use tempfile::TempDir;
     use tokio::{net::UnixDatagram, sync::mpsc, task::JoinHandle, time::timeout};
@@ -216,7 +216,7 @@ mod tests {
             stack::Packets,
             targets::Targets,
         },
-        tests::{AppStack, Connect, FakeConn, device_pair},
+        tests::{AppStack, Connect, FakeConn, NoFlow, device_pair},
     };
 
     /// Refuses every open, saying which thread (by its kernel id) the open ran on.
@@ -225,6 +225,7 @@ mod tests {
 
     impl Tunnel for Recorder {
         type Conn = FakeConn;
+        type Flow = NoFlow;
 
         fn open(&self, host: &str, port: u16) -> impl Future<Output = Result<FakeConn, OpenError>> + Send {
             // The stack calls this inside the dial's task.
@@ -240,6 +241,22 @@ mod tests {
                 kind: ResolveErrKind::NoSuchName,
                 reason: format!("{host}: no such name"),
             }))
+        }
+
+        fn open_udp(&self, host: &str, port: u16) -> impl Future<Output = Result<NoFlow, OpenError>> + Send {
+            NoFlow::refuse(&format!("UDP {host}:{port}"))
+        }
+
+        fn open_echo(&self, host: &str) -> impl Future<Output = Result<NoFlow, OpenError>> + Send {
+            NoFlow::refuse(&format!("echo {host}"))
+        }
+
+        fn query(&self, _message: Bytes, _transport: Transport) -> impl Future<Output = Result<Bytes, QueryError>> + Send {
+            NoFlow::unanswered()
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
         }
     }
 

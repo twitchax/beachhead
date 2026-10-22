@@ -1,4 +1,5 @@
-//! [`FakeTunnel`]: a [`Tunnel`] scripted per target, standing in for the relay in the route tests.
+//! [`FakeTunnel`]: a [`Tunnel`] scripted per target, standing in for the relay in the route tests;
+//! and [`NoFlow`], the flow of test tunnels that open none.
 
 use std::{
     collections::HashMap,
@@ -7,14 +8,19 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use sshunnel_mux::{OpenError, ResolveError, Traffic, base::Res, frame::OpenErrKind, frame::ResolveErrKind};
+use bytes::Bytes;
+use sshunnel_mux::{
+    FlowEvent, OpenError, QueryError, ResolveError, Traffic,
+    base::Res,
+    frame::{Capabilities, OpenErrKind, ResolveErrKind, Transport},
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, copy, copy_bidirectional, sink, split},
     net::TcpStream,
     sync::{Notify, watch},
 };
 
-use crate::tunnel::{Conn, Tunnel};
+use crate::tunnel::{Conn, Flow, FlowSender, Tunnel};
 
 /// What an open of one `(host, port)` does.
 #[derive(Clone)]
@@ -156,6 +162,7 @@ pub enum FakeConn {
 
 impl Tunnel for FakeTunnel {
     type Conn = FakeConn;
+    type Flow = NoFlow;
 
     async fn open(&self, host: &str, port: u16) -> Result<FakeConn, OpenError> {
         let dial = {
@@ -190,6 +197,22 @@ impl Tunnel for FakeTunnel {
             reason: format!("resolving {host}: scripted {kind:?}"),
         }))
     }
+
+    fn open_udp(&self, host: &str, port: u16) -> impl Future<Output = Result<NoFlow, OpenError>> + Send {
+        NoFlow::refuse(&format!("UDP {host}:{port}"))
+    }
+
+    fn open_echo(&self, host: &str) -> impl Future<Output = Result<NoFlow, OpenError>> + Send {
+        NoFlow::refuse(&format!("echo {host}"))
+    }
+
+    fn query(&self, _message: Bytes, _transport: Transport) -> impl Future<Output = Result<Bytes, QueryError>> + Send {
+        NoFlow::unanswered()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
 }
 
 impl Conn for FakeConn {
@@ -221,5 +244,44 @@ impl Conn for FakeConn {
                 bail!("the remote reset after {sent} bytes")
             }
         }
+    }
+}
+
+/// The flow of a test tunnel that opens none: no value of it exists, so its methods never run.
+#[derive(Clone)]
+pub enum NoFlow {}
+
+impl NoFlow {
+    /// An open of `target` that fails, since nothing is scripted for it.
+    pub fn refuse(target: &str) -> std::future::Ready<Result<Self, OpenError>> {
+        std::future::ready(Err(OpenError {
+            kind: OpenErrKind::Other,
+            reason: format!("nothing scripted for {target}"),
+        }))
+    }
+
+    /// A query that fails, since nothing is scripted to answer it.
+    pub fn unanswered() -> std::future::Ready<Result<Bytes, QueryError>> {
+        std::future::ready(Err(QueryError {
+            reason: "nothing scripted to answer the query".to_owned(),
+        }))
+    }
+}
+
+impl Flow for NoFlow {
+    type Sender = Self;
+
+    fn sender(&self) -> Self {
+        match *self {}
+    }
+
+    async fn recv(&mut self) -> Option<FlowEvent> {
+        match *self {}
+    }
+}
+
+impl FlowSender for NoFlow {
+    fn try_send(&self, _datagram: Bytes) -> bool {
+        match *self {}
     }
 }

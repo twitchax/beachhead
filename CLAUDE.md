@@ -33,7 +33,9 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   with C code (`rust-lld` links it). Build it with `cargo xtask relay` (`--profile relay`).
 
 The mux invariant to protect: **the frame reader never blocks**. It hands frames to per-stream
-channels bounded by credit, so the ssh pipe always drains. `route::stack` (the TUN netstack) keeps
+channels bounded by credit, so the ssh pipe always drains. Datagrams don't take credit: the reader
+drops one whose flow's queue is full, and the writer alternates datagrams, round-robin over the
+flows, with stream data after control. `route::stack` (the TUN netstack) keeps
 the same shape: **its packet loop never waits on one connection**. Each smoltcp socket bridges to
 its relay stream through a bounded pipe, so a slow stream closes only that socket's window. The
 packet loop, its connections' tasks, the device's reader and writer and the DNS server share one

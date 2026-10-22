@@ -1,10 +1,12 @@
-//! The connection: many streams over one byte pipe, the ssh session's stdio.
+//! The connection: many streams and datagram flows over one byte pipe, the ssh session's stdio.
 //!
 //! The invariant everything rests on: **the reader never blocks.** It hands each frame to a
 //! per-stream unbounded channel whose depth is bounded by credit, so the pipe always drains and one
-//! stalled stream can't hold up the rest. A single writer owns the outbound pipe and drains two
-//! channels: control frames first (so credit returns promptly), then data. `Fin` rides the data
-//! channel, because it must never overtake that stream's queued data.
+//! stalled stream can't hold up the rest. Datagrams take no credit: the reader pushes each into its
+//! flow's bounded queue and drops it when the queue is full. A single writer owns the outbound pipe:
+//! control frames first (so credit returns promptly), then datagrams and data taking turns, the
+//! datagrams round-robin over the flows. `Fin` rides the data channel, because it must never
+//! overtake that stream's queued data.
 
 use std::{
     collections::HashMap,
@@ -21,7 +23,8 @@ use tracing::debug;
 
 use crate::{
     base::{Res, Void},
-    frame::{Capabilities, Frame, HEADER_LEN, MAX_HOST, MAX_PAYLOAD, OpenErrKind, ResolveErrKind, StreamId},
+    flow::{Flow, FlowKind, Inbox, Outbox},
+    frame::{Capabilities, FlowErrKind, Frame, HEADER_LEN, MAX_HOST, MAX_PAYLOAD, MAX_QUERY, OpenErrKind, ResolveErrKind, StreamId, Transport},
     hello::PeerHello,
     stream::{Inbound, State, Stream},
 };
@@ -164,6 +167,26 @@ impl ResolveError {
     }
 }
 
+/// Why [`Mux::query`] failed: the peer got no answer, or the query never reached it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryError {
+    pub reason: String,
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for QueryError {}
+
+impl QueryError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into() }
+    }
+}
+
 /// The handle for opening streams. Clones share one connection.
 #[derive(Clone)]
 pub struct Mux {
@@ -241,6 +264,98 @@ impl Mux {
         }
         answer_rx.await.unwrap_or_else(|_| Err(ResolveError::failed(format!("connection closed while resolving {host}"))))
     }
+
+    /// Asks the peer to open a UDP flow to `host:port` and returns the flow once it has.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the peer refuses (with its kind) or the connection is gone.
+    pub async fn open_udp(&self, host: &str, port: u16) -> Result<Flow, OpenError> {
+        self.open_flow(FlowKind::Udp, host, port).await
+    }
+
+    /// Asks the peer to open an ICMP echo flow to `host` and returns the flow once it has.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the peer refuses (with its kind) or the connection is gone.
+    pub async fn open_echo(&self, host: &str) -> Result<Flow, OpenError> {
+        self.open_flow(FlowKind::Echo, host, 0).await
+    }
+
+    async fn open_flow(&self, kind: FlowKind, host: &str, port: u16) -> Result<Flow, OpenError> {
+        let target = || match kind {
+            FlowKind::Udp => format!("UDP {host}:{port}"),
+            FlowKind::Echo => format!("echo {host}"),
+        };
+        if host.len() > MAX_HOST {
+            return Err(OpenError::other(format!("host `{host}` is longer than {MAX_HOST} bytes")));
+        }
+        let (opened_tx, opened_rx) = oneshot::channel();
+        // Built before the wait, so a caller that gives up drops it and resets the flow.
+        let flow = {
+            let mut table = self.shared.table();
+            if let Some(reason) = &table.dead {
+                return Err(OpenError::other(format!("connection closed: {reason}")));
+            }
+            let id = table.allocate_id().map_err(|e| OpenError::other(format!("{e:#}")))?;
+            let inbox = self.shared.register_flow(&mut table, id, Some(opened_tx));
+            // Same lock, same order rule as `open`.
+            self.shared.control(match kind {
+                FlowKind::Udp => Frame::OpenUdp { stream: id, host: host.to_owned(), port },
+                FlowKind::Echo => Frame::OpenEcho { stream: id, host: host.to_owned() },
+            });
+            Flow::new(id, inbox, Arc::clone(&self.shared))
+        };
+
+        // A refused or failed flow is already forgotten, so dropping it tells the peer nothing.
+        match opened_rx.await {
+            Ok(Ok(())) => Ok(flow),
+            Ok(Err(Refusal::Peer(e))) => Err(e),
+            Ok(Err(Refusal::Local(reason))) => Err(OpenError::other(format!("{}: {reason}", target()))),
+            Err(_) => Err(OpenError::other(format!("connection closed while opening {}", target()))),
+        }
+    }
+
+    /// Asks the peer's resolvers a raw DNS `message`, over the `transport` its asker used, and
+    /// returns their answer. Nothing here times it out: a caller gives up by dropping the future,
+    /// which forgets the query, and a late answer is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the peer got no answer, the message is too long for a frame, or the connection is
+    /// gone.
+    pub async fn query(&self, message: Bytes, transport: Transport) -> Result<Bytes, QueryError> {
+        if message.len() > MAX_QUERY {
+            return Err(QueryError::new(format!("the query is {} bytes, over the {MAX_QUERY}-byte limit", message.len())));
+        }
+        let (answer_tx, answer_rx) = oneshot::channel();
+        let id = {
+            let mut table = self.shared.table();
+            if let Some(reason) = &table.dead {
+                return Err(QueryError::new(format!("connection closed: {reason}")));
+            }
+            let id = table.allocate_id().map_err(|e| QueryError::new(format!("{e:#}")))?;
+            table.queries.insert(id, answer_tx);
+            // Same lock, same order rule as `open`.
+            self.shared.control(Frame::Query { stream: id, transport, message });
+            id
+        };
+        let _waiting = WaitingQuery { shared: &self.shared, id };
+        answer_rx.await.unwrap_or_else(|_| Err(QueryError::new("connection closed while querying")))
+    }
+}
+
+/// Forgets a query once its caller stops waiting, so one given up leaves nothing behind.
+struct WaitingQuery<'a> {
+    shared: &'a Shared,
+    id: StreamId,
+}
+
+impl Drop for WaitingQuery<'_> {
+    fn drop(&mut self) {
+        self.shared.table().queries.remove(&self.id);
+    }
 }
 
 /// Something the peer asked this side to do.
@@ -249,6 +364,10 @@ pub enum Request {
     Open(OpenRequest),
     /// Resolve a name.
     Resolve(ResolveRequest),
+    /// Open a datagram flow.
+    OpenFlow(FlowRequest),
+    /// Ask this side's resolvers a raw DNS message.
+    Query(QueryRequest),
 }
 
 /// Requests the peer made of this side.
@@ -339,6 +458,119 @@ impl Drop for ResolveRequest {
     }
 }
 
+/// A peer's request to open a datagram flow. Dropping it unanswered rejects it.
+pub struct FlowRequest {
+    kind: FlowKind,
+    host: String,
+    port: u16,
+    stream: StreamId,
+    inbox: Arc<Inbox>,
+    shared: Arc<Shared>,
+    answered: bool,
+}
+
+impl FlowRequest {
+    /// What the flow carries.
+    #[must_use]
+    pub fn kind(&self) -> FlowKind {
+        self.kind
+    }
+
+    /// The host the peer asked for.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The port the peer asked for; 0 for an echo flow.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Tells the peer the flow is open and returns it.
+    #[must_use]
+    pub fn accept(mut self) -> Flow {
+        self.answered = true;
+        self.shared.control(Frame::OpenOk { stream: self.stream });
+        Flow::new(self.stream, Arc::clone(&self.inbox), Arc::clone(&self.shared))
+    }
+
+    /// Tells the peer the open failed.
+    pub fn reject(mut self, kind: OpenErrKind, reason: &str) {
+        self.answered = true;
+        self.refuse(kind, reason);
+    }
+
+    /// Forgets the flow and refuses it, unless the peer already reset it.
+    fn refuse(&self, kind: OpenErrKind, reason: &str) {
+        if self.shared.forget_flow(self.stream) {
+            self.shared.control(Frame::OpenErr {
+                stream: self.stream,
+                kind,
+                reason: reason.to_owned(),
+            });
+        }
+    }
+}
+
+impl Drop for FlowRequest {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.refuse(OpenErrKind::Other, "not accepted");
+        }
+    }
+}
+
+/// A peer's raw DNS query for this side's resolvers. Dropping it unanswered answers a query error.
+pub struct QueryRequest {
+    message: Bytes,
+    transport: Transport,
+    stream: StreamId,
+    shared: Arc<Shared>,
+    answered: bool,
+}
+
+impl QueryRequest {
+    /// The raw DNS message the peer asked.
+    #[must_use]
+    pub fn message(&self) -> &Bytes {
+        &self.message
+    }
+
+    /// The transport the peer's asker used, and the one to ask over.
+    #[must_use]
+    pub fn transport(&self) -> Transport {
+        self.transport
+    }
+
+    /// Sends the peer the answer, or why there is none. An answer too long for a frame goes as a
+    /// query error.
+    pub fn answer(mut self, result: Result<Bytes, QueryError>) {
+        self.answered = true;
+        let stream = self.stream;
+        self.shared.control(match result {
+            Ok(message) if message.len() <= MAX_PAYLOAD => Frame::Answer { stream, message },
+            Ok(message) => Frame::QueryErr {
+                stream,
+                reason: format!("the answer is {} bytes, over the {MAX_PAYLOAD}-byte limit", message.len()),
+            },
+            Err(QueryError { reason }) => Frame::QueryErr { stream, reason },
+        });
+    }
+}
+
+impl Drop for QueryRequest {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.shared.control(Frame::QueryErr {
+                stream: self.stream,
+                reason: "not answered".to_owned(),
+            });
+        }
+    }
+}
+
 /// Starts a connection over a pipe whose `Hello`s were already exchanged (see [`crate::hello`]).
 /// `buffered` holds bytes already read past the peer's `Hello`, and `peer` is what it announced: its
 /// window is every stream's starting credit and the most the peer may ever return.
@@ -358,6 +590,8 @@ where
     let table = Table {
         streams: HashMap::new(),
         resolves: HashMap::new(),
+        flows: HashMap::new(),
+        queries: HashMap::new(),
         next_id: role.first_id(),
         last_peer_id: 0,
         dead: None,
@@ -366,6 +600,7 @@ where
         table: Mutex::new(table),
         ctrl: ctrl_tx,
         data: data_tx,
+        outbox: Outbox::default(),
         config,
         peer_window,
         peer_capabilities: peer.capabilities,
@@ -379,7 +614,7 @@ where
         async move {
             let result = tokio::select! {
                 read = read_loop(reader, buffered, &shared, incoming_tx) => read.context("reading from the peer"),
-                write = write_loop(writer, ctrl_rx, data_rx) => write.context("writing to the peer"),
+                write = write_loop(writer, Outgoing::new(ctrl_rx, data_rx, &shared.outbox)) => write.context("writing to the peer"),
             };
             let reason = match &result {
                 Ok(()) => "the peer hung up".to_owned(),
@@ -398,6 +633,8 @@ pub(crate) struct Shared {
     table: Mutex<Table>,
     ctrl: mpsc::UnboundedSender<Frame>,
     data: mpsc::Sender<Frame>,
+    /// Every flow's send queue; the writer takes turns between it and `data`.
+    pub(crate) outbox: Outbox,
     pub(crate) config: Config,
     /// The window the peer announced: each stream's starting send credit.
     peer_window: u32,
@@ -412,6 +649,10 @@ struct Table {
     /// Resolves awaiting an answer. They share `next_id` with streams but carry no data, so they
     /// need no credit or channel.
     resolves: HashMap<StreamId, oneshot::Sender<Result<(), ResolveError>>>,
+    /// Datagram flows, opened by either side. They share the id sequence too, and take no credit.
+    flows: HashMap<StreamId, FlowEntry>,
+    /// Queries awaiting an answer, like `resolves`.
+    queries: HashMap<StreamId, oneshot::Sender<Result<Bytes, QueryError>>>,
     next_id: u32,
     last_peer_id: u32,
     /// Set once, when the connection ends; checked under the same lock as inserts, so no stream
@@ -420,7 +661,8 @@ struct Table {
 }
 
 impl Table {
-    /// The next id this side may open with; opens and resolves draw from one sequence.
+    /// The next id this side may open with; opens, flows, resolves and queries draw from one
+    /// sequence.
     fn allocate_id(&mut self) -> Res<StreamId> {
         let id = StreamId(self.next_id);
         self.next_id = self.next_id.checked_add(2).context("stream ids exhausted")?;
@@ -447,6 +689,21 @@ impl Entry {
             let _ = opened.send(Err(Refusal::Local(reason.to_owned())));
         }
         let _ = self.inbound.send(Inbound::Reset(reason.to_owned()));
+    }
+}
+
+/// The reader's view of one flow.
+struct FlowEntry {
+    inbox: Arc<Inbox>,
+    opened: Option<oneshot::Sender<Result<(), Refusal>>>,
+}
+
+impl FlowEntry {
+    fn abort(mut self, reason: &str) {
+        self.inbox.close();
+        if let Some(opened) = self.opened.take() {
+            let _ = opened.send(Err(Refusal::Local(reason.to_owned())));
+        }
     }
 }
 
@@ -489,27 +746,36 @@ impl Shared {
         self.table().streams.remove(&id).is_some()
     }
 
+    /// Registers flow `id` and gives it a send queue, under the lock that allocated or admitted
+    /// the id, so the flow exists before its open frame can leave or its first datagram arrive.
+    fn register_flow(&self, table: &mut Table, id: StreamId, opened: Option<oneshot::Sender<Result<(), Refusal>>>) -> Arc<Inbox> {
+        let inbox = Arc::new(Inbox::default());
+        table.flows.insert(id, FlowEntry { inbox: Arc::clone(&inbox), opened });
+        self.outbox.open(id);
+        inbox
+    }
+
+    /// Drops flow `id` and its send queue, returning whether the peer still thinks it is live.
+    pub(crate) fn forget_flow(&self, id: StreamId) -> bool {
+        let mut table = self.table();
+        self.outbox.close(id);
+        table.flows.remove(&id).is_some()
+    }
+
     fn dispatch(self: &Arc<Self>, frame: Frame, incoming: &mpsc::UnboundedSender<Request>) -> Void {
         match frame {
             Frame::Hello { .. } => bail!("unexpected Hello mid-connection"),
             Frame::Open { stream, host, port } => self.on_open(stream, host, port, incoming),
-            Frame::OpenOk { stream } => {
-                if let Some(opened) = self.table().streams.get_mut(&stream).and_then(|e| e.opened.take()) {
-                    let _ = opened.send(Ok(()));
-                }
-            }
-            Frame::OpenErr { stream, kind, reason } => {
-                let entry = self.table().streams.remove(&stream);
-                if let Some(mut entry) = entry {
-                    if let Some(opened) = entry.opened.take() {
-                        let _ = opened.send(Err(Refusal::Peer(OpenError { kind, reason: reason.clone() })));
-                    }
-                    entry.abort(&reason);
-                }
-            }
+            Frame::OpenUdp { stream, host, port } => self.on_open_flow(stream, FlowKind::Udp, host, port, incoming),
+            Frame::OpenEcho { stream, host } => self.on_open_flow(stream, FlowKind::Echo, host, 0, incoming),
+            Frame::OpenOk { stream } => self.on_open_ok(stream),
+            Frame::OpenErr { stream, kind, reason } => self.on_open_err(stream, OpenError { kind, reason }),
             Frame::Resolve { stream, host } => self.on_resolve(stream, host, incoming),
             Frame::Resolved { stream } => self.answer_resolve(stream, Ok(())),
             Frame::ResolveErr { stream, kind, reason } => self.answer_resolve(stream, Err(ResolveError { kind, reason })),
+            Frame::Query { stream, transport, message } => self.on_query(stream, transport, message, incoming),
+            Frame::Answer { stream, message } => self.answer_query(stream, Ok(message)),
+            Frame::QueryErr { stream, reason } => self.answer_query(stream, Err(QueryError { reason })),
             Frame::Data { stream, data } => self.on_data(stream, data),
             Frame::Window { stream, credit } => self.on_window(stream, credit),
             Frame::Fin { stream } => {
@@ -517,37 +783,9 @@ impl Shared {
                     let _ = entry.inbound.send(Inbound::Fin);
                 }
             }
-            // Interim, until flows and queries get their behavior: refuse what opens, drop the rest.
-            Frame::OpenUdp { stream, .. } | Frame::OpenEcho { stream, .. } => {
-                if self.admit_peer_id(&mut self.table(), stream) {
-                    self.control(Frame::OpenErr {
-                        stream,
-                        kind: OpenErrKind::Other,
-                        reason: "not supported".to_owned(),
-                    });
-                }
-            }
-            Frame::Query { stream, .. } => {
-                if self.admit_peer_id(&mut self.table(), stream) {
-                    self.control(Frame::QueryErr {
-                        stream,
-                        reason: "not supported".to_owned(),
-                    });
-                }
-            }
-            Frame::Datagram { stream, .. } | Frame::FlowErr { stream, .. } | Frame::Answer { stream, .. } | Frame::QueryErr { stream, .. } => {
-                debug!(%stream, "ignoring a frame nothing handles yet");
-            }
-            Frame::Rst { stream, reason } => {
-                let entry = self.table().streams.remove(&stream);
-                if let Some(entry) = entry {
-                    debug!(%stream, %reason, "peer reset stream");
-                    entry.abort(&reason);
-                } else {
-                    // A resolve the peer refused outright (a bad id) is reset, not answered.
-                    self.answer_resolve(stream, Err(ResolveError::failed(reason)));
-                }
-            }
+            Frame::Datagram { stream, data } => self.on_datagram(stream, data),
+            Frame::FlowErr { stream, kind } => self.on_flow_err(stream, kind),
+            Frame::Rst { stream, reason } => self.on_rst(stream, reason),
         }
         Ok(())
     }
@@ -583,6 +821,58 @@ impl Shared {
         let _ = incoming.send(Request::Open(request));
     }
 
+    fn on_open_flow(self: &Arc<Self>, stream: StreamId, kind: FlowKind, host: String, port: u16, incoming: &mpsc::UnboundedSender<Request>) {
+        let request = {
+            let mut table = self.table();
+            if !self.admit_peer_id(&mut table, stream) {
+                return;
+            }
+            FlowRequest {
+                kind,
+                host,
+                port,
+                stream,
+                inbox: self.register_flow(&mut table, stream, None),
+                shared: Arc::clone(self),
+                answered: false,
+            }
+        };
+        debug!(%stream, ?kind, host = request.host, port, "peer opened flow");
+        // With no one accepting, the returned request drops here, which rejects it.
+        let _ = incoming.send(Request::OpenFlow(request));
+    }
+
+    fn on_open_ok(&self, stream: StreamId) {
+        let opened = {
+            let mut table = self.table();
+            match table.streams.get_mut(&stream) {
+                Some(entry) => entry.opened.take(),
+                None => table.flows.get_mut(&stream).and_then(|entry| entry.opened.take()),
+            }
+        };
+        if let Some(opened) = opened {
+            let _ = opened.send(Ok(()));
+        }
+    }
+
+    fn on_open_err(&self, stream: StreamId, refusal: OpenError) {
+        let mut table = self.table();
+        if let Some(mut entry) = table.streams.remove(&stream) {
+            drop(table);
+            if let Some(opened) = entry.opened.take() {
+                let _ = opened.send(Err(Refusal::Peer(refusal.clone())));
+            }
+            entry.abort(&refusal.reason);
+        } else if let Some(mut entry) = table.flows.remove(&stream) {
+            self.outbox.close(stream);
+            drop(table);
+            if let Some(opened) = entry.opened.take() {
+                let _ = opened.send(Err(Refusal::Peer(refusal)));
+            }
+            entry.inbox.close();
+        }
+    }
+
     fn on_resolve(self: &Arc<Self>, stream: StreamId, host: String, incoming: &mpsc::UnboundedSender<Request>) {
         if !self.admit_peer_id(&mut self.table(), stream) {
             return;
@@ -599,6 +889,29 @@ impl Shared {
 
     fn answer_resolve(&self, stream: StreamId, result: Result<(), ResolveError>) {
         let waiting = self.table().resolves.remove(&stream);
+        if let Some(waiting) = waiting {
+            let _ = waiting.send(result);
+        }
+    }
+
+    fn on_query(self: &Arc<Self>, stream: StreamId, transport: Transport, message: Bytes, incoming: &mpsc::UnboundedSender<Request>) {
+        if !self.admit_peer_id(&mut self.table(), stream) {
+            return;
+        }
+        debug!(%stream, ?transport, len = message.len(), "peer sent a query");
+        // With no one serving, the returned request drops here, which answers a query error.
+        let _ = incoming.send(Request::Query(QueryRequest {
+            message,
+            transport,
+            stream,
+            shared: Arc::clone(self),
+            answered: false,
+        }));
+    }
+
+    /// Hands over an answer, unless its asker gave up (or never asked).
+    fn answer_query(&self, stream: StreamId, result: Result<Bytes, QueryError>) {
+        let waiting = self.table().queries.remove(&stream);
         if let Some(waiting) = waiting {
             let _ = waiting.send(result);
         }
@@ -635,6 +948,47 @@ impl Shared {
         entry.credit.add_permits(credit as usize);
     }
 
+    /// Hands a datagram to its flow without waiting: no credit, and a full queue drops it.
+    fn on_datagram(&self, stream: StreamId, data: Bytes) {
+        let pushed = self.table().flows.get(&stream).map(|entry| entry.inbox.push(data));
+        match pushed {
+            Some(true) => {}
+            Some(false) => debug!(%stream, "dropping a datagram: its flow's queue is full"),
+            // A flow this side already ended, or an id that names no flow (a stream's included).
+            None => debug!(%stream, "dropping a datagram for no flow"),
+        }
+    }
+
+    fn on_flow_err(&self, stream: StreamId, kind: FlowErrKind) {
+        if let Some(entry) = self.table().flows.get(&stream) {
+            entry.inbox.report(kind);
+        } else {
+            debug!(%stream, ?kind, "ignoring a flow error for no flow");
+        }
+    }
+
+    fn on_rst(&self, stream: StreamId, reason: String) {
+        let mut table = self.table();
+        if let Some(entry) = table.streams.remove(&stream) {
+            drop(table);
+            debug!(%stream, %reason, "peer reset stream");
+            entry.abort(&reason);
+        } else if let Some(entry) = table.flows.remove(&stream) {
+            // The send queue goes first, so a flow whose `recv` has ended takes no more datagrams.
+            self.outbox.close(stream);
+            drop(table);
+            debug!(%stream, %reason, "peer reset flow");
+            entry.abort(&reason);
+        } else if let Some(waiting) = table.queries.remove(&stream) {
+            drop(table);
+            let _ = waiting.send(Err(QueryError { reason }));
+        } else if let Some(waiting) = table.resolves.remove(&stream) {
+            drop(table);
+            // A resolve the peer refused outright (a bad id) is reset, not answered.
+            let _ = waiting.send(Err(ResolveError::failed(reason)));
+        }
+    }
+
     fn violation(&self, stream: StreamId, entry: Option<Entry>, what: &str) {
         let reason = format!("protocol error on stream {stream}: {what}");
         debug!(%reason, "resetting stream");
@@ -645,16 +999,30 @@ impl Shared {
     }
 
     fn teardown(&self, reason: &str) {
-        let (streams, resolves) = {
+        let (streams, resolves, flows, queries) = {
             let mut table = self.table();
             table.dead = Some(reason.to_owned());
-            (std::mem::take(&mut table.streams), std::mem::take(&mut table.resolves))
+            // Under the table lock, which every flow registers under after checking `dead`, so no
+            // flow gets a send queue from here on.
+            self.outbox.clear();
+            (
+                std::mem::take(&mut table.streams),
+                std::mem::take(&mut table.resolves),
+                std::mem::take(&mut table.flows),
+                std::mem::take(&mut table.queries),
+            )
         };
         let reason = format!("connection closed: {reason}");
         for waiting in resolves.into_values() {
             let _ = waiting.send(Err(ResolveError::failed(reason.clone())));
         }
+        for waiting in queries.into_values() {
+            let _ = waiting.send(Err(QueryError::new(reason.clone())));
+        }
         for entry in streams.into_values() {
+            entry.abort(&reason);
+        }
+        for entry in flows.into_values() {
             entry.abort(&reason);
         }
     }
@@ -675,28 +1043,151 @@ async fn read_loop<R: AsyncRead + Unpin>(mut reader: R, mut buf: BytesMut, share
     }
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut writer: W, mut ctrl: mpsc::UnboundedReceiver<Frame>, mut data: mpsc::Receiver<Frame>) -> Void {
+/// What the writer sends, in its order: control first, then datagrams and data-channel frames
+/// taking turns while both wait, so neither can starve the other. The outbox takes its flows
+/// round-robin, so a flood on one flow gets only its own turns.
+struct Outgoing<'a> {
+    ctrl: mpsc::UnboundedReceiver<Frame>,
+    data: mpsc::Receiver<Frame>,
+    outbox: &'a Outbox,
+    /// Whether a datagram goes ahead of data when both wait.
+    datagram_turn: bool,
+}
+
+impl<'a> Outgoing<'a> {
+    fn new(ctrl: mpsc::UnboundedReceiver<Frame>, data: mpsc::Receiver<Frame>, outbox: &'a Outbox) -> Self {
+        Self { ctrl, data, outbox, datagram_turn: false }
+    }
+
+    /// The next frame ready to go, without waiting.
+    fn ready(&mut self) -> Option<Frame> {
+        if let Ok(frame) = self.ctrl.try_recv() {
+            return Some(frame);
+        }
+        let frame = if self.datagram_turn {
+            self.outbox.pop().or_else(|| self.data.try_recv().ok())
+        } else {
+            self.data.try_recv().ok().or_else(|| self.outbox.pop())
+        }?;
+        self.datagram_turn = !matches!(frame, Frame::Datagram { .. });
+        Some(frame)
+    }
+
+    /// The next frame, waiting for one. The channels' senders live in `Shared`, which the driver
+    /// holds, so neither closes while the writer runs.
+    async fn next(&mut self) -> Frame {
+        loop {
+            if let Some(frame) = self.ready() {
+                return frame;
+            }
+            tokio::select! {
+                biased;
+                Some(frame) = self.ctrl.recv() => return frame,
+                Some(frame) = self.data.recv() => {
+                    self.datagram_turn = true;
+                    return frame;
+                }
+                () = self.outbox.ready() => {}
+            }
+        }
+    }
+
+    /// Whether nothing waits, so the batch just written is the last for now.
+    fn is_idle(&self) -> bool {
+        self.ctrl.is_empty() && self.data.is_empty() && self.outbox.is_empty()
+    }
+}
+
+async fn write_loop<W: AsyncWrite + Unpin>(mut writer: W, mut outgoing: Outgoing<'_>) -> Void {
     let mut buf = BytesMut::with_capacity(WRITE_BATCH + HEADER_LEN + MAX_PAYLOAD);
     loop {
-        let first = tokio::select! {
-            biased;
-            Some(frame) = ctrl.recv() => frame,
-            Some(frame) = data.recv() => frame,
-            else => return Ok(()),
-        };
-        first.encode(&mut buf)?;
-        // Batch whatever else is ready, control first, so credit goes back promptly. That is a
-        // priority, not an order: a control frame queued just after its channel was checked can
-        // still go out behind data queued later (an `OpenOk` behind its stream's first `Data`).
-        // That is harmless only because an opener registers its stream before its `Open` leaves.
+        outgoing.next().await.encode(&mut buf)?;
+        // Batch whatever else is ready, in the same order, so credit goes back promptly. Control
+        // first is a priority, not an order: a control frame queued just after its channel was
+        // checked can still go out behind data queued later (an `OpenOk` behind its stream's first
+        // `Data`, or its flow's first `Datagram`). That is harmless only because an opener
+        // registers its stream or flow before its open leaves.
         while buf.len() < WRITE_BATCH {
-            let Some(next) = ctrl.try_recv().ok().or_else(|| data.try_recv().ok()) else { break };
+            let Some(next) = outgoing.ready() else { break };
             next.encode(&mut buf)?;
         }
         writer.write_all(&buf).await.context("writing frames")?;
         buf.clear();
-        if ctrl.is_empty() && data.is_empty() {
+        if outgoing.is_idle() {
             writer.flush().await.context("flushing frames")?;
         }
+    }
+}
+
+#[cfg(test)]
+mod unit {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncRead, duplex, split},
+        time::timeout,
+    };
+
+    use super::*;
+    use crate::frame::Transport;
+
+    /// The next frame from the client's side of the pipe.
+    async fn next_frame(r: &mut (impl AsyncRead + Unpin), buf: &mut BytesMut) -> Frame {
+        loop {
+            if let Some(frame) = Frame::decode(buf).unwrap() {
+                return frame;
+            }
+            assert!(r.read_buf(buf).await.unwrap() > 0, "the client hung up");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_query_given_up_is_forgotten() {
+        let (a, b) = duplex(64 * 1024);
+        let (ar, aw) = split(a);
+        let peer = PeerHello {
+            window: 64 * 1024,
+            capabilities: Capabilities::default(),
+        };
+        let (mux, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, Config::default(), peer);
+        tokio::spawn(driver);
+        let (mut r, mut w) = split(b);
+        let mut buf = BytesMut::new();
+
+        let given_up = timeout(Duration::from_secs(1), mux.query(Bytes::from_static(b"q1"), Transport::Udp)).await;
+        assert!(given_up.is_err(), "nothing answers, so the caller gives up");
+        assert!(mux.shared.table().queries.is_empty(), "a query given up leaves nothing behind");
+
+        // The answer arrives late, then a second query asks.
+        let Frame::Query { stream: late, .. } = next_frame(&mut r, &mut buf).await else {
+            panic!("expected the first Query")
+        };
+        let asking = tokio::spawn({
+            let mux = mux.clone();
+            async move { mux.query(Bytes::from_static(b"q2"), Transport::Udp).await }
+        });
+        let Frame::Query { stream: second, .. } = next_frame(&mut r, &mut buf).await else {
+            panic!("expected the second Query")
+        };
+        let mut wire = BytesMut::new();
+        Frame::Answer {
+            stream: late,
+            message: Bytes::from_static(b"late"),
+        }
+        .encode(&mut wire)
+        .unwrap();
+        Frame::Answer {
+            stream: second,
+            message: Bytes::from_static(b"a2"),
+        }
+        .encode(&mut wire)
+        .unwrap();
+        w.write_all(&wire).await.unwrap();
+
+        // The late answer changed nothing: the second query gets its own.
+        assert_eq!(asking.await.unwrap().unwrap(), Bytes::from_static(b"a2"));
+        assert!(mux.shared.table().queries.is_empty());
     }
 }

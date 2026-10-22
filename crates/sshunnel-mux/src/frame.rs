@@ -12,6 +12,8 @@ use crate::base::{Res, Void};
 pub const HEADER_LEN: usize = 9;
 /// The largest payload a decoder accepts, so a garbage length can't make it allocate.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
+/// The longest `Query` message: a payload, less the transport byte ahead of it.
+pub const MAX_QUERY: usize = MAX_PAYLOAD - 1;
 /// The longest `Open` or `Resolve` host, matching DNS's own limit.
 pub const MAX_HOST: usize = 255;
 /// `OpenErr`, `ResolveErr` and `Rst` reasons are cut to this many bytes (on a char boundary) when encoded.
@@ -486,8 +488,8 @@ impl Frame {
                 buf.put_u8(*kind as u8);
             }
             Self::Query { stream, transport, message } => {
-                if message.len() > MAX_PAYLOAD - 1 {
-                    bail!("Query message is {} bytes, over the {}-byte limit", message.len(), MAX_PAYLOAD - 1);
+                if message.len() > MAX_QUERY {
+                    bail!("Query message is {} bytes, over the {MAX_QUERY}-byte limit", message.len());
                 }
                 put_header(buf, *stream, Kind::Query, 1 + message.len());
                 buf.put_u8(*transport as u8);
@@ -993,7 +995,7 @@ mod unit {
         let fits = Frame::Query {
             stream: StreamId(1),
             transport: Transport::Udp,
-            message: Bytes::from(vec![7; MAX_PAYLOAD - 1]),
+            message: Bytes::from(vec![7; MAX_QUERY]),
         };
         let mut buf = encoded(&fits);
         assert_eq!(Frame::decode(&mut buf).unwrap(), Some(fits));
@@ -1001,7 +1003,7 @@ mod unit {
         let too_long = Frame::Query {
             stream: StreamId(1),
             transport: Transport::Udp,
-            message: Bytes::from(vec![7; MAX_PAYLOAD]),
+            message: Bytes::from(vec![7; MAX_QUERY + 1]),
         };
         assert!(too_long.encode(&mut BytesMut::new()).is_err());
         // A decoded Query needs at least its transport byte.

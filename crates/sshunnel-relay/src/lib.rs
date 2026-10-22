@@ -61,6 +61,8 @@ pub async fn serve(mut incoming: Incoming) {
             Request::Resolve(request) => {
                 tokio::spawn(resolve(request, Arc::clone(&lookups)));
             }
+            // Not served yet (T-002): dropping a request refuses it, so the client hears why.
+            Request::OpenFlow(_) | Request::Query(_) => {}
         }
     }
 }

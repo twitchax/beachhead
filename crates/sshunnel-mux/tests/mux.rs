@@ -5,6 +5,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::{
     sync::{
         Arc,
@@ -13,35 +15,20 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
+use common::{CHUNK, PIPE_CAP, SOCK_CAP, WINDOW, client_with_hand_peer, connect, connect_pair, hello, next_frame, open_by_hand, small};
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
-    Config, Incoming, Mux, Request, ResolveError, Role, Stream,
-    frame::{Capabilities, Frame, OpenErrKind, ResolveErrKind, StreamId, Transport},
+    Config, Mux, Request, ResolveError, Role,
+    frame::{Capabilities, Frame, OpenErrKind, ResolveErrKind, StreamId},
     hello::PeerHello,
     pump, start,
 };
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, ReadHalf, WriteHalf, duplex, split},
+    io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex, split},
     task::JoinHandle,
     time::{sleep, timeout},
 };
-
-const WINDOW: u32 = 16 * 1024;
-const CHUNK: usize = 4 * 1024;
-const PIPE_CAP: usize = 8 * 1024;
-const SOCK_CAP: usize = 4 * 1024;
-
-fn hello(window: u32) -> PeerHello {
-    PeerHello {
-        window,
-        capabilities: Capabilities::default(),
-    }
-}
-
-fn small() -> Config {
-    Config::new(WINDOW, CHUNK).unwrap()
-}
 
 /// Deterministic, stream-specific bytes (xorshift64), so a misrouted chunk can't compare equal.
 fn pattern(seed: u64, len: usize) -> Vec<u8> {
@@ -54,79 +41,6 @@ fn pattern(seed: u64, len: usize) -> Vec<u8> {
             x.to_le_bytes()[0]
         })
         .collect()
-}
-
-/// Starts a client and a relay mux over one in-memory pipe and serves the relay side.
-fn connect(config: Config) -> Mux {
-    connect_pair(config, config)
-}
-
-/// [`connect`], with each end's own config.
-fn connect_pair(client_config: Config, relay_config: Config) -> Mux {
-    let (a, b) = duplex(PIPE_CAP);
-    let (ar, aw) = split(a);
-    let (br, bw) = split(b);
-    // Each end learns the other's window from its Hello; here the test hands it over directly.
-    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, client_config, hello(relay_config.window()));
-    let (_relay, relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, relay_config, hello(client_config.window()));
-    tokio::spawn(client_driver);
-    tokio::spawn(relay_driver);
-    tokio::spawn(serve(relay_incoming));
-    client
-}
-
-/// The relay's stand-in targets, picked by the `Open` host.
-async fn serve(mut incoming: Incoming) {
-    while let Some(request) = incoming.next().await {
-        let Request::Open(request) = request else { panic!("unexpected Resolve") };
-        match request.host() {
-            "echo" => {
-                let (near, far) = duplex(SOCK_CAP);
-                tokio::spawn(pump(request.accept(), near));
-                tokio::spawn(async move {
-                    let (mut r, mut w) = split(far);
-                    tokio::io::copy(&mut r, &mut w).await.unwrap();
-                    w.shutdown().await.unwrap();
-                });
-            }
-            // A target that accepts and then never reads: the stalled consumer.
-            "sink" => {
-                let (near, far) = duplex(SOCK_CAP);
-                tokio::spawn(pump(request.accept(), near));
-                tokio::spawn(async move {
-                    let _held = far;
-                    std::future::pending::<()>().await;
-                });
-            }
-            // Reads to EOF, then answers with the byte count: data must flow back after a Fin.
-            "count" => {
-                let (near, far) = duplex(SOCK_CAP);
-                tokio::spawn(pump(request.accept(), near));
-                tokio::spawn(async move {
-                    let (mut r, mut w) = split(far);
-                    let mut all = Vec::new();
-                    r.read_to_end(&mut all).await.unwrap();
-                    w.write_all(all.len().to_string().as_bytes()).await.unwrap();
-                    w.shutdown().await.unwrap();
-                });
-            }
-            // Reads a little, then vanishes: the relay's pump fails and resets the stream.
-            "vanish" => {
-                let (near, far) = duplex(SOCK_CAP);
-                tokio::spawn(pump(request.accept(), near));
-                tokio::spawn(async move {
-                    let mut far = far;
-                    let mut first = [0; 16];
-                    far.read_exact(&mut first).await.unwrap();
-                    drop(far);
-                });
-            }
-            // Opens, then hangs up at once: an open that only needs to succeed.
-            "accept" => drop(request.accept()),
-            "refuse" => request.reject(OpenErrKind::Refused, "connection refused"),
-            other => panic!("unexpected host {other}"),
-        }
-    }
 }
 
 /// Opens `host` through `mux` and returns the test's end of the client-side socket.
@@ -360,57 +274,6 @@ async fn a_dead_connection_fails_opens_and_live_streams() {
     timeout(Duration::from_secs(10), driver).await.expect("the driver notices the hangup").unwrap().ok();
     assert!(client.open("echo", 7).await.is_err(), "opens fail once the connection is gone");
     assert!(pumped.await.unwrap().is_err(), "live streams fail once the connection is gone");
-}
-
-/// Reads frames from a hand-driven peer until one matches.
-async fn next_frame(r: &mut (impl tokio::io::AsyncRead + Unpin), buf: &mut BytesMut) -> Frame {
-    loop {
-        if let Some(frame) = Frame::decode(buf).unwrap() {
-            return frame;
-        }
-        assert!(r.read_buf(buf).await.unwrap() > 0, "peer hung up");
-    }
-}
-
-/// The far end of a client mux, played by hand: the test reads its frames and writes the replies.
-struct HandPeer {
-    r: ReadHalf<DuplexStream>,
-    w: WriteHalf<DuplexStream>,
-    buf: BytesMut,
-}
-
-impl HandPeer {
-    /// The client's next frame. Under a paused clock, one that never comes fails at once.
-    async fn next(&mut self) -> Frame {
-        timeout(Duration::from_secs(10), next_frame(&mut self.r, &mut self.buf)).await.expect("the client sends a frame")
-    }
-
-    async fn send(&mut self, frame: Frame) {
-        let mut out = BytesMut::new();
-        frame.encode(&mut out).unwrap();
-        self.w.write_all(&out).await.unwrap();
-    }
-}
-
-/// A client mux whose peer the test plays by hand.
-fn client_with_hand_peer() -> (Mux, Incoming, HandPeer) {
-    let (a, b) = duplex(PIPE_CAP);
-    let (ar, aw) = split(a);
-    let (client, incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), hello(WINDOW));
-    tokio::spawn(driver);
-    let (r, w) = split(b);
-    (client, incoming, HandPeer { r, w, buf: BytesMut::new() })
-}
-
-/// Opens a stream that the hand peer accepts.
-async fn open_by_hand(client: &Mux, peer: &mut HandPeer) -> (Stream, StreamId) {
-    let opener = {
-        let client = client.clone();
-        tokio::spawn(async move { client.open("x", 7).await })
-    };
-    let Frame::Open { stream, .. } = peer.next().await else { panic!("expected Open") };
-    peer.send(Frame::OpenOk { stream }).await;
-    (opener.await.unwrap().unwrap(), stream)
 }
 
 /// How the hand peer kills a stream.
@@ -695,55 +558,11 @@ fn config_rejects_a_chunk_larger_than_half_the_window() {
 }
 
 #[tokio::test]
-async fn the_peers_capabilities_are_reported_and_new_opens_are_refused_for_now() {
-    let (a, b) = duplex(PIPE_CAP);
+async fn the_peers_capabilities_are_reported() {
+    let (a, _b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
     let capabilities = Capabilities { ping4: true, ping6: false };
     let peer = PeerHello { window: WINDOW, capabilities };
-    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), peer);
-    tokio::spawn(driver);
+    let (client, _incoming, _driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), peer);
     assert_eq!(client.capabilities(), capabilities);
-
-    // Play the relay by hand: its udp, echo and query opens get a refusal, until Task 3 serves them.
-    let (mut br, mut bw) = split(b);
-    let mut wire = BytesMut::new();
-    for frame in [
-        Frame::OpenUdp {
-            stream: StreamId(2),
-            host: "h".into(),
-            port: 53,
-        },
-        Frame::OpenEcho { stream: StreamId(4), host: "h".into() },
-        Frame::Query {
-            stream: StreamId(6),
-            transport: Transport::Udp,
-            message: Bytes::from_static(b"q"),
-        },
-    ] {
-        frame.encode(&mut wire).unwrap();
-    }
-    bw.write_all(&wire).await.unwrap();
-    let mut buf = BytesMut::new();
-    let mut replies = Vec::new();
-    while replies.len() < 3 {
-        if let Some(frame) = Frame::decode(&mut buf).unwrap() {
-            replies.push(frame);
-        } else {
-            assert!(timeout(Duration::from_secs(10), br.read_buf(&mut buf)).await.unwrap().unwrap() > 0);
-        }
-    }
-    let refused = |stream| Frame::OpenErr {
-        stream: StreamId(stream),
-        kind: OpenErrKind::Other,
-        reason: "not supported".into(),
-    };
-    assert_eq!(replies[0], refused(2));
-    assert_eq!(replies[1], refused(4));
-    assert_eq!(
-        replies[2],
-        Frame::QueryErr {
-            stream: StreamId(6),
-            reason: "not supported".into()
-        }
-    );
 }

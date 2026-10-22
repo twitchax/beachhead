@@ -6,12 +6,12 @@
 
 use std::{process::Stdio, time::Duration};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
     Config, Mux, Role,
     frame::Capabilities,
-    frame::ResolveErrKind,
+    frame::{ResolveErrKind, Transport},
     hello::{recv_hello, send_hello},
     pump, start,
 };
@@ -123,6 +123,15 @@ async fn e2e_stdio_answers_a_resolve() {
     timeout(Duration::from_secs(30), mux.resolve("localhost")).await.unwrap().unwrap();
     let err = timeout(Duration::from_secs(30), mux.resolve("nonexistent.invalid")).await.unwrap().unwrap_err();
     assert_eq!(err.kind, ResolveErrKind::NoSuchName, "{err}");
+}
+
+#[tokio::test]
+async fn e2e_stdio_refuses_flows_and_queries_it_does_not_serve_yet() {
+    let (mux, _child) = connect().await;
+    let err = timeout(Duration::from_secs(30), mux.open_udp("127.0.0.1", 9)).await.unwrap().unwrap_err();
+    assert_eq!(err.kind, sshunnel_mux::frame::OpenErrKind::Other, "{err}");
+    let err = timeout(Duration::from_secs(30), mux.query(Bytes::from_static(b"q"), Transport::Udp)).await.unwrap().unwrap_err();
+    assert_eq!(err.reason, "not answered");
 }
 
 #[tokio::test]
