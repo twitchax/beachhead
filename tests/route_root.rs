@@ -1,25 +1,34 @@
 //! `sshunnel route` as root on the host, through the machine's own systemd-resolved: what a test
 //! namespace can't show, since resolved serves the host's namespace alone. The remote is this
-//! machine with an `/etc/hosts` of its own (`FakeRemote::with_hosts`). `#[ignore]`d: CI runs them
+//! machine with an `/etc/hosts` of its own (`FakeRemote::with_hosts`), and for SRV a `/etc/resolv.conf`
+//! naming a stub nameserver the test runs (`FakeRemote::with_resolv_conf`). `#[ignore]`d: CI runs them
 //! under `sudo -E` (the workflow's route-root step), and without root they skip.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     process::Command as StdCommand,
     time::Duration,
 };
 
 use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, geteuid, kill_process};
+use simple_dns::{
+    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, TYPE,
+    rdata::{RData, SRV},
+};
 use sshunnel::{
     route::{FAKE_RANGE, FAKE_RANGE6, names::fake_v6},
     tests::{FakeRemote, Pinged, Watched, echo_server, pattern, ping, relay_dir, resolved_leftovers, round_trip, route_command, udp_echo_server},
 };
 use tempfile::TempDir;
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::{TcpListener, UdpSocket},
+    time::timeout,
+};
 
 /// How long `route` may take to bring its routes up, or to exit.
 const WITHIN: Duration = Duration::from_secs(30);
@@ -37,15 +46,83 @@ fn root() -> bool {
     false
 }
 
-/// `route` routing `*.corp.example` through a remote whose `/etc/hosts` has `wiki.corp.example`,
-/// once its routes are up.
-async fn route_names(dir: &TempDir) -> Watched {
-    let remote = FakeRemote::new(dir.path(), "sh", &[]).unwrap().with_hosts("127.0.0.1 wiki.corp.example\n").unwrap();
+/// `route` routing `*.corp.example` through `remote`, once its routes are up.
+async fn route_through(dir: &TempDir, remote: &FakeRemote) -> Watched {
     let relays = relay_dir(dir.path()).unwrap();
     let command = route_command(env!("CARGO_BIN_EXE_sshunnel"), dir.path(), remote.ssh_path(), &relays, &["*.corp.example"]);
     let mut route = Watched::spawn(command).unwrap();
     route.line("sshunnel: routing ", WITHIN).await.unwrap();
     route
+}
+
+/// `route` routing `*.corp.example` through a remote whose `/etc/hosts` has `wiki.corp.example`,
+/// once its routes are up.
+async fn route_names(dir: &TempDir) -> Watched {
+    let remote = FakeRemote::new(dir.path(), "sh", &[]).unwrap().with_hosts("127.0.0.1 wiki.corp.example\n").unwrap();
+    route_through(dir, &remote).await
+}
+
+/// The stub nameserver's address: a loopback address of its own, since 127.0.0.53 and .54 are
+/// systemd-resolved's. Binding port 53 is why these tests need root.
+const STUB: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 153)), 53);
+
+/// What the stub nameserver answers: SRV for `_ldap._tcp.corp.example` pointing at
+/// `ldap.corp.example`, and NXDOMAIN for anything else. `None` for what isn't a DNS query.
+fn stub_answer(query: &[u8]) -> Option<Vec<u8>> {
+    let query = Packet::parse(query).ok()?;
+    let question = query.questions.first()?;
+    let mut reply = Packet::new_reply(query.id());
+    reply.set_flags(PacketFlag::RECURSION_AVAILABLE);
+    reply.questions.clone_from(&query.questions);
+    if question.qtype == QTYPE::TYPE(TYPE::SRV) && question.qname.to_string().eq_ignore_ascii_case("_ldap._tcp.corp.example") {
+        let target = Name::new_unchecked("ldap.corp.example");
+        reply.answers.push(ResourceRecord::new(
+            question.qname.clone(),
+            CLASS::IN,
+            60,
+            RData::SRV(SRV {
+                priority: 0,
+                weight: 0,
+                port: 389,
+                target,
+            }),
+        ));
+    } else {
+        *reply.rcode_mut() = RCODE::NameError;
+    }
+    reply.build_bytes_vec().ok()
+}
+
+/// The stub nameserver, over UDP and TCP, until the test ends (the runtime drops its tasks).
+async fn stub_nameserver() {
+    let udp = UdpSocket::bind(STUB).await.expect("binding the stub nameserver's UDP port needs root");
+    let tcp = TcpListener::bind(STUB).await.expect("binding the stub nameserver's TCP port needs root");
+    tokio::spawn(async move {
+        let mut buf = [0; 1500];
+        while let Ok((n, from)) = udp.recv_from(&mut buf).await {
+            if let Some(answer) = stub_answer(&buf[..n]) {
+                let _ = udp.send_to(&answer, from).await;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = tcp.accept().await {
+            tokio::spawn(async move {
+                // RFC 7766 framing: a two-byte length before each message.
+                while let Ok(len) = conn.read_u16().await {
+                    let mut query = vec![0; usize::from(len)];
+                    if conn.read_exact(&mut query).await.is_err() {
+                        return;
+                    }
+                    let Some(answer) = stub_answer(&query) else { return };
+                    let framed = [&u16::try_from(answer.len()).unwrap().to_be_bytes()[..], &answer].concat();
+                    if conn.write_all(&framed).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// SIGTERM, then a clean exit.
@@ -225,6 +302,15 @@ async fn e2e_resolved_routes_only_the_patterns() {
 
     let fake = getent("ahostsv4", "wiki.corp.example").expect("wiki.corp.example resolves");
     assert!(fake.iter().all(is_fake), "{fake:?}");
+    // The link routes the fake ranges' reverse zones too, so a PTR for a fake reaches the client.
+    let link = resolved_leftovers().unwrap().join("\n");
+    let mut zones = vec!["~18.198.in-addr.arpa", "~19.198.in-addr.arpa"];
+    if ipv6_on() {
+        zones.push("~0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.0.0.1.0.0.2.ip6.arpa");
+    }
+    for zone in zones {
+        assert!(link.contains(zone), "{zone} missing from the link: {link}");
+    }
     // Every other name goes where it went before.
     assert_eq!(getent("ahosts", "localhost"), localhost);
     let now = getent("ahostsv4", "example.com");
@@ -232,6 +318,49 @@ async fn e2e_resolved_routes_only_the_patterns() {
     assert!(now.unwrap_or_default().iter().all(|addr| !is_fake(addr)));
     stop(route).await;
 
-    // The link's resolver config went with the device.
+    // The link's resolver config went with the device, reverse zones included.
     assert_eq!(resolved_leftovers().unwrap(), Vec::<String>::new());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and the host's systemd-resolved; CI runs it under sudo"]
+async fn e2e_resolved_answers_srv_from_the_remote() {
+    if !root() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    stub_nameserver().await;
+    // The relay asks the nameservers in its own resolv.conf, which is the stub.
+    let remote = FakeRemote::new(dir.path(), "sh", &[])
+        .unwrap()
+        .with_hosts("127.0.0.1 wiki.corp.example\n")
+        .unwrap()
+        .with_resolv_conf(&format!("nameserver {}\n", STUB.ip()))
+        .unwrap();
+    let route = route_through(&dir, &remote).await;
+
+    let out = StdCommand::new("resolvectl").args(["query", "--legend=no", "-t", "SRV", "_ldap._tcp.corp.example"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}; stdout:\n{stdout}\nstderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("ldap.corp.example"), "{stdout}");
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and the host's systemd-resolved; CI runs it under sudo"]
+async fn e2e_resolved_answers_ptr_for_a_fake() {
+    if !root() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let route = route_names(&dir).await;
+
+    let fake = getent("ahostsv4", "wiki.corp.example").expect("wiki.corp.example resolves");
+    assert!(fake.len() == 1 && is_fake(&fake[0]), "{fake:?}");
+    // The reverse zone is routed to the link, and the client answers from the name it handed out.
+    let out = StdCommand::new("getent").args(["hosts", &fake[0].to_string()]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}; stdout:\n{stdout}", out.status);
+    assert!(stdout.split_whitespace().any(|word| word == "wiki.corp.example"), "{stdout}");
+    stop(route).await;
 }

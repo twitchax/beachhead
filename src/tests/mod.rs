@@ -54,7 +54,8 @@ pub use tunnel::{FakeConn, FakeFlow, FakeTunnel, Gate, NoFlow};
 /// the remote command here, through a chosen login shell, with `HOME` and every cache candidate
 /// except `/dev/shm` inside `root`. That covers push, exec and cache with no sshd. The builders give
 /// the remote side namespaces of its own: a network ([`Self::in_netns`]) or an `/etc/hosts`
-/// ([`Self::with_hosts`]). Not `Clone`: each builder rewrites the one fake `ssh` in `root`.
+/// ([`Self::with_hosts`]) or `/etc/resolv.conf` ([`Self::with_resolv_conf`]). Not `Clone`: each
+/// builder rewrites the one fake `ssh` in `root`.
 #[derive(Debug)]
 pub struct FakeRemote {
     root: PathBuf,
@@ -124,6 +125,26 @@ impl FakeRemote {
             quote(r#"mount --bind "$1" /etc/hosts && mount --bind "$2" /etc/nsswitch.conf && shift 2 && exec "$@""#)?,
             quote(&hosts_file.to_string_lossy())?,
             quote(&nsswitch.to_string_lossy())?,
+        ));
+        self.write()?;
+        Ok(self)
+    }
+
+    /// Runs the remote side with `resolv_conf` as its `/etc/resolv.conf`, bind-mounted the way
+    /// [`Self::with_hosts`] mounts `/etc/hosts`, in a wrapper of its own so the two compose. The
+    /// mount follows a symlink at that path (systemd-resolved's stub file, usually), which is what
+    /// the relay reads.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file can't be written or a path would break the script's quoting.
+    pub fn with_resolv_conf(mut self, resolv_conf: &str) -> Res<Self> {
+        let file = self.root.join("resolv.conf");
+        std::fs::write(&file, resolv_conf).context("writing the remote's resolv.conf")?;
+        self.wrapper.push(format!(
+            "unshare -rm sh -c {} sh {}",
+            quote(r#"mount --bind "$1" /etc/resolv.conf && shift && exec "$@""#)?,
+            quote(&file.to_string_lossy())?,
         ));
         self.write()?;
         Ok(self)
@@ -741,6 +762,18 @@ mod unit {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn remote_resolv_conf_composes_with_hosts() -> Void {
+        let dir = tempfile::tempdir()?;
+        let remote = FakeRemote::new(dir.path(), "sh", &[])?.with_hosts("127.0.0.1 a\n")?.with_resolv_conf("nameserver 127.0.0.153\n")?;
+        assert_eq!(std::fs::read_to_string(dir.path().join("resolv.conf"))?, "nameserver 127.0.0.153\n");
+        let script = std::fs::read_to_string(remote.ssh_path())?;
+        // Two wrappers, one inside the other, ahead of the login shell.
+        assert_eq!(script.matches("unshare -rm").count(), 2, "{script}");
+        assert!(script.contains("/etc/hosts") && script.contains("/etc/resolv.conf"), "{script}");
+        Ok(())
+    }
 
     #[test]
     fn resolved_leftovers_are_the_devices_link() {
