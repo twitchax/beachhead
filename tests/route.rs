@@ -8,7 +8,7 @@
 
 use std::{
     io,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::{
         fd::{AsRawFd as _, OwnedFd},
         unix::fs::PermissionsExt as _,
@@ -22,7 +22,7 @@ use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use sshunnel::{
     route::{helper::Setup, peers::process_tree, system::same_netns_as_init},
-    tests::{self, FakeRemote, RemoteNs, Watched, echo_on, netns, pattern, relay_dir, round_trip, route_command, shim_dir, start_helper},
+    tests::{self, FakeRemote, RemoteNs, Watched, echo_on, netns, pattern, relay_dir, round_trip, route_command, shim_dir, start_helper, udp_echo_on},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -73,6 +73,13 @@ impl World {
     /// An echo server on the remote, at `addr`; returns its address.
     fn echo(&self, addr: SocketAddr) -> SocketAddr {
         echo_on(self.listen(addr)).unwrap()
+    }
+
+    /// A UDP echo server on the remote, at `addr`; returns its address.
+    fn udp_echo(&self, addr: SocketAddr) -> SocketAddr {
+        let socket = self.ns.udp(addr).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        udp_echo_on(UdpSocket::from_std(socket).unwrap()).unwrap()
     }
 
     /// An ssh that, as the real one does, holds its own TCP connection to `peer` for the session
@@ -201,6 +208,51 @@ async fn e2e_route_a_closed_port_is_refused() {
     // Nothing listens there on the remote: the relay's dial is refused, and so is the app's connect.
     let connect = timeout(WITHIN, TcpStream::connect((RemoteNs::HOST, 9))).await.expect("the connect ends");
     let refused = connect.expect_err("connected to a closed port");
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused, "{refused}");
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_udp_cidr_round_trips_v4_and_v6() {
+    if !netns("e2e_route_udp_cidr_round_trips_v4_and_v6").unwrap() {
+        return;
+    }
+    let world = World::new();
+    let v4 = world.udp_echo(SocketAddr::new(RemoteNs::HOST.into(), 0));
+    let v6 = world.udp_echo(SocketAddr::new(RemoteNs::HOST6.into(), 0));
+    let route = world.start(&["10.99.0.0/16", "fd99::/64"]).await;
+
+    for (seed, echo) in [(1, v4), (2, v6)] {
+        let any: IpAddr = if echo.is_ipv4() { Ipv4Addr::UNSPECIFIED.into() } else { Ipv6Addr::UNSPECIFIED.into() };
+        let app = UdpSocket::bind((any, 0)).await.unwrap();
+        app.connect(echo).await.unwrap();
+        let mut back = vec![0; 2048];
+        // 1 to 1 400 bytes, one at a time: each waits for its echo, so none is lost to a full queue.
+        for i in 0..20 {
+            let data = pattern(seed * 100 + i, usize::try_from(1 + i * 1399 / 19).unwrap());
+            app.send(&data).await.unwrap();
+            let n = timeout(WITHIN, app.recv(&mut back)).await.expect("the echo comes back").unwrap();
+            assert!(back[..n] == data[..], "{echo}: datagram {i} came back as {n} bytes, or differs");
+        }
+    }
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_udp_cidr_closed_port_is_refused() {
+    if !netns("e2e_route_udp_cidr_closed_port_is_refused").unwrap() {
+        return;
+    }
+    let world = World::new();
+    let route = world.start(&["10.99.0.0/16"]).await;
+
+    // Nothing listens there on the remote: its port unreachable reaches the relay's socket, and the
+    // app's socket hears it as it would from a real network.
+    let app = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    app.connect((RemoteNs::HOST, 9)).await.unwrap();
+    app.send(b"anyone there?").await.unwrap();
+    let recv = timeout(WITHIN, app.recv(&mut [0; 64])).await.expect("the recv ends");
+    let refused = recv.expect_err("a closed port answered");
     assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused, "{refused}");
     stop(route).await;
 }
@@ -510,27 +562,29 @@ async fn e2e_route_pins_an_upstream_dns_server() {
         return;
     }
     let world = World::new();
-    // The machine's DNS server is on the remote's network, inside the target.
+    // The machine's DNS server is on the remote's network, inside the target. It answers with the
+    // address each query came from.
     let server = world.ns.udp(SocketAddr::new(RemoteNs::PEER.into(), 53)).unwrap();
     server.set_nonblocking(true).unwrap();
     let server = UdpSocket::from_std(server).unwrap();
     tokio::spawn(async move {
         let mut query = [0; 512];
-        while let Ok((n, from)) = server.recv_from(&mut query).await {
-            let _ = server.send_to(&query[..n], from).await;
+        while let Ok((_, from)) = server.recv_from(&mut query).await {
+            let _ = server.send_to(from.ip().to_string().as_bytes(), from).await;
         }
     });
     use_dns_server(world.dir.path(), RemoteNs::PEER);
     let route = world.start(&["10.98.0.0/16"]).await;
 
     assert_eq!(pins(), [PIN]);
-    // A query still reaches the server, where the device would answer administratively prohibited.
+    // A query goes around the device, over the veth: through the device and the relay, it would
+    // reach the server from the remote's own side.
     let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     client.connect((RemoteNs::PEER, 53)).await.unwrap();
     client.send(b"a query").await.unwrap();
-    let mut answer = [0; 16];
+    let mut answer = [0; 64];
     let n = timeout(WITHIN, client.recv(&mut answer)).await.expect("the DNS server answers").unwrap();
-    assert_eq!(&answer[..n], b"a query");
+    assert_eq!(&answer[..n], RemoteNs::LINK_ADDR.to_string().as_bytes());
     stop(route).await;
 }
 

@@ -5,13 +5,15 @@
 //! the relay dials, so the app sees the remote's answer rather than ours: a dial that succeeds
 //! replays the SYN into a fresh listening socket, a refused one becomes an RST, an unreachable host
 //! ICMP host unreachable, and a timed-out one silence (the app's own timeout fires). UDP to the DNS
-//! address goes to [`Dns`]; other UDP and ICMP get ICMP administratively prohibited. smoltcp only
-//! ever sees TCP.
+//! address goes to [`Dns`], other routed UDP to its flow through the relay (`route::datagrams`),
+//! and unrouted UDP and ICMP get ICMP administratively prohibited. smoltcp only ever sees TCP.
 //!
-//! One task runs it all from one `poll_fn`: the device's packets, the dials and DNS answers in
-//! flight, smoltcp's timer, and every connection's end of the duplex pipe its relay stream pumps,
-//! so a pump's write wakes it. Back-pressure is per connection, as in the mux: a slow relay stream
-//! fills its pipe and then its socket's receive window, never the packet path.
+//! One task runs it all from one `poll_fn`: the device's packets, the dials, DNS answers and flow
+//! opens in flight, the flows' replies, smoltcp's timer and the flows' idle timer, and every
+//! connection's end of the duplex pipe its relay stream pumps, so a pump's write wakes it. Back-pressure is per
+//! connection, as in the mux: a slow relay stream fills its pipe and then its socket's receive
+//! window, never the packet path. Flows' replies are read only while the device keeps up, so a
+//! flood waits in its own flow's bounded queue, and drops there.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -44,7 +46,7 @@ use tracing::debug;
 
 use crate::{
     base::{Res, Void},
-    route::{DNS_ADDR, FAKE_RANGE, MTU, TUN_ADDR, TUN_ADDR6, router::Router},
+    route::{DNS_ADDR, FAKE_RANGE, MTU, TUN_ADDR, TUN_ADDR6, datagrams::Datagrams, router::Router},
     tunnel::{Conn as _, Tunnel},
 };
 
@@ -89,17 +91,19 @@ pub trait Dns: Send + Sync + 'static {
 /// # Errors
 ///
 /// Fails when the device stops taking packets while it still sends them, or a connection's task
-/// panics.
+/// or a flow's open panics.
 pub async fn run<T: Tunnel, D: Dns>(packets: Packets, tunnel: T, router: Arc<Router>, dns: Arc<D>) -> Void {
     // Owning the DNS address and answering for every other one (any-IP), the stack sends
     // everything back out through the device.
     let engine = Engine::new(&[IpCidr::new(DNS_ADDR.into(), FAKE_RANGE.prefix_len())], &[TUN_ADDR.into(), TUN_ADDR6.addr().into()], packets.tx)?;
+    let datagrams = Datagrams::new(tunnel.clone(), Arc::clone(&router));
     let mut stack = Stack {
         engine,
         rx: packets.rx,
         tunnel,
         router,
         dns,
+        datagrams,
         held: HashMap::new(),
         flows: HashMap::new(),
         handles: HashMap::new(),
@@ -140,6 +144,8 @@ struct Stack<T: Tunnel, D: Dns> {
     /// Answers to send: the asker and the answer.
     queries: JoinSet<Option<(SocketAddr, Bytes)>>,
     pumps: JoinSet<(Flow, Res<Traffic>)>,
+    /// Routed UDP's flows.
+    datagrams: Datagrams<T>,
 }
 
 impl<T: Tunnel, D: Dns> Stack<T, D> {
@@ -164,6 +170,8 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
             if let Err(e) = self.finish(cx) {
                 return Poll::Ready(Err(e));
             }
+            // Whether the flows' replies hold this task's waker, as `listening` is for `rx`.
+            let replying = self.replies(cx);
             self.engine.poll();
             let Self { engine, flows, handles, .. } = self;
             engine.run_bridges(cx, |handle| {
@@ -175,9 +183,11 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
             if let Err(e) = self.engine.flush(cx) {
                 return Poll::Ready(Err(e));
             }
+            self.datagrams.expire(cx);
+            let caught_up = listening && replying;
             // Still backlogged after a flush means the device is full, and its permit wakes us.
             // `|`, not `||`: the timer is armed either way.
-            let again = (!listening && !self.engine.backlogged()) | self.engine.wait(cx);
+            let again = (!caught_up && !self.engine.backlogged()) | self.engine.wait(cx);
             if !again {
                 return Poll::Pending;
             }
@@ -186,7 +196,8 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         Poll::Pending
     }
 
-    /// Sends a packet where it belongs: smoltcp, a held SYN, the DNS server, or an ICMP refusal.
+    /// Sends a packet where it belongs: smoltcp, a held SYN, the DNS server, a flow, or an ICMP
+    /// refusal.
     fn classify(&mut self, packet: Bytes) {
         let Some(ip) = Ip::parse(&packet) else { return };
         // Router solicitations, MLD reports and broadcasts (the device subnet's included) aren't
@@ -197,6 +208,7 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         match ip.proto {
             IpProtocol::Tcp => self.tcp(packet, &ip),
             IpProtocol::Udp if ip.dst == IpAddr::V4(DNS_ADDR) && UdpPacket::new_checked(ip.payload(&packet)).is_ok_and(|udp| udp.dst_port() == DNS_PORT) => self.query(&packet, &ip),
+            IpProtocol::Udp => self.engine.send_opt(self.datagrams.udp(packet, &ip)),
             // Never an ICMP error about an ICMP error (RFC 1122).
             IpProtocol::Icmp | IpProtocol::Icmpv6 if ip.payload(&packet).first().is_some_and(|kind| is_icmp_error(ip.proto, *kind)) => {}
             _ => self.engine.send_opt(icmp_error(&packet, &ip, Refusal::Prohibited)),
@@ -252,14 +264,14 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         }
         let Ok(udp) = UdpPacket::new_checked(ip.payload(packet)) else { return };
         let asker = SocketAddr::new(ip.src, udp.src_port());
-        let start = ip.start + UDP_HEADER_LEN;
-        let query = packet.slice(start..start + udp.payload().len());
+        let Some(query) = ip.udp_payload(packet) else { return };
         let dns = Arc::clone(&self.dns);
         self.queries.spawn(async move { dns.answer(query).await.map(|answer| (asker, answer)) });
     }
 
-    /// Acts on the dials, DNS answers and pumps that finished.
+    /// Acts on the dials, DNS answers, flow opens and pumps that finished.
     fn finish(&mut self, cx: &mut Context<'_>) -> Void {
+        self.datagrams.opened(cx, |packet| self.engine.send_opt(packet))?;
         while let Poll::Ready(Some(dialed)) = self.dials.poll_join_next(cx) {
             let (flow, opened) = dialed.context("a dial task failed")?;
             self.dialed(flow, opened);
@@ -317,21 +329,46 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         self.flows.insert(flow, handle);
         self.handles.insert(handle, flow);
     }
+
+    /// Writes the flows' replies while the device keeps up, so a flood waits in its flow's bounded
+    /// queue rather than the device's. True once none is waiting and the next will wake this task.
+    fn replies(&mut self, cx: &mut Context<'_>) -> bool {
+        for _ in 0..BATCH {
+            if self.engine.backlogged() {
+                return false;
+            }
+            match self.datagrams.poll_reply(cx) {
+                Poll::Ready(packet) => self.engine.send_opt(packet),
+                Poll::Pending => return true,
+            }
+        }
+        false
+    }
 }
 
 /// How the stack turns a packet away with ICMP.
 #[derive(Clone, Copy)]
-enum Refusal {
+pub(crate) enum Refusal {
+    /// Net unreachable, which Linux reports as `ENETUNREACH`.
+    NetUnreachable,
+    /// Host (for IPv6, address) unreachable: `EHOSTUNREACH`.
     Unreachable,
+    /// Port unreachable: `ECONNREFUSED`.
+    PortUnreachable,
+    /// Administratively prohibited.
     Prohibited,
 }
 
 impl Refusal {
-    /// The ICMP type and code for a packet of `family`. Linux reports each as `EHOSTUNREACH`.
+    /// The ICMP type and code for a packet of `family`.
     fn icmp(self, v4: bool) -> (u8, u8) {
         match (self, v4) {
+            (Self::NetUnreachable, true) => (3, 0),
+            (Self::NetUnreachable, false) => (1, 0),
             (Self::Unreachable, true) => (3, 1),
             (Self::Unreachable, false) => (1, 3),
+            (Self::PortUnreachable, true) => (3, 3),
+            (Self::PortUnreachable, false) => (1, 4),
             (Self::Prohibited, true) => (3, 13),
             (Self::Prohibited, false) => (1, 1),
         }
@@ -361,8 +398,10 @@ pub(crate) struct Ip {
     pub(crate) src: IpAddr,
     pub(crate) dst: IpAddr,
     pub(crate) proto: IpProtocol,
-    start: usize,
-    end: usize,
+    /// Where the payload starts: the IP header's length.
+    pub(crate) start: usize,
+    /// Where the payload ends: the length the IP header gives.
+    pub(crate) end: usize,
 }
 
 impl Ip {
@@ -400,10 +439,17 @@ impl Ip {
     pub(crate) fn payload<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
         packet.get(self.start..self.end).unwrap_or_default()
     }
+
+    /// The payload of the UDP datagram in `packet`, sharing its buffer.
+    pub(crate) fn udp_payload(&self, packet: &Bytes) -> Option<Bytes> {
+        let udp = UdpPacket::new_checked(self.payload(packet)).ok()?;
+        let start = self.start + UDP_HEADER_LEN;
+        Some(packet.slice(start..start + udp.payload().len()))
+    }
 }
 
 /// An ICMP error from `packet`'s destination back to its source, quoting as much of it as fits.
-fn icmp_error(packet: &[u8], ip: &Ip, refusal: Refusal) -> Option<Bytes> {
+pub(crate) fn icmp_error(packet: &[u8], ip: &Ip, refusal: Refusal) -> Option<Bytes> {
     let v4 = ip.src.is_ipv4();
     let (proto, max) = if v4 { (IpProtocol::Icmp, ICMP4_MAX) } else { (IpProtocol::Icmpv6, ICMP6_MAX) };
     let (from, to) = (IpAddress::from(ip.dst), IpAddress::from(ip.src));

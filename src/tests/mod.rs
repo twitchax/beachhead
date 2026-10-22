@@ -386,6 +386,39 @@ pub fn udp_echo_on(socket: UdpSocket) -> Res<SocketAddr> {
     Ok(addr)
 }
 
+/// A loopback UDP server that answers anything with `stale`, so a reply through it shows; returns
+/// its address.
+///
+/// # Errors
+///
+/// Fails when no loopback port can be bound.
+pub async fn udp_stale_server() -> Res<SocketAddr> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.context("binding the stale server")?;
+    let addr = socket.local_addr().context("reading the stale server's address")?;
+    tokio::spawn(async move {
+        let mut buf = [0; 64];
+        while let Ok((_, from)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(b"stale", from).await;
+        }
+    });
+    Ok(addr)
+}
+
+/// Yields until `done` holds, which lets the runtime poll its I/O without moving a paused clock.
+///
+/// # Errors
+///
+/// Fails when it still doesn't hold after 10 000 yields.
+pub async fn until(mut done: impl FnMut() -> bool) -> Void {
+    for _ in 0..10_000 {
+        if done() {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+    bail!("the condition never held")
+}
+
 /// A stand-in for the TUN device's fd that keeps packet boundaries, and the far end of it, as the
 /// kernel, on the current runtime.
 ///

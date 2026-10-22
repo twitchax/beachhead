@@ -59,6 +59,9 @@ pub trait Flow: Send + 'static {
     fn recv(&mut self) -> impl Future<Output = Option<FlowEvent>> + Send;
 }
 
+/// The sending half of a tunnel's flows.
+pub(crate) type SenderOf<T> = <<T as Tunnel>::Flow as Flow>::Sender;
+
 /// A flow's sending half.
 pub trait FlowSender: Clone + Send + Sync + 'static {
     /// Sends a datagram without waiting; `false` when it was dropped instead.

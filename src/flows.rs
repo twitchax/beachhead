@@ -1,4 +1,6 @@
-//! The table of datagram flows `forward`'s UDP and `route`'s UDP and echo share.
+//! The table of datagram flows `forward`'s UDP and `route`'s UDP and echo share, and the parts of
+//! their entries both keep: the hold a flow's first datagrams wait in while it opens, and the task
+//! that carries its replies.
 //!
 //! Plain data with no locks and no awaits, so the netstack's thread can use it without blocking.
 //! Time comes in as an argument, which is what lets the tests drive it on tokio's paused clock.
@@ -11,7 +13,9 @@ use std::{
     time::Duration,
 };
 
-use tokio::time::Instant;
+use bytes::Bytes;
+use sshunnel_mux::{FLOW_QUEUE, FLOW_QUEUE_BYTES};
+use tokio::{task::AbortHandle, time::Instant};
 
 /// The most flows one session holds; the next insert evicts the least recently used.
 pub const MAX_FLOWS: usize = 4096;
@@ -170,6 +174,39 @@ impl<K: Clone + Eq + Hash, V> FlowTable<K, V> {
     }
 }
 
+/// Datagrams waiting for their flow to open, bounded as a flow's own queue is.
+#[derive(Default)]
+pub(crate) struct Held {
+    datagrams: Vec<Bytes>,
+    bytes: usize,
+}
+
+impl Held {
+    /// Holds `datagram`, or drops it when the hold is full. An empty hold takes one of any size.
+    pub(crate) fn push(&mut self, datagram: Bytes) {
+        let over_bytes = !self.datagrams.is_empty() && self.bytes + datagram.len() > FLOW_QUEUE_BYTES;
+        if self.datagrams.len() < FLOW_QUEUE && !over_bytes {
+            self.bytes += datagram.len();
+            self.datagrams.push(datagram);
+        }
+    }
+
+    /// Empties the hold, oldest first.
+    pub(crate) fn take(&mut self) -> Vec<Bytes> {
+        self.bytes = 0;
+        std::mem::take(&mut self.datagrams)
+    }
+}
+
+/// A flow's reply task, aborted when its entry goes: that drops the flow, which resets it.
+pub(crate) struct ReplyTask(pub(crate) AbortHandle);
+
+impl Drop for ReplyTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +305,28 @@ mod tests {
         assert_eq!(table.get_mut(&"a"), Some(&mut 2));
         // The replacement starts over: no replies yet, so it idles out at 30 s.
         assert_eq!(table.deadline(), Some(t + secs(1.0) + IDLE));
+    }
+
+    #[test]
+    fn a_hold_keeps_flow_queue_datagrams_within_its_bytes() {
+        let mut held = Held::default();
+        for _ in 0..=FLOW_QUEUE {
+            held.push(Bytes::from_static(b"x"));
+        }
+        assert_eq!(held.take().len(), FLOW_QUEUE);
+
+        // An empty hold takes one of any size, then nothing past the byte bound.
+        held.push(Bytes::from(vec![0; FLOW_QUEUE_BYTES + 1]));
+        held.push(Bytes::from_static(b"x"));
+        assert_eq!(held.take().iter().map(Bytes::len).collect::<Vec<_>>(), [FLOW_QUEUE_BYTES + 1]);
+        held.push(Bytes::from(vec![0; FLOW_QUEUE_BYTES]));
+        held.push(Bytes::from_static(b"x"));
+        assert_eq!(held.take().len(), 1);
+
+        // Taking empties it, bytes included.
+        held.push(Bytes::from(vec![0; FLOW_QUEUE_BYTES / 2]));
+        held.push(Bytes::from(vec![0; FLOW_QUEUE_BYTES / 2]));
+        assert_eq!(held.take().len(), 2);
     }
 
     #[tokio::test(start_paused = true)]

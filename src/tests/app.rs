@@ -15,7 +15,7 @@ use smoltcp::{
     iface::SocketHandle,
     phy::ChecksumCapabilities,
     socket::tcp::State,
-    wire::{Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpCidr, IpProtocol, IpRepr, TcpPacket, UdpPacket},
+    wire::{IPV4_HEADER_LEN, IPV6_HEADER_LEN, Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpCidr, IpProtocol, IpRepr, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket},
 };
 use tokio::{
     io::{DuplexStream, duplex},
@@ -130,14 +130,26 @@ pub struct Icmp {
     pub about: Option<(SocketAddr, SocketAddr, IpProtocol)>,
 }
 
-/// The addressing of a packet an ICMP error quotes.
+/// The addressing of a packet an ICMP error quotes. A quote may stop 8 bytes past the IP header
+/// (RFC 792), short of the length that header claims, so only the headers are read, as a kernel
+/// reads them.
 fn about(quoted: &[u8]) -> Option<(SocketAddr, SocketAddr, IpProtocol)> {
-    let ip = Ip::parse(quoted)?;
-    let ports = match (ip.proto, ip.payload(quoted)) {
+    let (src, dst, proto, rest): (IpAddr, IpAddr, IpProtocol, &[u8]) = match quoted.first()? >> 4 {
+        4 if quoted.len() >= IPV4_HEADER_LEN => {
+            let ip = Ipv4Packet::new_unchecked(quoted);
+            (ip.src_addr().into(), ip.dst_addr().into(), ip.next_header(), quoted.get(usize::from(ip.header_len())..)?)
+        }
+        6 if quoted.len() >= IPV6_HEADER_LEN => {
+            let ip = Ipv6Packet::new_unchecked(quoted);
+            (ip.src_addr().into(), ip.dst_addr().into(), ip.next_header(), quoted.get(IPV6_HEADER_LEN..)?)
+        }
+        _ => return None,
+    };
+    let ports = match (proto, rest) {
         (IpProtocol::Tcp | IpProtocol::Udp, [a, b, c, d, ..]) => (u16::from_be_bytes([*a, *b]), u16::from_be_bytes([*c, *d])),
         _ => (0, 0),
     };
-    Some((SocketAddr::new(ip.src, ports.0), SocketAddr::new(ip.dst, ports.1), ip.proto))
+    Some((SocketAddr::new(src, ports.0), SocketAddr::new(dst, ports.1), proto))
 }
 
 /// The app's side of a stack under test. Dropping it stops its task, which closes the pipe and
@@ -237,9 +249,16 @@ impl AppStack {
 
     /// Sends one UDP datagram to `to` and returns the payload of the datagram that answers it.
     pub async fn exchange(&self, to: SocketAddr, payload: &[u8]) -> Option<Bytes> {
-        let from = SocketAddr::new(local(to.ip()), self.port());
+        self.exchange_from(self.port(), to, payload).await
+    }
+
+    /// Sends one UDP datagram to `to` from local port `from_port`, as an app reusing its socket
+    /// would, and returns the payload of the first datagram from `to` to that port after it.
+    pub async fn exchange_from(&self, from_port: u16, to: SocketAddr, payload: &[u8]) -> Option<Bytes> {
+        let from = SocketAddr::new(local(to.ip()), from_port);
+        let before = self.tap.borrow().len();
         self.send(udp_packet(from, to, payload)?).await?;
-        self.find(|sent| match sent {
+        self.find_after(before, |sent| match sent {
             Sent::Udp { from: answerer, to: asker, payload } if *answerer == to && *asker == from => Some(payload.clone()),
             _ => None,
         })
@@ -264,9 +283,14 @@ impl AppStack {
 
     /// The first thing `pick` finds on the tap, waiting up to five seconds for it.
     pub async fn find<T>(&self, pick: impl Fn(&Sent) -> Option<T>) -> Option<T> {
+        self.find_after(0, pick).await
+    }
+
+    /// [`Self::find`], past the first `skip` packets on the tap.
+    async fn find_after<T>(&self, skip: usize, pick: impl Fn(&Sent) -> Option<T>) -> Option<T> {
         let mut tap = self.tap.clone();
-        let seen = timeout(PROBE_TIMEOUT, tap.wait_for(|seen| seen.iter().any(|sent| pick(sent).is_some()))).await.ok()?.ok()?;
-        seen.iter().find_map(&pick)
+        let seen = timeout(PROBE_TIMEOUT, tap.wait_for(|seen| seen.iter().skip(skip).any(|sent| pick(sent).is_some()))).await.ok()?.ok()?;
+        seen.iter().skip(skip).find_map(&pick)
     }
 }
 

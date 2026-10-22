@@ -24,9 +24,9 @@ use sshunnel::{
         stack::{self, Dns, MAX_HELD, MAX_QUERIES, Packets},
         targets::Targets,
     },
-    tests::{AppStack, Connect, FakeTunnel, Icmp, Sent, echo_server, pattern},
+    tests::{AppStack, Connect, FakeTunnel, Icmp, Sent, echo_server, pattern, udp_echo_server, udp_stale_server, until},
 };
-use sshunnel_mux::frame::OpenErrKind;
+use sshunnel_mux::{FlowKind, frame::OpenErrKind};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -287,15 +287,192 @@ async fn tcp_that_is_not_routed_is_reset() {
     assert_eq!(rig.tunnel.opens(), []);
 }
 
+fn udp_flow(host: &str, port: u16) -> (FlowKind, String, u16) {
+    (FlowKind::Udp, host.to_owned(), port)
+}
+
+/// The payloads of the datagrams the stack has sent the app's `port`, in order.
+fn udp_to(app: &AppStack, port: u16) -> Vec<Bytes> {
+    let to_port = |sent: Sent| match sent {
+        Sent::Udp { to, payload, .. } if to.port() == port => Some(payload),
+        _ => None,
+    };
+    app.tap().into_iter().filter_map(to_port).collect()
+}
+
+/// The ICMP error (type and code) the stack answers one datagram to `to` with.
+async fn udp_refusal(app: &AppStack, to: SocketAddr) -> Option<(u8, u8)> {
+    app.udp(to, b"hello").await.map(|i: Icmp| (i.kind, i.code))
+}
+
 #[tokio::test]
-async fn udp_to_a_routed_address_is_admin_prohibited() {
+async fn udp_to_a_routed_address_round_trips_through_a_flow() {
     let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
+    let echo = udp_echo_server().await.unwrap();
+    rig.tunnel.udp("10.99.0.5", 9999, echo);
+    rig.tunnel.udp("fd99::5", 9999, echo);
 
-    let v4 = rig.app.udp(at("10.99.0.5", 9999), b"hello").await.map(|i: Icmp| (i.kind, i.code));
-    let v6 = rig.app.udp(at("fd99::5", 9999), b"hello").await.map(|i: Icmp| (i.kind, i.code));
+    let v4 = rig.app.exchange(at("10.99.0.5", 9999), b"hello over v4").await;
+    let v6 = rig.app.exchange(at("fd99::5", 9999), b"hello over v6").await;
 
-    assert_eq!(v4, Some((3, 13)));
-    assert_eq!(v6, Some((1, 1)));
+    assert_eq!(v4.as_deref(), Some(&b"hello over v4"[..]));
+    assert_eq!(v6.as_deref(), Some(&b"hello over v6"[..]));
+    assert_eq!(rig.tunnel.flows(), [udp_flow("10.99.0.5", 9999), udp_flow("fd99::5", 9999)]);
+}
+
+#[tokio::test]
+async fn udp_to_an_unrouted_address_is_admin_prohibited() {
+    let rig = rig(&["10.99.0.0/16"]);
+
+    assert_eq!(udp_refusal(&rig.app, at("192.0.2.1", 9999)).await, Some((3, 13)));
+    assert_eq!(rig.tunnel.flows(), []);
+}
+
+#[tokio::test]
+async fn udp_to_a_fake_address_opens_a_flow_by_name() {
+    let rig = rig(&["*.corp.example"]);
+    rig.tunnel.udp("wiki.corp.example", 5353, udp_echo_server().await.unwrap());
+    let fake = rig.router.names().address("wiki.corp.example", today());
+
+    let answer = rig.app.exchange(SocketAddr::new(fake.into(), 5353), b"by name").await;
+
+    assert_eq!(answer.as_deref(), Some(&b"by name"[..]));
+    assert_eq!(rig.tunnel.flows(), [udp_flow("wiki.corp.example", 5353)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_before_the_open_is_held_and_sent_after() {
+    let rig = rig(&["10.99.0.0/16"]);
+    let gate = rig.tunnel.udp_gate("10.99.0.5", 9999, udp_echo_server().await.unwrap());
+    let to = at("10.99.0.5", 9999);
+
+    let app = Arc::new(rig.app);
+    let exchanges: Vec<_> = ["one", "two", "three"]
+        .into_iter()
+        .map(|payload| {
+            let app = Arc::clone(&app);
+            tokio::spawn(async move { app.exchange_from(41_000, to, payload.as_bytes()).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // One open for all three, and nothing back while it runs.
+    assert_eq!(rig.tunnel.flows(), [udp_flow("10.99.0.5", 9999)]);
+    assert_eq!(udp_to(&app, 41_000), Vec::<Bytes>::new());
+
+    gate.open();
+    for exchange in exchanges {
+        assert!(exchange.await.unwrap().is_some());
+    }
+    assert_eq!(udp_to(&app, 41_000), ["one", "two", "three"]);
+}
+
+#[tokio::test]
+async fn a_refused_udp_open_is_port_unreachable() {
+    let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
+    rig.tunnel.udp_reject("10.99.0.5", 9999, OpenErrKind::Refused);
+    rig.tunnel.udp_reject("fd99::5", 9999, OpenErrKind::Refused);
+
+    // Port unreachable in each family, which a connected socket reads as ECONNREFUSED; an open
+    // that fails any other way (here, one nothing is scripted for) reads the same.
+    assert_eq!(udp_refusal(&rig.app, at("10.99.0.5", 9999)).await, Some((3, 3)));
+    assert_eq!(udp_refusal(&rig.app, at("fd99::5", 9999)).await, Some((1, 4)));
+    assert_eq!(udp_refusal(&rig.app, at("10.99.0.6", 9999)).await, Some((3, 3)));
+}
+
+#[tokio::test]
+async fn an_unreachable_udp_open_is_host_unreachable() {
+    let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
+    rig.tunnel.udp_reject("10.99.0.5", 9999, OpenErrKind::Unreachable);
+    rig.tunnel.udp_reject("fd99::5", 9999, OpenErrKind::Unreachable);
+
+    assert_eq!(udp_refusal(&rig.app, at("10.99.0.5", 9999)).await, Some((3, 1)));
+    assert_eq!(udp_refusal(&rig.app, at("fd99::5", 9999)).await, Some((1, 3)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_udp_open_is_silent() {
+    let rig = rig(&["10.99.0.0/16"]);
+    rig.tunnel.udp_reject("10.99.0.5", 9999, OpenErrKind::TimedOut);
+
+    assert_eq!(udp_refusal(&rig.app, at("10.99.0.5", 9999)).await, None);
+    assert_eq!(rig.tunnel.flows(), [udp_flow("10.99.0.5", 9999)]);
+    assert_eq!(rig.app.tap(), []);
+}
+
+#[tokio::test]
+async fn a_udp_flow_error_is_icmp_quoting_the_last_datagram() {
+    let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
+    // Nothing listens there, so the flow's socket hears port unreachable, as the relay's would.
+    let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    rig.tunnel.udp("10.99.0.5", 9999, closed);
+    rig.tunnel.udp("fd99::5", 9999, closed);
+
+    for (to, unreachable) in [(at("10.99.0.5", 9999), (3, 3)), (at("fd99::5", 9999), (1, 4))] {
+        let icmp = rig.app.udp(to, b"anyone there?").await.expect("an ICMP error");
+        assert_eq!((icmp.kind, icmp.code), unreachable, "{to}");
+        let (app, remote, proto) = icmp.about.unwrap();
+        assert_eq!((app.ip().is_ipv4(), remote, proto), (to.is_ipv4(), to, IpProtocol::Udp));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_udp_flow_idles_out_and_resets_its_relay_flow() {
+    let rig = rig(&["10.99.0.0/16"]);
+    // Bound and never read, so nothing answers and nothing refuses.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    rig.tunnel.udp("10.99.0.5", 9999, silent.local_addr().unwrap());
+
+    rig.app.send(datagram(41_000)).await.unwrap();
+    until(|| rig.tunnel.live_flows() == 1).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(29)).await;
+    assert_eq!(rig.tunnel.live_flows(), 1);
+
+    // Past 30 s with no reply: the flow goes, and dropping it resets the relay's end.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    until(|| rig.tunnel.live_flows() == 0).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_udp_flow_the_relay_ends_opens_afresh() {
+    let rig = rig(&["10.99.0.0/16"]);
+    rig.tunnel.udp_hangup("10.99.0.5", 9999);
+
+    rig.app.send(datagram(41_000)).await.unwrap();
+    until(|| rig.tunnel.flows().len() == 1 && rig.tunnel.live_flows() == 0).await.unwrap();
+    // Its entry went with it, so the app's next datagram opens a fresh flow rather than feeding the
+    // dead one.
+    rig.app.send(datagram(41_000)).await.unwrap();
+    until(|| rig.tunnel.flows().len() == 2).await.unwrap();
+}
+
+/// Review Focus 1: an open that finishes after its flow idled out, with the same app socket's next
+/// flow still opening, must not take that flow's place.
+#[tokio::test(start_paused = true)]
+async fn udp_an_open_finishing_after_its_flow_idled_out_is_dropped() {
+    let rig = rig(&["10.99.0.0/16"]);
+    let to = at("10.99.0.5", 9999);
+    let first = rig.tunnel.udp_gate("10.99.0.5", 9999, udp_stale_server().await.unwrap());
+
+    rig.app.send(datagram(41_000)).await.unwrap();
+    until(|| rig.tunnel.flows().len() == 1).await.unwrap();
+    // Its entry idles out while the open is still waiting.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+
+    let second = rig.tunnel.udp_gate("10.99.0.5", 9999, udp_echo_server().await.unwrap());
+    let app = Arc::new(rig.app);
+    let exchange = tokio::spawn({
+        let app = Arc::clone(&app);
+        async move { app.exchange_from(41_000, to, b"two").await }
+    });
+    until(|| rig.tunnel.flows().len() == 2).await.unwrap();
+    first.open();
+    // The first open finishes, and the stack takes it, before the second does.
+    tokio::task::yield_now().await;
+    second.open();
+
+    assert_eq!(exchange.await.unwrap().as_deref(), Some(&b"two"[..]));
+    assert_eq!(app.exchange_from(41_000, to, b"three").await.as_deref(), Some(&b"three"[..]));
+    assert_eq!(rig.tunnel.live_flows(), 1);
 }
 
 #[tokio::test]
@@ -391,7 +568,8 @@ async fn a_port_reused_during_time_wait_connects_at_once() {
 #[tokio::test(start_paused = true)]
 async fn the_stack_reads_on_after_a_device_backlog() {
     const N: u16 = 200;
-    let (router, _state) = router(&["10.99.0.0/16"]);
+    // Nothing routes the datagrams' destination, so the stack answers each as it reads it.
+    let (router, _state) = router(&["fd99::/64"]);
     // A device that takes fewer packets at a time than the stack queues for it, in bursts.
     let (to_stack, rx) = mpsc::channel(1024);
     let (tx, mut from_stack) = mpsc::channel(64);

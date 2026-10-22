@@ -23,15 +23,16 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   local sender. Its listeners never wait (a full queue drops), and each entry's generation keeps an
   open that finishes late from taking a newer flow's place.
 - `src/flows.rs`: the flow table `forward`'s UDP and `route`'s UDP and echo share (conntrack's
-  timeouts, a 4096 cap, LRU eviction). Plain data: no locks, no awaits.
+  timeouts, a 4096 cap, LRU eviction), and the hold and reply task their entries both keep. Plain
+  data: no locks, no awaits.
 - `src/route/`: `sshunnel route` (Linux), designed in `.prds/PRD-0004.md`. `targets` (parsing,
   matching, refusals), `names` (the fake-address map), `router` (the per-connection decision,
-  sharing the map), `stack` (the smoltcp netstack) with `dns` on it, `device` (the TUN fd as the
-  stack's packets), `peers` and `system` (what the machine depends on, and the commands and
-  syscalls behind it), `helper` (the root side, run as the hidden `sshunnel helper` through sudo),
-  `thread` (the netstack's own thread: `device`, `stack` and `dns` on a runtime of their own), and
-  `lifecycle`, which runs them in the spec's order and, on every exit path, joins the netstack's
-  thread and then stops the helper.
+  sharing the map), `stack` (the smoltcp netstack) with `dns` and `datagrams` (routed UDP's flows)
+  on it, `device` (the TUN fd as the stack's packets), `peers` and `system` (what the machine
+  depends on, and the commands and syscalls behind it), `helper` (the root side, run as the hidden
+  `sshunnel helper` through sudo), `thread` (the netstack's own thread: `device`, `stack` and `dns`
+  on a runtime of their own), and `lifecycle`, which runs them in the spec's order and, on every
+  exit path, joins the netstack's thread and then stops the helper.
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.
 - `crates/sshunnel-relay`: the remote binary, pushed over SSH as a static musl build. Every
@@ -41,14 +42,16 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
 The mux invariant to protect: **the frame reader never blocks**. It hands frames to per-stream
 channels bounded by credit, so the ssh pipe always drains. Datagrams don't take credit: the reader
 drops one whose flow's queue is full, and the writer alternates datagrams, round-robin over the
-flows, with stream data after control. `route::stack` (the TUN netstack) keeps
-the same shape: **its packet loop never waits on one connection**. Each smoltcp socket bridges to
-its relay stream through a bounded pipe, so a slow stream closes only that socket's window. The
-packet loop, its connections' tasks, the device's reader and writer and the DNS server share one
-current-thread runtime on a thread of their own (`route::thread`, named `sshunnel-stack`), so the
-netstack's own hops stay on one thread. The mux and everything else stay on the main runtime, and
-each segment still crosses to the mux there and back, through tokio's channels. **Nothing on that
-thread may block**: a blocking call there stalls every connection.
+flows, with stream data after control. `route::stack` (the TUN netstack) keeps the same shape:
+**its packet loop never waits on one connection**. Each smoltcp socket bridges to its relay stream
+through a bounded pipe, so a slow stream closes only that socket's window, and routed UDP becomes
+flows through the flow table: datagrams go out with `try_send`, and replies come back through one
+bounded channel the loop reads only while the device keeps up, so a flood drops at its own flow's
+queue. The packet loop, its connections' and flows' tasks, the device's reader and writer and the
+DNS server share one current-thread runtime on a thread of their own (`route::thread`, named
+`sshunnel-stack`), so the netstack's own hops stay on one thread. The mux and everything else
+stay on the main runtime, and each segment still crosses to the mux there and back, through tokio's
+channels. **Nothing on that thread may block**: a blocking call there stalls every connection.
 
 `route::helper` is the privilege boundary, not the client. `sshunnel route` starts it through sudo,
 and with a `NOPASSWD` sudoers line anything running as the user can too, so it trusts nothing the

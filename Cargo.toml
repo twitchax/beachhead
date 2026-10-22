@@ -64,7 +64,7 @@ ipnet = "2"
 sha2 = "0.11"
 shlex = "2"
 simple-dns = "0.12"
-smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "signal"] }
 tracing.workspace = true
 

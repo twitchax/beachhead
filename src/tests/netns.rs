@@ -336,6 +336,8 @@ impl RemoteNs {
     pub const HOST6: Ipv6Addr = Ipv6Addr::new(0xfd99, 0, 0, 0, 0, 0, 0, 5);
     /// The test's end of the veth.
     pub const LINK: &str = "cl0";
+    /// The address of the test's end of the veth: where a pinned route's traffic comes from.
+    pub const LINK_ADDR: Ipv4Addr = Ipv4Addr::new(172, 31, 0, 1);
     /// ssh's peer, inside `10.98.0.0/16` and reached through the veth.
     pub const PEER: Ipv4Addr = Ipv4Addr::new(10, 98, 0, 2);
 
@@ -360,10 +362,11 @@ impl RemoteNs {
 
         let pid = ns.holder.id().to_string();
         let gateway = Self::GATEWAY.to_string();
+        let link_addr = format!("{}/30", Self::LINK_ADDR);
         let local: [&[&str]; 5] = [
             &["link", "set", "lo", "up"],
             &["link", "add", Self::LINK, "type", "veth", "peer", "name", "rm0", "netns", &pid],
-            &["addr", "add", "172.31.0.1/30", "dev", Self::LINK],
+            &["addr", "add", &link_addr, "dev", Self::LINK],
             &["link", "set", Self::LINK, "up"],
             &["route", "add", "10.98.0.0/16", "via", &gateway, "metric", "100"],
         ];

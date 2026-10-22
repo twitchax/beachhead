@@ -16,9 +16,10 @@ use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, geteuid, kill_process};
 use sshunnel::{
     route::FAKE_RANGE,
-    tests::{FakeRemote, Watched, echo_server, pattern, relay_dir, resolved_leftovers, round_trip, route_command},
+    tests::{FakeRemote, Watched, echo_server, pattern, relay_dir, resolved_leftovers, round_trip, route_command, udp_echo_server},
 };
 use tempfile::TempDir;
+use tokio::{net::UdpSocket, time::timeout};
 
 /// How long `route` may take to bring its routes up, or to exit.
 const WITHIN: Duration = Duration::from_secs(30);
@@ -95,6 +96,28 @@ async fn e2e_route_name_connects_by_name() {
     // alone, v4-mapped. A failed lookup would mean NXDOMAIN or SERVFAIL instead.
     let v6 = getent("ahostsv6", "wiki.corp.example").expect("an IPv6 lookup finds the A record, v4-mapped");
     assert!(!v6.is_empty() && v6.iter().all(|addr| matches!(addr, IpAddr::V6(_)) && is_fake(addr)), "{v6:?}");
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and the host's systemd-resolved; CI runs it under sudo"]
+async fn e2e_route_name_udp_reaches_the_remote_by_name() {
+    if !root() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let echo = udp_echo_server().await.unwrap();
+    let route = route_names(&dir).await;
+
+    let fake = getent("ahostsv4", "wiki.corp.example").expect("wiki.corp.example resolves");
+    assert!(fake.len() == 1 && is_fake(&fake[0]), "{fake:?}");
+    // The relay opens the flow by name, which the remote's /etc/hosts sends to the echo server.
+    let app = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    app.connect(SocketAddr::new(fake[0], echo.port())).await.unwrap();
+    app.send(b"by name").await.unwrap();
+    let mut back = [0; 64];
+    let n = timeout(WITHIN, app.recv(&mut back)).await.expect("the echo comes back").unwrap();
+    assert_eq!(&back[..n], b"by name");
     stop(route).await;
 }
 

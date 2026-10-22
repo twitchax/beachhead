@@ -21,6 +21,11 @@ why the version moved the way it did.
   of its own, opened by its first datagram and answered from the port it sent to; flows idle out
   after 30 s (120 s once they've carried more than one reply), and a session holds at most 4096,
   closing the least recently used to open another.
+- UDP through `sshunnel route`, to CIDR targets and to names under a pattern: each app socket and
+  destination is a flow through the relay, with UDP forwards' timeouts and cap. A closed port or an
+  unreachable host on the remote comes back as the ICMP unreachable a real network sends, so a
+  connected socket sees `ECONNREFUSED` for a closed port. UDP to an address nothing routes, and
+  ICMP, still get administratively prohibited.
 
 ### Changed
 

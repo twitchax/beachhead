@@ -17,20 +17,19 @@ use std::{
 use anyhow::{Context as _, anyhow, bail, ensure};
 use bytes::Bytes;
 use sshunnel_mux::{
-    FLOW_QUEUE, FLOW_QUEUE_BYTES, FlowEvent,
+    FlowEvent,
     base::{Err, Res, Void},
 };
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::Notify,
-    task::AbortHandle,
     time::Instant,
 };
 use tracing::{debug, warn};
 
 use crate::{
-    flows::FlowTable,
-    tunnel::{Conn as _, Flow, FlowSender as _, Tunnel},
+    flows::{FlowTable, Held, ReplyTask},
+    tunnel::{Conn as _, Flow, FlowSender as _, SenderOf, Tunnel},
 };
 
 /// What a forward carries.
@@ -253,9 +252,6 @@ pub async fn serve<T: Tunnel>(tunnel: T, listener: TcpListener, host: Arc<str>, 
 /// A UDP forward's flow: the listener a datagram came in on, and the local sender it came from.
 type FlowKey = (SocketAddr, SocketAddr);
 
-/// The sending half of a tunnel's flows.
-type SenderOf<T> = <<T as Tunnel>::Flow as Flow>::Sender;
-
 /// The session's UDP forwards: one flow table across every UDP listener, keyed by (listener
 /// address, sender address), so the cap counts every flow the session holds.
 #[derive(Clone)]
@@ -283,33 +279,6 @@ enum State<S> {
     Opening(Held),
     /// Datagrams go straight to the flow, and a task carries its replies back.
     Open { sender: S, _replies: ReplyTask },
-}
-
-/// Datagrams waiting for their flow to open, bounded as a flow's own queue is.
-#[derive(Default)]
-struct Held {
-    datagrams: Vec<Bytes>,
-    bytes: usize,
-}
-
-impl Held {
-    /// Holds `datagram`, or drops it when the hold is full. An empty hold takes one of any size.
-    fn push(&mut self, datagram: Bytes) {
-        let over_bytes = !self.datagrams.is_empty() && self.bytes + datagram.len() > FLOW_QUEUE_BYTES;
-        if self.datagrams.len() < FLOW_QUEUE && !over_bytes {
-            self.bytes += datagram.len();
-            self.datagrams.push(datagram);
-        }
-    }
-}
-
-/// A flow's reply task, aborted when its entry goes: that drops the flow, which resets it.
-struct ReplyTask(AbortHandle);
-
-impl Drop for ReplyTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 impl<T: Tunnel> UdpForwards<T> {
@@ -424,7 +393,7 @@ impl<T: Tunnel> UdpForwards<T> {
         match opened {
             Ok(flow) => {
                 let State::Opening(held) = &mut entry.state else { return };
-                let held = std::mem::take(&mut held.datagrams);
+                let held = held.take();
                 let sender = flow.sender();
                 for datagram in held {
                     sender.try_send(datagram);
@@ -492,7 +461,7 @@ mod unit {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::tests::{self, FakeTunnel};
+    use crate::tests::{self, FakeTunnel, until};
 
     fn fwd(bind: &str, bind_port: u16, host: &str, port: u16) -> Forward {
         Forward {
@@ -604,31 +573,6 @@ mod unit {
         assert!("0:h:1/tcp".parse::<Forward>().unwrap().bind_udp().await.is_err());
     }
 
-    /// Yields until `done` holds, which lets the runtime poll its I/O without moving a paused
-    /// clock; panics if it never does.
-    async fn until(mut done: impl FnMut() -> bool) {
-        for _ in 0..10_000 {
-            if done() {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("the condition never held");
-    }
-
-    /// A UDP server that answers anything with `stale`, so a reply through it shows.
-    async fn stale_server() -> SocketAddr {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0; 64];
-            while let Ok((_, from)) = socket.recv_from(&mut buf).await {
-                let _ = socket.send_to(b"stale", from).await;
-            }
-        });
-        addr
-    }
-
     /// Waits up to 5 s of real time for `done` to hold.
     async fn eventually(mut done: impl FnMut() -> bool) {
         for _ in 0..500 {
@@ -664,7 +608,7 @@ mod unit {
     #[tokio::test(start_paused = true)]
     async fn udp_an_open_finishing_after_its_flow_idled_out_is_dropped() {
         let tunnel = FakeTunnel::new();
-        let first = tunnel.udp_gate("dns.corp.example", 53, stale_server().await);
+        let first = tunnel.udp_gate("dns.corp.example", 53, tests::udp_stale_server().await.unwrap());
         let forwards = UdpForwards::new(tunnel.clone());
         let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -673,16 +617,16 @@ mod unit {
         let sweep = tokio::spawn(forwards.clone().sweep());
 
         app.send(b"one").await.unwrap();
-        until(|| tunnel.flows().len() == 1).await;
+        until(|| tunnel.flows().len() == 1).await.unwrap();
         tokio::time::advance(Duration::from_secs(31)).await;
-        until(|| forwards.len() == 0).await;
+        until(|| forwards.len() == 0).await.unwrap();
         // Past here the test waits on real sockets, and a paused clock jumps to any pending timer
         // whenever the runtime idles: the sweep would idle the second flow out mid-exchange.
         sweep.abort();
 
         let second = tunnel.udp_gate("dns.corp.example", 53, tests::udp_echo_server().await.unwrap());
         app.send(b"two").await.unwrap();
-        until(|| tunnel.flows().len() == 2).await;
+        until(|| tunnel.flows().len() == 2).await.unwrap();
         first.open();
         // The first open runs before this task resumes.
         tokio::task::yield_now().await;

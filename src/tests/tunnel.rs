@@ -52,6 +52,8 @@ enum UdpDial {
     Reject(OpenErrKind),
     /// Waits for the gate, then connects to this address.
     Gated(watch::Receiver<bool>, SocketAddr),
+    /// Succeeds with a flow the relay ends at once.
+    Hangup,
 }
 
 #[derive(Default)]
@@ -149,6 +151,12 @@ impl FakeTunnel {
         let (gate, waiting) = watch::channel(false);
         self.script().udp.insert((host.to_owned(), port), UdpDial::Gated(waiting, to));
         Gate(gate)
+    }
+
+    /// UDP flow opens of `host:port` succeed with a flow the relay ends at once, as it ends one on
+    /// a socket error it doesn't report.
+    pub fn udp_hangup(&self, host: &str, port: u16) {
+        self.script().udp.insert((host.to_owned(), port), UdpDial::Hangup);
     }
 
     /// Lookups of `name` answer `answer`.
@@ -259,6 +267,7 @@ impl Tunnel for FakeTunnel {
             None => return Err(fail(OpenErrKind::Other, format!("nothing scripted for UDP {host}:{port}"))),
             Some(UdpDial::Reject(kind)) => return Err(fail(kind, format!("opening UDP {host}:{port}: scripted {kind:?}"))),
             Some(UdpDial::To(to)) => to,
+            Some(UdpDial::Hangup) => return Ok(FakeFlow::Ended(FakeEnded { _live: Live::new(&self.live) })),
             Some(UdpDial::Gated(mut gate, to)) => {
                 gate.wait_for(|open| *open).await.map_err(|_| fail(OpenErrKind::Other, "the gate was dropped".to_owned()))?;
                 to
@@ -288,6 +297,13 @@ impl Tunnel for FakeTunnel {
 pub enum FakeFlow {
     /// A local UDP socket connected to the scripted address.
     Udp(FakeUdp),
+    /// A flow the relay ended at once: it delivers nothing and takes nothing.
+    Ended(FakeEnded),
+}
+
+/// A [`FakeFlow::Ended`].
+pub struct FakeEnded {
+    _live: Live,
 }
 
 /// A [`FakeFlow::Udp`]: socket errors become flow errors as the relay maps them
@@ -359,11 +375,12 @@ impl Flow for FakeFlow {
     fn sender(&self) -> FakeSender {
         match self {
             Self::Udp(udp) => FakeSender(Arc::downgrade(&udp.link)),
+            Self::Ended(_) => FakeSender(Weak::new()),
         }
     }
 
     async fn recv(&mut self) -> Option<FlowEvent> {
-        let Self::Udp(udp) = self;
+        let Self::Udp(udp) = self else { return None };
         loop {
             if udp.ended {
                 return None;
