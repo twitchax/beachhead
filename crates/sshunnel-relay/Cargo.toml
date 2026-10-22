@@ -17,11 +17,12 @@ anyhow.workspace = true
 sshunnel-mux.workspace = true
 bytes.workspace = true
 libc = "0.2"
-tokio = { workspace = true, features = ["rt", "net", "io-std", "io-util", "sync", "macros"] }
+socket2 = "0.6"
+tokio = { workspace = true, features = ["rt", "net", "io-std", "io-util", "sync", "macros", "time"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-std", "io-util", "sync", "macros", "process", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-std", "io-util", "sync", "macros", "process", "time", "test-util"] }
 
 [lints]
 workspace = true

@@ -126,12 +126,36 @@ async fn e2e_stdio_answers_a_resolve() {
 }
 
 #[tokio::test]
-async fn e2e_stdio_refuses_flows_and_queries_it_does_not_serve_yet() {
+async fn e2e_stdio_hello_reports_ping_capabilities() {
+    let mut child = relay().arg("--stdio").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let hello = recv_hello(&mut stdout, &mut BytesMut::new()).await.unwrap();
+    assert_eq!(hello.capabilities, sshunnel_relay::ping::probe());
+}
+
+#[tokio::test]
+async fn e2e_stdio_pings_localhost() {
+    if !sshunnel_relay::ping::probe().ping4 {
+        eprintln!("skipped: this machine may not open ping sockets");
+        return;
+    }
     let (mux, _child) = connect().await;
-    let err = timeout(Duration::from_secs(30), mux.open_echo("127.0.0.1")).await.unwrap().unwrap_err();
-    assert_eq!(err.kind, OpenErrKind::Other, "{err}");
-    let err = timeout(Duration::from_secs(30), mux.query(Bytes::from_static(b"q"), Transport::Udp)).await.unwrap().unwrap_err();
-    assert_eq!(err.reason, "not answered");
+    let mut flow = timeout(Duration::from_secs(30), mux.open_echo("127.0.0.1")).await.unwrap().unwrap();
+    let sender = flow.sender();
+    let request = Bytes::from_static(&[0, 7, b'x']);
+    assert!(sender.try_send(request.clone()));
+    assert_eq!(next_event(&mut flow).await, FlowEvent::Datagram(request));
+}
+
+#[tokio::test]
+async fn e2e_stdio_answers_a_query_it_cannot_route_with_a_query_error() {
+    // The relay reads the machine's own resolv.conf, so the test can only pin the failure shape:
+    // either an answer or a reason, never the old "not answered".
+    let (mux, _child) = connect().await;
+    let question = Bytes::from_static(&[0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
+    if let Err(e) = timeout(Duration::from_secs(30), mux.query(question, Transport::Tcp)).await.unwrap() {
+        assert_ne!(e.reason, "not answered", "{e}");
+    }
 }
 
 /// A loopback UDP echo; returns its port.

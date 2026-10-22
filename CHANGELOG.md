@@ -15,6 +15,8 @@ why the version moved the way it did.
   taking turns with stream data.
 - The relay serves UDP flows: a connected socket per flow, datagrams both ways, and socket errors
   (port unreachable and the like) reported as flow errors.
+- The relay answers raw DNS queries from its own `/etc/resolv.conf`, and reports in its `Hello`
+  whether it may ping over IPv4 and IPv6.
 
 ### Changed
 

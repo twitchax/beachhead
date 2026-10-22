@@ -612,6 +612,7 @@ dependencies = [
  "bytes",
  "libc",
  "pretty_assertions",
+ "socket2",
  "sshunnel-mux",
  "tokio",
 ]

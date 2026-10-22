@@ -3,7 +3,11 @@
 //! stdout carries frames and nothing else; anything human-readable goes to stderr, which ssh hands
 //! back to the client's terminal.
 
+pub mod ping;
+pub mod query;
+
 use std::{
+    borrow::Cow,
     ffi::CString,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -12,9 +16,9 @@ use std::{
 };
 
 use anyhow::Context as _;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use sshunnel_mux::{
-    Config, FlowEvent, FlowKind, FlowRequest, Incoming, OpenError, OpenRequest, Request, ResolveError, ResolveRequest, Role,
+    Config, Flow, FlowEvent, FlowKind, FlowRequest, Incoming, OpenError, OpenRequest, Request, ResolveError, ResolveRequest, Role,
     base::Void,
     frame::{Capabilities, FlowErrKind, MAX_HOST, OpenErrKind, ResolveErrKind},
     hello::{recv_hello, send_hello},
@@ -45,17 +49,18 @@ pub fn run_stdio() -> Void {
     if let Err(e) = raise_fd_limit() {
         eprintln!("sshunnel-relay: could not raise the open-file limit: {e}");
     }
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_io().build().context("starting the runtime")?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build().context("starting the runtime")?;
     let result = runtime.block_on(async {
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let config = Config::default();
         // The relay speaks first: the client stays quiet until this Hello arrives.
-        send_hello(&mut stdout, config.window(), Capabilities::default()).await?;
+        let capabilities = ping::probe();
+        send_hello(&mut stdout, config.window(), capabilities).await?;
         let mut buf = BytesMut::new();
         let client = recv_hello(&mut stdin, &mut buf).await?;
         let (_mux, incoming, driver) = start(stdin, buf, stdout, Role::Relay, config, client);
-        tokio::spawn(serve(incoming));
+        tokio::spawn(serve(incoming, capabilities));
         driver.await
     });
     // A stdin read parked on the blocking pool would make an orderly shutdown wait on it forever.
@@ -82,8 +87,9 @@ pub fn raise_fd_limit() -> std::io::Result<u64> {
     Ok(limit.rlim_cur)
 }
 
-/// Serves each request the client makes: dial a host, open a flow, or resolve a name.
-pub async fn serve(mut incoming: Incoming) {
+/// Serves each request the client makes: dial a host, open a flow, resolve a name, or ask the
+/// remote's nameservers. `capabilities` is what the `Hello` promised about ping.
+pub async fn serve(mut incoming: Incoming, capabilities: Capabilities) {
     let lookups = Arc::new(Semaphore::new(MAX_LOOKUPS));
     while let Some(request) = incoming.next().await {
         match request {
@@ -96,8 +102,12 @@ pub async fn serve(mut incoming: Incoming) {
             Request::OpenFlow(request) if request.kind() == FlowKind::Udp => {
                 tokio::spawn(udp(request, Arc::clone(&lookups)));
             }
-            // Not served yet (T-002): dropping a request refuses it, so the client hears why.
-            Request::OpenFlow(_) | Request::Query(_) => {}
+            Request::OpenFlow(request) => {
+                tokio::spawn(echo(request, Arc::clone(&lookups), capabilities));
+            }
+            Request::Query(request) => {
+                tokio::spawn(query::serve(request));
+            }
         }
     }
 }
@@ -176,7 +186,55 @@ async fn udp(request: FlowRequest, permits: Arc<Semaphore>) {
             return;
         }
     };
-    let mut flow = request.accept();
+    carry(request.accept(), &socket, |datagram| Some(Cow::Borrowed(datagram)), |packet| Some(Bytes::copy_from_slice(packet))).await;
+}
+
+/// An echo flow: a connected ping socket of the first address's family the remote may ping over,
+/// with each datagram (a sequence, then a payload) carried as an echo request, and each echo
+/// reply back as one.
+async fn echo(request: FlowRequest, permits: Arc<Semaphore>, capabilities: Capabilities) {
+    let found = match addresses(&permits, request.host(), 0).await {
+        Ok(found) => found,
+        Err(e) => {
+            request.reject(e.kind, &e.reason);
+            return;
+        }
+    };
+    let Some(addr) = found.iter().find(|a| if a.is_ipv6() { capabilities.ping6 } else { capabilities.ping4 }) else {
+        let reason = match found.first() {
+            Some(a) if a.is_ipv6() => "the remote can't ping over IPv6",
+            Some(_) => "the remote can't ping over IPv4",
+            None => "the name has no addresses",
+        };
+        request.reject(OpenErrKind::Other, reason);
+        return;
+    };
+    let v6 = addr.is_ipv6();
+    let socket = match ping::open(*addr) {
+        Ok(socket) => socket,
+        Err(e) => {
+            let reason = format!("opening a ping socket to {}: {e}", request.host());
+            request.reject(open_err_kind(&e), &reason);
+            return;
+        }
+    };
+    carry(
+        request.accept(),
+        &socket,
+        |datagram| ping::echo_request(datagram, v6).map(Cow::Owned),
+        |packet| ping::echo_reply(packet, v6),
+    )
+    .await;
+}
+
+/// Carries a flow's datagrams to `socket` and back until the client ends the flow. `outbound`
+/// turns a datagram into what the socket sends, `inbound` what it received into a datagram;
+/// either returns `None` for what the flow has no use for, which is dropped.
+async fn carry<O, I>(mut flow: Flow, socket: &UdpSocket, outbound: O, inbound: I)
+where
+    O: for<'a> Fn(&'a [u8]) -> Option<Cow<'a, [u8]>>,
+    I: Fn(&[u8]) -> Option<Bytes>,
+{
     let sender = flow.sender();
     // A datagram can be 65 535 bytes; untouched pages of this buffer cost nothing.
     let mut buf = vec![0u8; 65_535];
@@ -184,7 +242,8 @@ async fn udp(request: FlowRequest, permits: Arc<Semaphore>) {
         tokio::select! {
             event = flow.recv() => match event {
                 Some(FlowEvent::Datagram(datagram)) => {
-                    if let Err(e) = socket.send(&datagram).await
+                    if let Some(packet) = outbound(&datagram)
+                        && let Err(e) = socket.send(&packet).await
                         && !report(&sender, &e)
                     {
                         return;
@@ -197,7 +256,9 @@ async fn udp(request: FlowRequest, permits: Arc<Semaphore>) {
             read = socket.recv(&mut buf) => match read {
                 Ok(n) => {
                     // A full queue drops the datagram: UDP may lose it, and the relay mustn't wait.
-                    sender.try_send(bytes::Bytes::copy_from_slice(&buf[..n]));
+                    if let Some(datagram) = inbound(&buf[..n]) {
+                        sender.try_send(datagram);
+                    }
                 }
                 Err(e) => {
                     if !report(&sender, &e) {
