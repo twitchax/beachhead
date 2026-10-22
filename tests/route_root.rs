@@ -164,6 +164,18 @@ fn ipv6_on() -> bool {
         .all(|conf| std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{conf}/disable_ipv6")).is_ok_and(|disabled| disabled.trim() == "0"))
 }
 
+/// IPv6 on, or a skip of a test that's all about fake v6; CI's runners have IPv6, so there a skip
+/// is a failure rather than a pass that tested nothing.
+fn ipv6_or_skip() -> bool {
+    if ipv6_on() {
+        return true;
+    }
+    let why = "IPv6 is disabled here (net.ipv6.conf.all or .default.disable_ipv6), so route leaves fake v6 off";
+    assert!(std::env::var_os("CI").is_none(), "{why}: CI runners must have IPv6 for these tests");
+    eprintln!("skipped: {why}");
+    false
+}
+
 /// `name`'s v6 fake, the one address an IPv6 lookup finds once AAAA answers.
 fn v6_fake(name: &str) -> IpAddr {
     let v6 = getent("ahostsv6", name).unwrap_or_else(|| panic!("{name} resolves over IPv6"));
@@ -232,8 +244,7 @@ async fn e2e_route_name_udp_reaches_the_remote_over_its_v6_fake() {
     if !root() {
         return;
     }
-    if !ipv6_on() {
-        eprintln!("skipped: IPv6 is disabled here (net.ipv6.conf.all or .default.disable_ipv6), so route leaves fake v6 off");
+    if !ipv6_or_skip() {
         return;
     }
     let dir = TempDir::new().unwrap();
@@ -258,8 +269,7 @@ async fn e2e_route_name_ping_reaches_the_remote_over_its_v6_fake() {
     if !root() {
         return;
     }
-    if !ipv6_on() {
-        eprintln!("skipped: IPv6 is disabled here (net.ipv6.conf.all or .default.disable_ipv6), so route leaves fake v6 off");
+    if !ipv6_or_skip() {
         return;
     }
     let dir = TempDir::new().unwrap();
@@ -306,7 +316,10 @@ async fn e2e_resolved_routes_only_the_patterns() {
     let link = resolved_leftovers().unwrap().join("\n");
     let mut zones = vec!["~18.198.in-addr.arpa", "~19.198.in-addr.arpa"];
     if ipv6_on() {
+        eprintln!("IPv6 is on: the link routes the v6 fake range's reverse zone too");
         zones.push("~0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.0.0.1.0.0.2.ip6.arpa");
+    } else {
+        eprintln!("IPv6 is off: fake v6 is off, so the link routes the v4 reverse zones alone");
     }
     for zone in zones {
         assert!(link.contains(zone), "{zone} missing from the link: {link}");
