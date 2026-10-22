@@ -1,6 +1,6 @@
 //! [`AppStack`]: the app side of the netstack tests. A second smoltcp interface at the device's
 //! addresses, on the other end of an in-memory packet pipe, so a test connects, sends UDP and
-//! pings the way an app on the machine would, and sees every packet the stack sent back.
+//! ICMP and pings the way an app on the machine would, and sees every packet the stack sent back.
 
 use std::{
     future::poll_fn,
@@ -76,7 +76,15 @@ pub enum Sent {
     },
     /// An ICMP error, for either family.
     Icmp(Icmp),
-    /// Anything else: an ICMP query or reply, or a packet that doesn't parse.
+    /// An echo reply (type 0, or 129 between v6 addresses) whose checksum holds.
+    Echo {
+        from: IpAddr,
+        to: IpAddr,
+        id: u16,
+        seq: u16,
+        payload: Bytes,
+    },
+    /// Anything else: another ICMP message, or a packet that doesn't parse.
     Other,
 }
 
@@ -113,10 +121,34 @@ impl Sent {
                     code: *code,
                     about: about(quoted),
                 }),
-                _ => Self::Other,
+                _ => Self::echo_reply(&ip, payload).unwrap_or(Self::Other),
             },
             _ => Self::Other,
         }
+    }
+
+    /// The echo reply `icmp` is, parsed as a kernel would: in the IP packet's own family, and only
+    /// with a checksum that holds (over the pseudo-header for v6).
+    fn echo_reply(ip: &Ip, icmp: &[u8]) -> Option<Self> {
+        let caps = ChecksumCapabilities::default();
+        let (id, seq, payload) = match (ip.proto, ip.src, ip.dst) {
+            (IpProtocol::Icmp, IpAddr::V4(_), IpAddr::V4(_)) => match Icmpv4Repr::parse(&Icmpv4Packet::new_checked(icmp).ok()?, &caps).ok()? {
+                Icmpv4Repr::EchoReply { ident, seq_no, data } => (ident, seq_no, data),
+                _ => return None,
+            },
+            (IpProtocol::Icmpv6, IpAddr::V6(src), IpAddr::V6(dst)) => match Icmpv6Repr::parse(&src, &dst, &Icmpv6Packet::new_checked(icmp).ok()?, &caps).ok()? {
+                Icmpv6Repr::EchoReply { ident, seq_no, data } => (ident, seq_no, data),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(Self::Echo {
+            from: ip.src,
+            to: ip.dst,
+            id,
+            seq,
+            payload: Bytes::copy_from_slice(payload),
+        })
     }
 }
 
@@ -236,10 +268,31 @@ impl AppStack {
 
     /// Sends one echo request to `to` and returns the ICMP error the stack answers it with.
     pub async fn ping(&self, to: IpAddr) -> Option<Icmp> {
-        let from = local(to);
-        self.send(echo_request(from, to, self.port())?).await?;
+        self.send(echo_request(local(to), to, self.port(), 1, b"ping")?).await?;
+        self.icmp_error_about(to).await
+    }
+
+    /// Sends one echo request to `to` with identifier `id`, sequence number `seq` and `payload`,
+    /// and returns the first echo reply from `to` after it (a [`Sent::Echo`]), or `None` when none
+    /// comes within five seconds.
+    pub async fn echo(&self, to: IpAddr, id: u16, seq: u16, payload: &[u8]) -> Option<Sent> {
+        let before = self.tap.borrow().len();
+        self.send(echo_request(local(to), to, id, seq, payload)?).await?;
+        self.find_after(before, |sent| matches!(sent, Sent::Echo { from, .. } if *from == to).then(|| sent.clone())).await
+    }
+
+    /// Sends one ICMP query of type `kind` (code 0, with an identifier, a sequence number and 12
+    /// bytes, a timestamp request's shape) to `to`, and returns the ICMP error the stack answers it
+    /// with.
+    pub async fn icmp_query(&self, to: IpAddr, kind: u8) -> Option<Icmp> {
+        self.send(icmp_query(local(to), to, kind)?).await?;
+        self.icmp_error_about(to).await
+    }
+
+    /// The ICMP error about an ICMP message from the app to `to`.
+    async fn icmp_error_about(&self, to: IpAddr) -> Option<Icmp> {
         let proto = if to.is_ipv4() { IpProtocol::Icmp } else { IpProtocol::Icmpv6 };
-        let about = Some((SocketAddr::new(from, 0), SocketAddr::new(to, 0), proto));
+        let about = Some((SocketAddr::new(local(to), 0), SocketAddr::new(to, 0), proto));
         self.find(|sent| match sent {
             Sent::Icmp(icmp) if icmp.about == about => Some(icmp.clone()),
             _ => None,
@@ -305,12 +358,11 @@ fn local(to: IpAddr) -> IpAddr {
     if to.is_ipv4() { TUN_ADDR.into() } else { TUN_ADDR6.addr().into() }
 }
 
-fn echo_request(from: IpAddr, to: IpAddr, ident: u16) -> Option<Bytes> {
+fn echo_request(from: IpAddr, to: IpAddr, ident: u16, seq_no: u16, data: &[u8]) -> Option<Bytes> {
     let caps = ChecksumCapabilities::default();
-    let data = b"ping";
     match (from, to) {
         (IpAddr::V4(from), IpAddr::V4(to)) => {
-            let icmp = Icmpv4Repr::EchoRequest { ident, seq_no: 1, data };
+            let icmp = Icmpv4Repr::EchoRequest { ident, seq_no, data };
             let ip = IpRepr::new(from.into(), to.into(), IpProtocol::Icmp, icmp.buffer_len(), 64);
             let mut buf = vec![0; ip.buffer_len()];
             ip.emit(&mut buf[..], &caps);
@@ -318,7 +370,7 @@ fn echo_request(from: IpAddr, to: IpAddr, ident: u16) -> Option<Bytes> {
             Some(buf.into())
         }
         (IpAddr::V6(from), IpAddr::V6(to)) => {
-            let icmp = Icmpv6Repr::EchoRequest { ident, seq_no: 1, data };
+            let icmp = Icmpv6Repr::EchoRequest { ident, seq_no, data };
             let ip = IpRepr::new(from.into(), to.into(), IpProtocol::Icmpv6, icmp.buffer_len(), 64);
             let mut buf = vec![0; ip.buffer_len()];
             ip.emit(&mut buf[..], &caps);
@@ -327,6 +379,28 @@ fn echo_request(from: IpAddr, to: IpAddr, ident: u16) -> Option<Bytes> {
         }
         _ => None,
     }
+}
+
+/// An ICMP query of type `kind` from `from` to `to`, in their family's ICMP: code 0, then an
+/// identifier, a sequence number and 12 bytes of zeros.
+fn icmp_query(from: IpAddr, to: IpAddr, kind: u8) -> Option<Bytes> {
+    const LEN: usize = 8 + 12;
+    let proto = match (from, to) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => IpProtocol::Icmp,
+        (IpAddr::V6(_), IpAddr::V6(_)) => IpProtocol::Icmpv6,
+        _ => return None,
+    };
+    let ip = IpRepr::new(from.into(), to.into(), proto, LEN, 64);
+    let mut buf = vec![0; ip.buffer_len()];
+    ip.emit(&mut buf[..], &ChecksumCapabilities::default());
+    let icmp = &mut buf[ip.header_len()..];
+    icmp[0] = kind;
+    icmp[4..8].copy_from_slice(&[0, 1, 0, 1]);
+    match (from, to) {
+        (IpAddr::V6(from), IpAddr::V6(to)) => Icmpv6Packet::new_unchecked(icmp).fill_checksum(&from, &to),
+        _ => Icmpv4Packet::new_unchecked(icmp).fill_checksum(),
+    }
+    Some(buf.into())
 }
 
 struct Command {

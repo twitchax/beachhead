@@ -37,6 +37,13 @@ const FORCE: &str = "SSHUNNEL_NETNS";
 /// How long a test has, from entering [`netns`], to finish in its container: under nextest's 120 s
 /// kill (`.config/nextest.toml`), since a killed `docker run` leaves its container running.
 const CONTAINER_TIMEOUT: Duration = Duration::from_secs(110);
+/// The groups that may open ping sockets in the network namespace of whoever reads or writes it.
+pub(super) const PING_GROUP_RANGE: &str = "/proc/sys/net/ipv4/ping_group_range";
+/// The `ping_group_range` that lets root's group ping: the one group the harness's user namespace
+/// maps. A new network namespace lets none ("1 0"), and the kernel refuses any bound the writer's
+/// user namespace doesn't map, so neither the usual "0 2147483647" nor "1 0" can be written there,
+/// and a range once opened stays open.
+pub(super) const PING_ROOT: &str = "0 0";
 
 /// Whether to run the test's body here. Outside, runs the test named `test` again as root over fresh
 /// namespaces (directly with `unshare`, else in a container), returns `false` once it passed,
@@ -321,8 +328,9 @@ fn run(command: &mut Command) -> Void {
 /// (`172.31.0.1/30`) and `rm0` there (`172.31.0.2/30`), with the targets' hosts and ssh's peer on a
 /// dummy link there. Here, `10.98.0.0/16` goes via the veth at metric 100, as a DHCP route would, so
 /// a `10.98.0.0/16` target captures the peer and only a pin keeps it; nothing here reaches
-/// `10.99.0.0/16` or `fd99::/64` but a route's device. A `sleep` holds the namespace and is killed on
-/// drop.
+/// `10.99.0.0/16` or `fd99::/64` but a route's device. The relay may ping there, as on a systemd
+/// distribution, unless the namespace was made [`Self::without_ping`]. A `sleep` holds the namespace
+/// and is killed on drop.
 pub struct RemoteNs {
     holder: Child,
 }
@@ -341,12 +349,26 @@ impl RemoteNs {
     /// ssh's peer, inside `10.98.0.0/16` and reached through the veth.
     pub const PEER: Ipv4Addr = Ipv4Addr::new(10, 98, 0, 2);
 
-    /// Makes the namespace and wires both ends.
+    /// Makes the namespace, wires both ends, and lets the remote ping.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::without_ping`], and when the sysctl can't be written.
+    pub fn new() -> Res<Self> {
+        let ns = Self::without_ping()?;
+        ns.run(&["sh", "-c", &format!("echo {PING_ROOT} > {PING_GROUP_RANGE}")])?;
+        Ok(ns)
+    }
+
+    /// Makes the namespace and wires both ends, leaving its `ping_group_range` at a new namespace's
+    /// "1 0": a remote whose relay may not ping, as in many containers and on Alpine. Closing the
+    /// range of a namespace [`Self::new`] opened is no substitute, since the harness can't write
+    /// "1 0" (see [`PING_ROOT`]).
     ///
     /// # Errors
     ///
     /// Fails outside a network namespace of the test's own (see [`netns`]), or when `ip` fails.
-    pub fn new() -> Res<Self> {
+    pub fn without_ping() -> Res<Self> {
         let mut holder = Command::new("unshare")
             .args(["-n", "sh", "-c", "echo ready && exec sleep infinity"])
             .stdin(Stdio::null())

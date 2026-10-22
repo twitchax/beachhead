@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use ipnet::IpNet;
-use sshunnel_mux::Mux;
+use sshunnel_mux::{Mux, frame::Capabilities};
 use tokio::time::timeout;
 use tracing::warn;
 
@@ -21,7 +21,7 @@ use crate::{
     base::{Res, Void},
     relays::Relays,
     route::{
-        DEVICE, FAKE_RANGE,
+        DEVICE, FAKE_RANGE, PING_WARNING,
         helper::{Helper, Setup, Signals},
         names::{FakeMap, state_path, today},
         peers,
@@ -85,6 +85,7 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
     let ended = match start(&mut helper, session.mux(), &router, &upstreams).await {
         Ok(started) => {
             warned.warn(&check_routes(probes).await);
+            warned.warn(&ping_warnings(session.mux().capabilities()));
             eprintln!("{status}");
             wait(&mut signals, session, &mut helper, netstack.insert(started)).await
         }
@@ -228,6 +229,12 @@ fn route_warnings(probes: &[Probe], route_get: impl Fn(IpAddr) -> Res<Via>) -> V
             Err(e) => Some(format!("could not check where {} goes: {e:#}", probe.label)),
         })
         .collect()
+}
+
+/// [`PING_WARNING`] when the relay may ping over neither family, so the netstack refuses every echo
+/// without asking it.
+fn ping_warnings(can: Capabilities) -> Vec<String> {
+    if can.ping4 || can.ping6 { Vec::new() } else { vec![PING_WARNING.to_owned()] }
 }
 
 /// The one status line: what is routed, through where, on which device.
@@ -419,6 +426,17 @@ mod tests {
         let error = first_failure([Ok(()), Err(anyhow!("the ssh session ended")), Err(anyhow!("the root helper exited with 1"))]).unwrap_err();
 
         assert_eq!(error.to_string(), "the ssh session ended");
+    }
+
+    #[test]
+    fn a_remote_that_can_ping_over_neither_family_earns_the_warning() {
+        let only = |ping4, ping6| ping_warnings(Capabilities { ping4, ping6 });
+
+        assert_eq!(only(false, false), [PING_WARNING]);
+        // One family is enough to try: a name may resolve to it on the remote.
+        assert_eq!(only(true, false), Vec::<String>::new());
+        assert_eq!(only(false, true), Vec::<String>::new());
+        assert_eq!(only(true, true), Vec::<String>::new());
     }
 
     #[test]

@@ -25,7 +25,12 @@ why the version moved the way it did.
   destination is a flow through the relay, with UDP forwards' timeouts and cap. A closed port or an
   unreachable host on the remote comes back as the ICMP unreachable a real network sends, so a
   connected socket sees `ECONNREFUSED` for a closed port. UDP to an address nothing routes, and
-  ICMP, still get administratively prohibited.
+  ICMP other than ping, still get administratively prohibited.
+- Ping through `sshunnel route`, over IPv4 and IPv6, to CIDR targets and to names under a pattern:
+  each `ping`'s echoes to an address are a flow to an unprivileged ping socket on the remote, and
+  each reply comes back in the app's own family under its identifier. Where the remote doesn't
+  allow unprivileged ping (`net.ipv4.ping_group_range`), `route` warns once its routes are up, and
+  ping through it gets administratively prohibited.
 
 ### Changed
 

@@ -34,8 +34,8 @@ use {
         helper::{self, Helper, Setup},
     },
     anyhow::ensure,
-    rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair},
-    std::os::fd::OwnedFd,
+    rustix::net::{AddressFamily, SocketFlags, SocketType, ipproto, socket_with, socketpair},
+    std::{net::IpAddr, os::fd::OwnedFd},
     tokio::net::UnixDatagram,
 };
 
@@ -431,6 +431,55 @@ pub fn device_pair() -> Res<(OwnedFd, UnixDatagram)> {
     let kernel = std::os::unix::net::UnixDatagram::from(kernel);
     kernel.set_nonblocking(true).context("making the device's far end non-blocking")?;
     Ok((tun, UnixDatagram::from_std(kernel).context("registering the device's far end")?))
+}
+
+/// Lets this network namespace's root group open ping sockets, as [`ping`] needs: a new network
+/// namespace lets no group. For the netns tests, which each have a namespace of their own.
+///
+/// # Errors
+///
+/// Fails when the sysctl can't be written.
+#[cfg(target_os = "linux")]
+pub fn allow_ping() -> Void {
+    std::fs::write(netns::PING_GROUP_RANGE, netns::PING_ROOT).context("opening this namespace's ping_group_range")
+}
+
+/// Pings `to` once, as `ping` does without privileges: an echo request through a `SOCK_DGRAM` ICMP
+/// socket, whose identifier and checksum the kernel fills in. True when the reply comes within
+/// `within`; false on silence or an ICMP error.
+///
+/// # Errors
+///
+/// Fails when the socket can't be opened (this namespace's `ping_group_range` may not include the
+/// caller's group; see [`allow_ping`]) or the request can't be sent.
+#[cfg(target_os = "linux")]
+pub async fn ping(to: IpAddr, within: Duration) -> Res<bool> {
+    const SEQ: u16 = 7;
+    let (family, protocol, request, reply) = match to {
+        IpAddr::V4(_) => (AddressFamily::INET, ipproto::ICMP, 8, 0),
+        IpAddr::V6(_) => (AddressFamily::INET6, ipproto::ICMPV6, 128, 129),
+    };
+    let fd = socket_with(family, SocketType::DGRAM, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK, Some(protocol)).with_context(|| format!("opening a ping socket for {to}"))?;
+    // A ping socket sends and receives whole ICMP messages, as a UDP socket does datagrams.
+    let socket = UdpSocket::from_std(std::net::UdpSocket::from(fd)).context("registering the ping socket")?;
+    socket.connect(SocketAddr::new(to, 0)).await.with_context(|| format!("connecting the ping socket to {to}"))?;
+    let mut echo = vec![request, 0, 0, 0, 0, 0];
+    echo.extend_from_slice(&SEQ.to_be_bytes());
+    echo.extend_from_slice(b"sshunnel");
+    socket.send(&echo).await.with_context(|| format!("pinging {to}"))?;
+    let answered = timeout(within, async {
+        let mut buf = [0; 64];
+        loop {
+            match socket.recv(&mut buf).await {
+                Ok(n) if buf.get(..n).is_some_and(|icmp| icmp.first() == Some(&reply) && icmp.get(6..8) == Some(&SEQ.to_be_bytes()[..])) => return true,
+                Ok(_) => {}
+                // A connected socket reports the ICMP error that answered the request.
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+    Ok(answered.unwrap_or(false))
 }
 
 /// Sends `data` to the echo server at `addr` and reads until it closes; returns what came back.

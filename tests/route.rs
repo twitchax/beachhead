@@ -21,8 +21,8 @@ use std::{
 use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use sshunnel::{
-    route::{helper::Setup, peers::process_tree, system::same_netns_as_init},
-    tests::{self, FakeRemote, RemoteNs, Watched, echo_on, netns, pattern, relay_dir, round_trip, route_command, shim_dir, start_helper, udp_echo_on},
+    route::{PING_WARNING, helper::Setup, peers::process_tree, system::same_netns_as_init},
+    tests::{self, FakeRemote, RemoteNs, Watched, allow_ping, echo_on, netns, pattern, ping, relay_dir, round_trip, route_command, shim_dir, start_helper, udp_echo_on},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -47,8 +47,16 @@ struct World {
 
 impl World {
     fn new() -> Self {
+        Self::on(RemoteNs::new().unwrap())
+    }
+
+    /// A world whose remote may not ping.
+    fn without_ping() -> Self {
+        Self::on(RemoteNs::without_ping().unwrap())
+    }
+
+    fn on(ns: RemoteNs) -> Self {
         let dir = TempDir::new().unwrap();
-        let ns = RemoteNs::new().unwrap();
         let remote = FakeRemote::new(dir.path(), "sh", &[]).unwrap().in_netns(&ns).unwrap();
         let relays = relay_dir(dir.path()).unwrap();
         Self { dir, ns, remote, relays }
@@ -123,12 +131,13 @@ async fn started(command: Command) -> Watched {
     route
 }
 
-/// SIGTERM, then a clean exit that leaves nothing behind.
-async fn stop(route: Watched) {
+/// SIGTERM, then a clean exit that leaves nothing behind; returns all of stderr.
+async fn stop(route: Watched) -> String {
     signal(route.pid().unwrap(), Signal::TERM);
     let (status, stderr) = route.exit(WITHIN).await.unwrap();
     assert!(status.success(), "{status}; stderr:\n{stderr}");
     assert_eq!(leftovers(), Vec::<String>::new(), "stderr:\n{stderr}");
+    stderr
 }
 
 fn signal(pid: u32, signal: Signal) {
@@ -255,6 +264,37 @@ async fn e2e_route_udp_cidr_closed_port_is_refused() {
     let refused = recv.expect_err("a closed port answered");
     assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused, "{refused}");
     stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_ping_gets_echo_replies_v4_and_v6() {
+    if !netns("e2e_route_ping_gets_echo_replies_v4_and_v6").unwrap() {
+        return;
+    }
+    let world = World::new();
+    allow_ping().unwrap();
+    let route = world.start(&["10.99.0.0/16", "fd99::/64"]).await;
+
+    // Nothing here reaches either host but the device, so the replies come from the relay's ping
+    // sockets on the remote's network.
+    for host in [IpAddr::V4(RemoteNs::HOST), IpAddr::V6(RemoteNs::HOST6)] {
+        assert!(ping(host, WITHIN).await.unwrap(), "no echo reply from {host}");
+    }
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_ping_refused_remote_is_admin_prohibited_and_warns_once() {
+    if !netns("e2e_route_ping_refused_remote_is_admin_prohibited_and_warns_once").unwrap() {
+        return;
+    }
+    let world = World::without_ping();
+    allow_ping().unwrap();
+    let route = world.start(&["10.99.0.0/16"]).await;
+
+    assert!(!ping(RemoteNs::HOST.into(), Duration::from_secs(3)).await.unwrap(), "an echo reply came back");
+    let stderr = stop(route).await;
+    assert_eq!(stderr.matches(PING_WARNING).count(), 1, "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

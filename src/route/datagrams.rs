@@ -1,8 +1,14 @@
-//! Routed UDP as flows through the relay. The first datagram between an app's address and port and
-//! a remote's opens a flow, and it and those after it wait while the relay opens it; after that,
-//! each goes straight to the flow. Replies come back as UDP packets from the remote's address, and a
-//! flow error as the ICMP unreachable a real network would send, quoting the app's last datagram.
-//! The flow table idles flows out and caps them, and a flow that goes resets.
+//! Routed UDP and ICMP echo as flows through the relay. The first datagram between an app's address
+//! and port and a remote's, or the first echo request between their addresses under an identifier,
+//! opens a flow, and it and those after it wait while the relay opens it; after that, each goes
+//! straight to the flow. Replies come back as UDP packets from the remote's address, or as echo
+//! replies in the app's own family under its identifier, and a flow error as the ICMP unreachable a
+//! real network would send, quoting the app's last datagram. The flow table idles flows out and caps
+//! them, and a flow that goes resets.
+//!
+//! An echo flow carries each request's sequence number and payload alone (protocol v4's
+//! family-neutral echo): the relay's ping socket may be of either family, and its kernel picks the
+//! identifier, so the reply's family and identifier are restored here.
 //!
 //! Nothing here waits, since it runs on the netstack's thread: a datagram goes to its flow with
 //! `try_send`, dropped when the flow's queue is full, and a task per open flow carries the flow's
@@ -11,7 +17,7 @@
 
 use std::{
     future::Future as _,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -19,7 +25,7 @@ use std::{
 
 use anyhow::Context as _;
 use bytes::Bytes;
-use smoltcp::wire::{UDP_HEADER_LEN, UdpPacket};
+use smoltcp::wire::{IpProtocol, UdpPacket};
 use sshunnel_mux::{
     FlowEvent, OpenError,
     frame::{FlowErrKind, OpenErrKind},
@@ -36,7 +42,7 @@ use crate::{
     flows::{FlowTable, FlowTask, Held},
     route::{
         router::Router,
-        stack::{Ip, Refusal, icmp_error, udp_packet},
+        stack::{Ip, Refusal, icmp_error, icmp_packet, udp_packet},
     },
     tunnel::{Flow, FlowSender as _, SenderOf, Tunnel},
 };
@@ -46,14 +52,64 @@ use crate::{
 pub(crate) enum DatagramKey {
     /// UDP between an app's address and port and a remote's.
     Udp { app: SocketAddr, remote: SocketAddr },
+    /// ICMP echo between an app's address and a remote's, under the identifier the app's requests
+    /// carry (one per `ping`).
+    Echo { app: IpAddr, remote: IpAddr, id: u16 },
+}
+
+impl DatagramKey {
+    /// What of the app's `packet` the flow carries: a UDP datagram's payload, or an echo request's
+    /// sequence number and payload. Shares the packet's buffer.
+    fn datagram(self, packet: &Bytes, ip: &Ip) -> Option<Bytes> {
+        match self {
+            Self::Udp { .. } => ip.udp_payload(packet),
+            Self::Echo { .. } => {
+                let seq = ip.start + ECHO_SEQ;
+                (ip.end >= ip.start + ECHO_HEADER && ip.end <= packet.len()).then(|| packet.slice(seq..ip.end))
+            }
+        }
+    }
+
+    /// The packet the flow's `datagram` becomes for the app.
+    fn reply(self, datagram: &[u8]) -> Option<Bytes> {
+        match self {
+            Self::Udp { app, remote } => udp_packet(remote, app, datagram),
+            Self::Echo { app, remote, id } => echo_reply(remote, app, id, datagram),
+        }
+    }
+
+    /// How the app hears that its flow's open failed `kind` (R5), as it would from the remote's
+    /// network; `None` for silence, so the app's own timeout fires.
+    fn refusal(self, kind: OpenErrKind) -> Option<Refusal> {
+        match (self, kind) {
+            (_, OpenErrKind::TimedOut) => None,
+            (_, OpenErrKind::Unreachable) => Some(Refusal::Unreachable),
+            (Self::Udp { .. }, OpenErrKind::Refused | OpenErrKind::Other) => Some(Refusal::PortUnreachable),
+            // The relay can't ping that host's family, or can't open a ping socket at all.
+            (Self::Echo { .. }, OpenErrKind::Refused | OpenErrKind::Other) => Some(Refusal::Prohibited),
+        }
+    }
 }
 
 /// The replies on their way from the flows' tasks to the stack.
 pub(crate) const REPLIES: usize = 64;
 
+/// What an ICMP error must quote of a datagram past its IP header (RFC 792): all of a UDP header, or
+/// of an echo's.
+const QUOTED: usize = 8;
 /// The most of a datagram an ICMP error about it quotes: an IPv4 header with every option, then
-/// the UDP header.
-const QUOTE: usize = 60 + UDP_HEADER_LEN;
+/// [`QUOTED`].
+const QUOTE: usize = 60 + QUOTED;
+
+// ICMP's echo request and reply types, then ICMPv6's.
+const ECHO_REQUEST: u8 = 8;
+const ECHO_REPLY: u8 = 0;
+const ECHO_REQUEST6: u8 = 128;
+const ECHO_REPLY6: u8 = 129;
+/// An echo's header: type, code, checksum, identifier and sequence number.
+const ECHO_HEADER: usize = 8;
+/// Where an echo's sequence number sits, and the part an echo flow carries starts.
+const ECHO_SEQ: usize = 6;
 
 /// A finished open: its flow's key, its entry's generation and the relay's answer.
 type Opened<F> = (DatagramKey, u64, Result<F, OpenError>);
@@ -88,7 +144,7 @@ struct Quote {
 
 impl Quote {
     fn new(packet: &[u8], ip: &Ip) -> Option<Self> {
-        let ip = Ip { end: ip.start + UDP_HEADER_LEN, ..*ip };
+        let ip = Ip { end: ip.start + QUOTED, ..*ip };
         let mut bytes = [0; QUOTE];
         bytes.get_mut(..ip.end)?.copy_from_slice(packet.get(..ip.end)?);
         Some(Self { bytes, ip })
@@ -129,19 +185,36 @@ impl<T: Tunnel> Datagrams<T> {
         }
     }
 
-    /// Sends an app's UDP `packet` on: to its flow, into the hold of a flow still opening, or
-    /// opening a flow for it. Never waits: a full queue or hold drops it. Returns the ICMP error to
-    /// answer it with when nothing routes its destination.
+    /// Sends an app's UDP `packet` on, as [`Self::send`] does.
     pub(crate) fn udp(&mut self, packet: Bytes, ip: &Ip) -> Option<Bytes> {
-        let (key, port) = {
-            let udp = UdpPacket::new_checked(ip.payload(&packet)).ok()?;
-            let remote = SocketAddr::new(ip.dst, udp.dst_port());
-            let key = DatagramKey::Udp {
-                app: SocketAddr::new(ip.src, udp.src_port()),
-                remote,
-            };
-            (key, remote.port())
+        let udp = UdpPacket::new_checked(ip.payload(&packet)).ok()?;
+        let key = DatagramKey::Udp {
+            app: SocketAddr::new(ip.src, udp.src_port()),
+            remote: SocketAddr::new(ip.dst, udp.dst_port()),
         };
+        self.send(key, packet, ip)
+    }
+
+    /// Sends an app's echo request on, as [`Self::send`] does, unless the relay can ping over neither
+    /// family: then it is refused without asking the relay.
+    pub(crate) fn echo(&mut self, packet: Bytes, ip: &Ip) -> Option<Bytes> {
+        let key = DatagramKey::Echo {
+            app: ip.src,
+            remote: ip.dst,
+            id: echo_id(&packet, ip)?,
+        };
+        let can = self.tunnel.capabilities();
+        if !(can.ping4 || can.ping6) {
+            debug!(?key, "the remote can't ping; refusing");
+            return icmp_error(&packet, ip, Refusal::Prohibited);
+        }
+        self.send(key, packet, ip)
+    }
+
+    /// Sends an app's `packet` on: to its flow, into the hold of a flow still opening, or opening a
+    /// flow for it. Never waits: a full queue or hold drops it. Returns the ICMP error to answer it
+    /// with when nothing routes its destination.
+    fn send(&mut self, key: DatagramKey, packet: Bytes, ip: &Ip) -> Option<Bytes> {
         let quote = Quote::new(&packet, ip)?;
         let now = Instant::now();
         if let Some(entry) = self.table.get_mut(&key) {
@@ -149,8 +222,8 @@ impl<T: Tunnel> Datagrams<T> {
             match &mut entry.state {
                 State::Opening { held, .. } => held.push(packet),
                 State::Open { sender, .. } => {
-                    if let Some(payload) = ip.udp_payload(&packet) {
-                        sender.try_send(payload);
+                    if let Some(datagram) = key.datagram(&packet, ip) {
+                        sender.try_send(datagram);
                     }
                     self.table.sent(&key, now);
                 }
@@ -164,7 +237,13 @@ impl<T: Tunnel> Datagrams<T> {
         let generation = self.generations;
         self.generations += 1;
         let tunnel = self.tunnel.clone();
-        let open = self.opens.spawn(async move { (key, generation, tunnel.open_udp(&host, port).await) });
+        let open = self.opens.spawn(async move {
+            let opened = match key {
+                DatagramKey::Udp { remote, .. } => tunnel.open_udp(&host, remote.port()).await,
+                DatagramKey::Echo { .. } => tunnel.open_echo(&host).await,
+            };
+            (key, generation, opened)
+        });
         let mut held = Held::default();
         held.push(packet);
         let state = State::Opening { held, _open: FlowTask(open) };
@@ -206,8 +285,8 @@ impl<T: Tunnel> Datagrams<T> {
             Ok(flow) => {
                 let sender = flow.sender();
                 for packet in &held {
-                    if let Some(payload) = Ip::parse(packet).and_then(|ip| ip.udp_payload(packet)) {
-                        sender.try_send(payload);
+                    if let Some(datagram) = Ip::parse(packet).and_then(|ip| key.datagram(packet, &ip)) {
+                        sender.try_send(datagram);
                     }
                 }
                 let replies = tokio::spawn(carry(flow, key, generation, self.reply_to.clone()));
@@ -220,12 +299,7 @@ impl<T: Tunnel> Datagrams<T> {
             Err(e) => {
                 debug!(?key, "opening the flow failed: {e}");
                 self.table.remove(&key);
-                let refusal = match e.kind {
-                    OpenErrKind::Refused | OpenErrKind::Other => Refusal::PortUnreachable,
-                    OpenErrKind::Unreachable => Refusal::Unreachable,
-                    // The app's own timeout fires, as it would on the remote's network.
-                    OpenErrKind::TimedOut => return,
-                };
+                let Some(refusal) = key.refusal(e.kind) else { return };
                 for packet in held {
                     send(Ip::parse(&packet).and_then(|ip| icmp_error(&packet, &ip, refusal)));
                 }
@@ -245,11 +319,10 @@ impl<T: Tunnel> Datagrams<T> {
     fn reply(&mut self, key: DatagramKey, generation: u64, event: Option<FlowEvent>) -> Option<Bytes> {
         // The reply of a flow that has since gone has no one to go to.
         let entry = self.table.get_mut(&key).filter(|entry| entry.generation == generation)?;
-        let DatagramKey::Udp { app, remote } = key;
         match event {
             Some(FlowEvent::Datagram(datagram)) => {
                 self.table.replied(&key, Instant::now());
-                udp_packet(remote, app, &datagram)
+                key.reply(&datagram)
             }
             Some(FlowEvent::Error(kind)) => entry.quote.icmp(refusal(kind)),
             None => {
@@ -290,6 +363,35 @@ async fn carry<F: Flow>(mut flow: F, key: DatagramKey, generation: u64, replies:
             return;
         }
     }
+}
+
+/// The identifier of `packet`'s ICMP echo request (v4 type 8, or v6 type 128; code 0), if it is
+/// one.
+pub(crate) fn echo_id(packet: &[u8], ip: &Ip) -> Option<u16> {
+    let request = match (ip.proto, ip.src) {
+        (IpProtocol::Icmp, IpAddr::V4(_)) => ECHO_REQUEST,
+        (IpProtocol::Icmpv6, IpAddr::V6(_)) => ECHO_REQUEST6,
+        _ => return None,
+    };
+    match ip.payload(packet) {
+        [kind, 0, _, _, a, b, _, _, ..] if *kind == request => Some(u16::from_be_bytes([*a, *b])),
+        _ => None,
+    }
+}
+
+/// An echo reply from `from` to `to` (type 0, or 129 between v6 addresses) under identifier `id`,
+/// around an echo flow's `datagram`: a sequence number, then a payload. `None` without the sequence
+/// number.
+fn echo_reply(from: IpAddr, to: IpAddr, id: u16, datagram: &[u8]) -> Option<Bytes> {
+    if datagram.len() < ECHO_HEADER - ECHO_SEQ {
+        return None;
+    }
+    let kind = if to.is_ipv4() { ECHO_REPLY } else { ECHO_REPLY6 };
+    icmp_packet(from, to, ECHO_SEQ + datagram.len(), |icmp| {
+        icmp[0] = kind;
+        icmp[4..ECHO_SEQ].copy_from_slice(&id.to_be_bytes());
+        icmp[ECHO_SEQ..].copy_from_slice(datagram);
+    })
 }
 
 /// The ICMP unreachable a flow error stands for: the one the remote's socket heard.
@@ -334,5 +436,35 @@ mod unit {
         assert_eq!(v6(FlowErrKind::PortUnreachable), (1, 4, 48));
         assert_eq!(v6(FlowErrKind::HostUnreachable), (1, 3, 48));
         assert_eq!(v6(FlowErrKind::NetUnreachable), (1, 0, 48));
+    }
+
+    #[test]
+    fn only_an_echo_request_has_an_echo_id() {
+        let id = |from: &str, to: &str, kind: u8, code: u8| {
+            let message = icmp_packet(from.parse().unwrap(), to.parse().unwrap(), ECHO_HEADER + 4, |icmp| {
+                (icmp[0], icmp[1]) = (kind, code);
+                icmp[4..6].copy_from_slice(&0x1234_u16.to_be_bytes());
+            })
+            .unwrap();
+            echo_id(&message, &Ip::parse(&message).unwrap())
+        };
+
+        assert_eq!(id("198.18.0.1", "10.99.0.5", ECHO_REQUEST, 0), Some(0x1234));
+        assert_eq!(id("fd73:7368::1", "fd99::5", ECHO_REQUEST6, 0), Some(0x1234));
+        // Another code, a timestamp request, and an echo request's type in the other family.
+        assert_eq!(id("198.18.0.1", "10.99.0.5", ECHO_REQUEST, 1), None);
+        assert_eq!(id("198.18.0.1", "10.99.0.5", 13, 0), None);
+        assert_eq!(id("fd73:7368::1", "fd99::5", ECHO_REQUEST, 0), None);
+    }
+
+    #[test]
+    fn an_echo_reply_needs_the_sequence_number() {
+        let (remote, app) = ("10.99.0.5".parse().unwrap(), IpAddr::V4(TUN_ADDR));
+
+        assert_eq!(echo_reply(remote, app, 7, &[0]), None);
+        let reply = echo_reply(remote, app, 7, &[0, 1]).unwrap();
+        let ip = Ip::parse(&reply).unwrap();
+        assert_eq!(ip.payload(&reply)[..2], [ECHO_REPLY, 0]);
+        assert_eq!(ip.payload(&reply)[4..], [0, 7, 0, 1]);
     }
 }

@@ -16,7 +16,7 @@ use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, geteuid, kill_process};
 use sshunnel::{
     route::FAKE_RANGE,
-    tests::{FakeRemote, Watched, echo_server, pattern, relay_dir, resolved_leftovers, round_trip, route_command, udp_echo_server},
+    tests::{FakeRemote, Watched, echo_server, pattern, ping, relay_dir, resolved_leftovers, round_trip, route_command, udp_echo_server},
 };
 use tempfile::TempDir;
 use tokio::{net::UdpSocket, time::timeout};
@@ -118,6 +118,23 @@ async fn e2e_route_name_udp_reaches_the_remote_by_name() {
     let mut back = [0; 64];
     let n = timeout(WITHIN, app.recv(&mut back)).await.expect("the echo comes back").unwrap();
     assert_eq!(&back[..n], b"by name");
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and the host's systemd-resolved; CI runs it under sudo"]
+async fn e2e_route_name_ping_gets_echo_replies() {
+    if !root() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let route = route_names(&dir).await;
+
+    let fake = getent("ahostsv4", "wiki.corp.example").expect("wiki.corp.example resolves");
+    assert!(fake.len() == 1 && is_fake(&fake[0]), "{fake:?}");
+    // The relay opens the echo flow by name, which the remote's /etc/hosts sends to 127.0.0.1: the
+    // remote, this machine, pings itself.
+    assert!(ping(fake[0], WITHIN).await.unwrap(), "no echo reply from {}", fake[0]);
     stop(route).await;
 }
 

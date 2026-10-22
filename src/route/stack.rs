@@ -5,8 +5,9 @@
 //! the relay dials, so the app sees the remote's answer rather than ours: a dial that succeeds
 //! replays the SYN into a fresh listening socket, a refused one becomes an RST, an unreachable host
 //! ICMP host unreachable, and a timed-out one silence (the app's own timeout fires). UDP to the DNS
-//! address goes to [`Dns`], other routed UDP to its flow through the relay (`route::datagrams`),
-//! and unrouted UDP and ICMP get ICMP administratively prohibited. smoltcp only ever sees TCP.
+//! address goes to [`Dns`], other routed UDP and echo requests to their flows through the relay
+//! (`route::datagrams`), and unrouted UDP and every other ICMP query get ICMP administratively
+//! prohibited. smoltcp only ever sees TCP.
 //!
 //! One task runs it all from one `poll_fn`: the device's packets, the dials, DNS answers and flow
 //! opens in flight, the flows' replies, smoltcp's timer and the flows' idle timer, and every
@@ -33,7 +34,9 @@ use smoltcp::{
     phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::tcp::{self, State},
     time::Instant as SmolInstant,
-    wire::{HardwareAddress, IPV6_HEADER_LEN, IpAddress, IpCidr, IpListenEndpoint, IpProtocol, IpRepr, Ipv4Packet, Ipv6Packet, TcpPacket, UDP_HEADER_LEN, UdpPacket, UdpRepr, checksum},
+    wire::{
+        HardwareAddress, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpCidr, IpListenEndpoint, IpProtocol, IpRepr, Ipv4Packet, Ipv6Packet, TcpPacket, UDP_HEADER_LEN, UdpPacket, UdpRepr, checksum,
+    },
 };
 use sshunnel_mux::{OpenError, Traffic, frame::OpenErrKind};
 use tokio::{
@@ -46,7 +49,11 @@ use tracing::debug;
 
 use crate::{
     base::{Res, Void},
-    route::{DNS_ADDR, FAKE_RANGE, MTU, TUN_ADDR, TUN_ADDR6, datagrams::Datagrams, router::Router},
+    route::{
+        DNS_ADDR, FAKE_RANGE, MTU, TUN_ADDR, TUN_ADDR6,
+        datagrams::{Datagrams, echo_id},
+        router::Router,
+    },
     tunnel::{Conn as _, Tunnel},
 };
 
@@ -196,8 +203,8 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         Poll::Pending
     }
 
-    /// Sends a packet where it belongs: smoltcp, a held SYN, the DNS server, a flow, or an ICMP
-    /// refusal.
+    /// Sends a packet where it belongs: smoltcp, a held SYN, the DNS server, a flow (of UDP or of
+    /// echoes), or an ICMP refusal.
     fn classify(&mut self, packet: Bytes) {
         let Some(ip) = Ip::parse(&packet) else { return };
         // Router solicitations, MLD reports and broadcasts (the device subnet's included) aren't
@@ -209,6 +216,7 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
             IpProtocol::Tcp => self.tcp(packet, &ip),
             IpProtocol::Udp if ip.dst == IpAddr::V4(DNS_ADDR) && UdpPacket::new_checked(ip.payload(&packet)).is_ok_and(|udp| udp.dst_port() == DNS_PORT) => self.query(&packet, &ip),
             IpProtocol::Udp => self.engine.send_opt(self.datagrams.udp(packet, &ip)),
+            IpProtocol::Icmp | IpProtocol::Icmpv6 if echo_id(&packet, &ip).is_some() => self.engine.send_opt(self.datagrams.echo(packet, &ip)),
             // Never an ICMP error about an ICMP error (RFC 1122).
             IpProtocol::Icmp | IpProtocol::Icmpv6 if ip.payload(&packet).first().is_some_and(|kind| is_icmp_error(ip.proto, *kind)) => {}
             _ => self.engine.send_opt(icmp_error(&packet, &ip, Refusal::Prohibited)),
@@ -451,20 +459,33 @@ impl Ip {
 /// An ICMP error from `packet`'s destination back to its source, quoting as much of it as fits.
 pub(crate) fn icmp_error(packet: &[u8], ip: &Ip, refusal: Refusal) -> Option<Bytes> {
     let v4 = ip.src.is_ipv4();
-    let (proto, max) = if v4 { (IpProtocol::Icmp, ICMP4_MAX) } else { (IpProtocol::Icmpv6, ICMP6_MAX) };
-    let (from, to) = (IpAddress::from(ip.dst), IpAddress::from(ip.src));
-    if from.version() != to.version() {
+    let (header_len, max) = if v4 { (IPV4_HEADER_LEN, ICMP4_MAX) } else { (IPV6_HEADER_LEN, ICMP6_MAX) };
+    let quoted = packet.get(..ip.end.min(max - header_len - 8))?;
+    icmp_packet(ip.dst, ip.src, 8 + quoted.len(), |icmp| {
+        (icmp[0], icmp[1]) = refusal.icmp(v4);
+        icmp[8..].copy_from_slice(quoted);
+    })
+}
+
+/// An ICMP message of `len` bytes from `from` to `to`, in their family's ICMP. `fill` writes
+/// everything but the checksum, which stays zero for this to fill in after (over the pseudo-header
+/// for v6). `None` when the families differ or it won't fit the MTU.
+pub(crate) fn icmp_packet(from: IpAddr, to: IpAddr, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Bytes> {
+    let proto = match (from, to) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => IpProtocol::Icmp,
+        (IpAddr::V6(_), IpAddr::V6(_)) => IpProtocol::Icmpv6,
+        _ => return None,
+    };
+    let (from, to) = (IpAddress::from(from), IpAddress::from(to));
+    let ip = IpRepr::new(from, to, proto, len, HOP_LIMIT);
+    if len < 4 || ip.buffer_len() > usize::from(MTU) {
         return None;
     }
-    let header_len = IpRepr::new(from, to, proto, 0, HOP_LIMIT).header_len();
-    let quoted = packet.get(..ip.end.min(max - header_len - 8))?;
-    let reply = IpRepr::new(from, to, proto, 8 + quoted.len(), HOP_LIMIT);
-    let mut buf = vec![0; reply.buffer_len()];
-    reply.emit(&mut buf[..], &ChecksumCapabilities::default());
-    let icmp = buf.get_mut(header_len..)?;
-    (icmp[0], icmp[1]) = refusal.icmp(v4);
-    icmp[8..].copy_from_slice(quoted);
-    let sum = if v4 {
+    let mut buf = vec![0; ip.buffer_len()];
+    ip.emit(&mut buf[..], &ChecksumCapabilities::default());
+    let icmp = buf.get_mut(ip.header_len()..)?;
+    fill(icmp);
+    let sum = if proto == IpProtocol::Icmp {
         checksum::data(icmp)
     } else {
         let len = u32::try_from(icmp.len()).ok()?;

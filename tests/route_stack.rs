@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -19,7 +19,7 @@ use smoltcp::{
 use sshunnel::{
     flows::MAX_FLOWS,
     route::{
-        DNS_ADDR, TUN_ADDR,
+        DNS_ADDR, TUN_ADDR, TUN_ADDR6,
         names::{FakeMap, today},
         router::Router,
         stack::{self, Dns, MAX_HELD, MAX_QUERIES, Packets},
@@ -27,7 +27,10 @@ use sshunnel::{
     },
     tests::{AppStack, Connect, FakeTunnel, Icmp, Sent, echo_server, pattern, udp_echo_server, udp_stale_server, until},
 };
-use sshunnel_mux::{FlowKind, frame::OpenErrKind};
+use sshunnel_mux::{
+    FlowKind,
+    frame::{Capabilities, OpenErrKind},
+};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -495,15 +498,142 @@ async fn udp_an_open_finished_before_its_flow_was_evicted_is_dropped() {
     assert_eq!(rig.tunnel.live_flows(), 1);
 }
 
+fn addr(ip: &str) -> IpAddr {
+    ip.parse().unwrap()
+}
+
+fn echo_flow(host: &str) -> (FlowKind, String, u16) {
+    (FlowKind::Echo, host.to_owned(), 0)
+}
+
+/// The echo reply the app should get from `from` for its echo request with `id`, `seq` and
+/// `payload`: to the app's own address in `from`'s family.
+fn echo_reply(from: IpAddr, id: u16, seq: u16, payload: &'static [u8]) -> Sent {
+    let to = if from.is_ipv4() { IpAddr::V4(TUN_ADDR) } else { IpAddr::V6(TUN_ADDR6.addr()) };
+    Sent::Echo {
+        from,
+        to,
+        id,
+        seq,
+        payload: Bytes::from_static(payload),
+    }
+}
+
+/// The ICMP error (type and code) the stack answers one echo request to `to` with.
+async fn ping_refusal(app: &AppStack, to: &str) -> Option<(u8, u8)> {
+    app.ping(addr(to)).await.map(|i| (i.kind, i.code))
+}
+
 #[tokio::test]
-async fn icmp_to_a_routed_address_is_admin_prohibited() {
+async fn ping_to_a_routed_address_gets_echo_replies() {
+    let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
+    rig.tunnel.echo("10.99.0.5");
+    rig.tunnel.echo("fd99::5");
+
+    for to in [addr("10.99.0.5"), addr("fd99::5")] {
+        let reply = rig.app.echo(to, 0x1234, 7, b"anyone there?").await;
+        assert_eq!(reply, Some(echo_reply(to, 0x1234, 7, b"anyone there?")), "{to}");
+    }
+    assert_eq!(rig.tunnel.flows(), [echo_flow("10.99.0.5"), echo_flow("fd99::5")]);
+}
+
+#[tokio::test]
+async fn ping_to_a_fake_address_opens_an_echo_flow_by_name() {
+    let rig = rig(&["*.corp.example"]);
+    rig.tunnel.echo("wiki.corp.example");
+    let fake = IpAddr::V4(rig.router.names().address("wiki.corp.example", today()));
+
+    let reply = rig.app.echo(fake, 9, 1, b"by name").await;
+
+    assert_eq!(reply, Some(echo_reply(fake, 9, 1, b"by name")));
+    assert_eq!(rig.tunnel.flows(), [echo_flow("wiki.corp.example")]);
+}
+
+#[tokio::test]
+async fn pings_with_different_identifiers_are_different_flows() {
+    let rig = rig(&["10.99.0.0/16"]);
+    rig.tunnel.echo("10.99.0.5");
+    let to = addr("10.99.0.5");
+
+    // Two `ping` processes' requests, interleaved: each identifier is a flow of its own, and each
+    // reply goes back under its own identifier.
+    for (id, seq) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+        assert_eq!(rig.app.echo(to, id, seq, b"x").await, Some(echo_reply(to, id, seq, b"x")), "id {id}, seq {seq}");
+    }
+    assert_eq!(rig.tunnel.flows(), [echo_flow("10.99.0.5"), echo_flow("10.99.0.5")]);
+    assert_eq!(rig.tunnel.live_flows(), 2);
+}
+
+/// Review Focus 5: the flow's datagrams carry no family, so a relay that pings over the other one
+/// (a v6 address whose name has only an A record on the remote) still answers the app in its own.
+#[tokio::test]
+async fn an_echo_answered_over_the_other_family_replies_in_the_apps_family() {
+    let rig = rig(&["fd99::/64"]);
+    rig.tunnel.echo("fd99::5");
+    rig.tunnel.set_capabilities(Capabilities { ping4: true, ping6: false });
+    let to = addr("fd99::5");
+
+    // An ICMPv6 echo reply (type 129, its checksum over the v6 pseudo-header), with the app's id.
+    let reply = rig.app.echo(to, 0xbeef, 3, b"asked over v6").await;
+
+    assert_eq!(reply, Some(echo_reply(to, 0xbeef, 3, b"asked over v6")));
+}
+
+#[tokio::test]
+async fn ping_when_the_remote_cannot_is_admin_prohibited() {
+    let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
+    rig.tunnel.echo("10.99.0.5");
+    rig.tunnel.echo("fd99::5");
+    rig.tunnel.set_capabilities(Capabilities::default());
+
+    assert_eq!(ping_refusal(&rig.app, "10.99.0.5").await, Some((3, 13)));
+    assert_eq!(ping_refusal(&rig.app, "fd99::5").await, Some((1, 1)));
+    // Refused here, without asking the relay.
+    assert_eq!(rig.tunnel.flows(), []);
+}
+
+#[tokio::test]
+async fn an_echo_open_the_relay_refuses_is_admin_prohibited() {
+    let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
+    // As the relay refuses an echo to a family it can't ping over.
+    rig.tunnel.echo_reject("10.99.0.5", OpenErrKind::Other);
+    rig.tunnel.echo_reject("fd99::5", OpenErrKind::Refused);
+
+    assert_eq!(ping_refusal(&rig.app, "10.99.0.5").await, Some((3, 13)));
+    assert_eq!(ping_refusal(&rig.app, "fd99::5").await, Some((1, 1)));
+}
+
+#[tokio::test]
+async fn an_unreachable_echo_open_is_host_unreachable() {
+    let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
+    rig.tunnel.echo_reject("10.99.0.5", OpenErrKind::Unreachable);
+    rig.tunnel.echo_reject("fd99::5", OpenErrKind::Unreachable);
+
+    assert_eq!(ping_refusal(&rig.app, "10.99.0.5").await, Some((3, 1)));
+    assert_eq!(ping_refusal(&rig.app, "fd99::5").await, Some((1, 3)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_echo_open_is_silent() {
+    let rig = rig(&["10.99.0.0/16"]);
+    rig.tunnel.echo_reject("10.99.0.5", OpenErrKind::TimedOut);
+
+    assert_eq!(ping_refusal(&rig.app, "10.99.0.5").await, None);
+    assert_eq!(rig.tunnel.flows(), [echo_flow("10.99.0.5")]);
+    assert_eq!(rig.app.tap(), []);
+}
+
+#[tokio::test]
+async fn non_echo_icmp_to_a_routed_address_is_admin_prohibited() {
     let rig = rig(&["10.99.0.0/16", "fd99::/64"]);
 
-    let v4 = rig.app.ping("10.99.0.5".parse().unwrap()).await.map(|i| (i.kind, i.code));
-    let v6 = rig.app.ping("fd99::5".parse().unwrap()).await.map(|i| (i.kind, i.code));
+    // A timestamp request, and an ICMPv6 node information query.
+    let v4 = rig.app.icmp_query(addr("10.99.0.5"), 13).await.map(|i| (i.kind, i.code));
+    let v6 = rig.app.icmp_query(addr("fd99::5"), 139).await.map(|i| (i.kind, i.code));
 
     assert_eq!(v4, Some((3, 13)));
     assert_eq!(v6, Some((1, 1)));
+    assert_eq!(rig.tunnel.flows(), []);
 }
 
 #[tokio::test]

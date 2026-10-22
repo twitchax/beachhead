@@ -7,9 +7,8 @@
 A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 
 > **Status: milestone 2 done.** sshunnel forwards TCP ports (the way `ssh -L` does) and UDP
-> ports and, on Linux, routes TCP and UDP to subnets and domain names over a TUN device
-> (`sshunnel route`), through a relay it installs on the remote by itself. Ping through `route`
-> comes later.
+> ports and, on Linux, routes TCP, UDP and ping to subnets and domain names over a TUN device
+> (`sshunnel route`), through a relay it installs on the remote by itself.
 
 ## Why
 
@@ -111,12 +110,12 @@ sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
 sshunnel: routing 10.99.0.0/16, *.corp.example (except 10.99.7.0/24) through jump.corp.example on sshunnel0
 ```
 
-TCP and UDP to every address in a CIDR target, and to every name a domain pattern matches, now go
-through the relay, which dials them on the remote; everything else keeps the machine's normal routes
-and DNS. `*.corp.example` matches `corp.example` and every name under it, and `wiki.corp.example`
-matches that name only. The most specific target wins, and an exclude (`-x`) wins a tie. CIDR
-excludes carve CIDR targets and name excludes carve patterns; they never cross, so a pattern routes
-a name whatever address it has on the remote.
+TCP, UDP and ping to every address in a CIDR target, and to every name a domain pattern matches,
+now go through the relay, which dials them on the remote; everything else keeps the machine's
+normal routes and DNS. `*.corp.example` matches `corp.example` and every name under it, and
+`wiki.corp.example` matches that name only. The most specific target wins, and an exclude (`-x`)
+wins a tie. CIDR excludes carve CIDR targets and name excludes carve patterns; they never cross, so
+a pattern routes a name whatever address it has on the remote.
 
 Names resolve on the remote. The relay looks each one up with the remote's own resolver, and a name
 that exists there gets a stable fake address from `198.18.0.0/15`, remembered in
@@ -129,6 +128,14 @@ wait while the relay opens it, up to 32 of them or 64 KiB. Flows idle out as UDP
 a session holds at most 4096, closing the least recently used to open another. A closed port on the
 remote comes back as ICMP port unreachable, so a connected socket's next receive fails with
 `ECONNREFUSED`, as it would on the remote's own network.
+
+Ping works over IPv4 and IPv6. Each `ping` (its echo identifier) to an address is a flow, and the
+relay sends its echoes from an unprivileged ping socket on the remote, so a reply means the host
+answers on the remote's network. The reply comes back in the family `ping` used, whatever family the
+name resolves to on the remote. Unprivileged ping needs the remote's `net.ipv4.ping_group_range`
+(which covers IPv6 too) to include the relay's group, as systemd distributions set it; where it
+doesn't (many containers, Alpine), `route` warns once its routes are up, and ping through it gets
+ICMP administratively prohibited.
 
 Before ssh even starts, `route` refuses `0.0.0.0/0` and `::/0`, a bare `*`, a pattern no hostname
 can match (labels are ASCII letters, digits, `-` and `_`; an IDN goes in its `xn--` form), a target
@@ -246,9 +253,9 @@ in the [PRD log](.prds/PRD-0004.log.md).
 - There are no reverse (`-R`) forwards yet, and a dropped session isn't re-established.
 - A UDP forward has no ICMP to pass on: when the remote reports a closed port or an unreachable
   host, the flow just ends, and the local sender hears nothing.
-- `route` carries TCP and UDP; ICMP to a routed address (ping included, until it lands) gets ICMP
-  administratively prohibited, and so does UDP to an address nothing routes. One `route` runs at a
-  time.
+- `route` carries TCP, UDP and ping; any other ICMP to a routed address gets ICMP administratively
+  prohibited, and so do ping when the remote doesn't allow unprivileged ping and UDP to an address
+  nothing routes. One `route` runs at a time.
 - Apps that resolve names themselves bypass domain patterns: a browser using DNS over HTTPS never
   asks the system resolver. CIDR targets still catch their traffic.
 - Fake addresses only mean something while `route` runs. Answers carry a 5-second TTL, so a cached

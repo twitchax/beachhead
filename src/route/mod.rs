@@ -42,3 +42,5 @@ pub const TUN_ADDR6: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::new(0xfd73, 0x7368,
 pub const MTU: u16 = 65535;
 /// The routing protocol number tagging pinned host routes, so teardown finds exactly its own.
 pub const PIN_PROTO: u8 = 222;
+/// What `route` warns once its routes are up, when the relay may ping over neither family.
+pub const PING_WARNING: &str = "the remote doesn't allow unprivileged ping (net.ipv4.ping_group_range), so ping through the tunnel gets administratively prohibited";

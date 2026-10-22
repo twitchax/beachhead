@@ -14,14 +14,14 @@ use std::{
 use anyhow::{Context as _, bail};
 use bytes::Bytes;
 use sshunnel_mux::{
-    FlowEvent, FlowKind, OpenError, QueryError, ResolveError, Traffic,
+    FLOW_QUEUE, FlowEvent, FlowKind, OpenError, QueryError, ResolveError, Traffic,
     base::Res,
     frame::{Capabilities, FlowErrKind, OpenErrKind, ResolveErrKind, Transport},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, copy, copy_bidirectional, sink, split},
     net::{TcpStream, UdpSocket},
-    sync::{Notify, watch},
+    sync::{Notify, mpsc, watch},
 };
 
 use crate::tunnel::{Conn, Flow, FlowSender, Tunnel};
@@ -56,10 +56,25 @@ enum UdpDial {
     Hangup,
 }
 
+/// What an echo flow open of one host does.
+#[derive(Clone, Copy)]
+enum EchoDial {
+    /// Answers each datagram with itself, as the relay's ping socket answers each echo.
+    Echo,
+    /// Fails with this kind.
+    Reject(OpenErrKind),
+}
+
+/// What a relay that may ping over both families reports: the scripted default.
+const PING_BOTH: Capabilities = Capabilities { ping4: true, ping6: true };
+
 #[derive(Default)]
 struct Script {
     dials: HashMap<(String, u16), Dial>,
     udp: HashMap<(String, u16), UdpDial>,
+    echo: HashMap<String, EchoDial>,
+    /// What the relay says it can do; `None` is [`PING_BOTH`].
+    capabilities: Option<Capabilities>,
     names: HashMap<String, Result<(), ResolveErrKind>>,
     opens: Vec<(String, u16)>,
     flows: Vec<(FlowKind, String, u16)>,
@@ -68,7 +83,7 @@ struct Script {
 
 /// A tunnel whose opens and lookups follow a script, recording every target it is asked for. An
 /// unscripted open (of a connection or a flow) fails with [`OpenErrKind::Other`]; an unscripted
-/// name doesn't exist.
+/// name doesn't exist. Its relay may ping over both families until [`Self::set_capabilities`].
 #[derive(Clone, Default)]
 pub struct FakeTunnel {
     script: Arc<Mutex<Script>>,
@@ -158,6 +173,22 @@ impl FakeTunnel {
     /// a socket error it doesn't report.
     pub fn udp_hangup(&self, host: &str, port: u16) {
         self.script().udp.insert((host.to_owned(), port), UdpDial::Hangup);
+    }
+
+    /// Echo flows to `host` answer each datagram (a sequence number, then a payload) with itself, in
+    /// memory, as the relay answers each with its ping socket's reply.
+    pub fn echo(&self, host: &str) {
+        self.script().echo.insert(host.to_owned(), EchoDial::Echo);
+    }
+
+    /// Echo flow opens of `host` fail with `kind`.
+    pub fn echo_reject(&self, host: &str, kind: OpenErrKind) {
+        self.script().echo.insert(host.to_owned(), EchoDial::Reject(kind));
+    }
+
+    /// What the relay says it can do from now on, as its `Hello` would.
+    pub fn set_capabilities(&self, caps: Capabilities) {
+        self.script().capabilities = Some(caps);
     }
 
     /// Lookups of `name` answer `answer`.
@@ -287,11 +318,20 @@ impl Tunnel for FakeTunnel {
     }
 
     fn open_echo(&self, host: &str) -> impl Future<Output = Result<FakeFlow, OpenError>> + Send {
-        self.script().flows.push((FlowKind::Echo, host.to_owned(), 0));
-        std::future::ready(Err(OpenError {
-            kind: OpenErrKind::Other,
-            reason: format!("nothing scripted for echo {host}"),
-        }))
+        let dial = {
+            let mut script = self.script();
+            script.flows.push((FlowKind::Echo, host.to_owned(), 0));
+            script.echo.get(host).copied()
+        };
+        let fail = |kind, reason: String| OpenError { kind, reason };
+        std::future::ready(match dial {
+            None => Err(fail(OpenErrKind::Other, format!("nothing scripted for echo {host}"))),
+            Some(EchoDial::Reject(kind)) => Err(fail(kind, format!("opening echo {host}: scripted {kind:?}"))),
+            Some(EchoDial::Echo) => {
+                self.opened.fetch_add(1, Ordering::SeqCst);
+                Ok(FakeFlow::echo(&self.live))
+            }
+        })
     }
 
     fn query(&self, _message: Bytes, _transport: Transport) -> impl Future<Output = Result<Bytes, QueryError>> + Send {
@@ -299,7 +339,7 @@ impl Tunnel for FakeTunnel {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        self.script().capabilities.unwrap_or(PING_BOTH)
     }
 }
 
@@ -307,8 +347,18 @@ impl Tunnel for FakeTunnel {
 pub enum FakeFlow {
     /// A local UDP socket connected to the scripted address.
     Udp(FakeUdp),
+    /// An echo flow answering each datagram with itself.
+    Echo(FakeEcho),
     /// A flow the relay ended at once: it delivers nothing and takes nothing.
     Ended(FakeEnded),
+}
+
+/// A [`FakeFlow::Echo`]: what its senders send comes back from `recv`, through a queue as bounded as
+/// a mux flow's.
+pub struct FakeEcho {
+    sender: mpsc::Sender<Bytes>,
+    echoed: mpsc::Receiver<Bytes>,
+    _live: Live,
 }
 
 /// A [`FakeFlow::Ended`].
@@ -377,6 +427,11 @@ impl FakeFlow {
             _live: Live::new(live),
         }))
     }
+
+    fn echo(live: &Arc<AtomicUsize>) -> Self {
+        let (sender, echoed) = mpsc::channel(FLOW_QUEUE);
+        Self::Echo(FakeEcho { sender, echoed, _live: Live::new(live) })
+    }
 }
 
 impl Flow for FakeFlow {
@@ -384,13 +439,18 @@ impl Flow for FakeFlow {
 
     fn sender(&self) -> FakeSender {
         match self {
-            Self::Udp(udp) => FakeSender(Arc::downgrade(&udp.link)),
-            Self::Ended(_) => FakeSender(Weak::new()),
+            Self::Udp(udp) => FakeSender(Link::Udp(Arc::downgrade(&udp.link))),
+            Self::Echo(echo) => FakeSender(Link::Echo(echo.sender.clone())),
+            Self::Ended(_) => FakeSender(Link::Udp(Weak::new())),
         }
     }
 
     async fn recv(&mut self) -> Option<FlowEvent> {
-        let Self::Udp(udp) = self else { return None };
+        let udp = match self {
+            Self::Udp(udp) => udp,
+            Self::Echo(echo) => return echo.echoed.recv().await.map(FlowEvent::Datagram),
+            Self::Ended(_) => return None,
+        };
         loop {
             if udp.ended {
                 return None;
@@ -417,11 +477,24 @@ impl Flow for FakeFlow {
 
 /// A [`FakeFlow`]'s sending half; it sends nothing once its flow has dropped.
 #[derive(Clone)]
-pub struct FakeSender(Weak<UdpLink>);
+pub struct FakeSender(Link);
+
+/// Where a [`FakeSender`] sends.
+#[derive(Clone)]
+enum Link {
+    /// A UDP flow's socket, while the flow lasts.
+    Udp(Weak<UdpLink>),
+    /// An echo flow's queue, which closes as the flow drops.
+    Echo(mpsc::Sender<Bytes>),
+}
 
 impl FlowSender for FakeSender {
     fn try_send(&self, datagram: Bytes) -> bool {
-        let Some(link) = self.0.upgrade() else { return false };
+        let link = match &self.0 {
+            Link::Udp(link) => link,
+            Link::Echo(sender) => return sender.try_send(datagram).is_ok(),
+        };
+        let Some(link) = link.upgrade() else { return false };
         match link.sending.send(&datagram) {
             Ok(_) => true,
             Err(e) => {
