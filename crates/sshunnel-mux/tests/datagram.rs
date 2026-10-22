@@ -15,7 +15,7 @@ use common::{CHUNK, HandPeer, SOCK_CAP, WINDOW, client_with_hand_peer, client_wi
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
     FLOW_QUEUE, Flow, FlowEvent, FlowKind, Incoming, Mux, QueryError, Request,
-    frame::{FlowErrKind, Frame, OpenErrKind, StreamId, Transport},
+    frame::{FlowErrKind, Frame, MAX_HOST, MAX_PAYLOAD, MAX_QUERY, OpenErrKind, StreamId, Transport},
     pump,
 };
 use tokio::{
@@ -414,4 +414,83 @@ async fn a_dropped_flow_request_rejects_the_open() {
     });
     let err = client.open_udp("h", 53).await.unwrap_err();
     assert_eq!(err.kind, OpenErrKind::Other);
+}
+
+/// Answers each query with its message, or with one byte over the frame limit for `b"big"`.
+fn answer_queries(mut relay: Incoming) {
+    tokio::spawn(async move {
+        while let Some(request) = relay.next().await {
+            let Request::Query(query) = request else { panic!("expected a query") };
+            let answer = match &query.message()[..] {
+                b"big" => Bytes::from(vec![0; MAX_PAYLOAD + 1]),
+                message => Bytes::copy_from_slice(message),
+            };
+            query.answer(Ok(answer));
+        }
+    });
+}
+
+#[tokio::test]
+async fn a_datagram_over_the_payload_limit_is_refused_and_the_connection_lives_on() {
+    let (client, mut relay) = pair(small(), small());
+    let (near, mut far) = open_flow(&client, &mut relay).await;
+    let sender = near.sender();
+
+    assert!(!sender.try_send(Bytes::from(vec![0; MAX_PAYLOAD + 1])));
+    assert!(sender.try_send(datagram(1, 0)));
+    assert_eq!(timeout(WAIT, far.recv()).await.unwrap(), Some(FlowEvent::Datagram(datagram(1, 0))));
+}
+
+#[tokio::test]
+async fn a_query_over_the_limit_is_refused_before_it_is_sent() {
+    let (client, relay) = pair(small(), small());
+    answer_queries(relay);
+
+    let err = client.query(Bytes::from(vec![0; MAX_QUERY + 1]), Transport::Udp).await.unwrap_err();
+    assert!(err.reason.contains("limit"), "{err}");
+    assert_eq!(client.query(Bytes::from_static(b"q"), Transport::Udp).await.unwrap(), Bytes::from_static(b"q"));
+}
+
+#[tokio::test]
+async fn an_answer_over_the_limit_goes_as_a_query_error_and_the_connection_lives_on() {
+    let (client, relay) = pair(small(), small());
+    answer_queries(relay);
+
+    let err = client.query(Bytes::from_static(b"big"), Transport::Udp).await.unwrap_err();
+    assert!(err.reason.contains("limit"), "{err}");
+    assert_eq!(client.query(Bytes::from_static(b"q"), Transport::Tcp).await.unwrap(), Bytes::from_static(b"q"));
+}
+
+#[tokio::test]
+async fn a_flow_open_with_a_host_over_the_limit_is_refused_before_it_is_sent() {
+    let (client, mut relay) = pair(small(), small());
+    let long = "a".repeat(MAX_HOST + 1);
+
+    assert_eq!(client.open_udp(&long, 53).await.unwrap_err().kind, OpenErrKind::Other);
+    assert_eq!(client.open_echo(&long).await.unwrap_err().kind, OpenErrKind::Other);
+    // Nothing went out for either: the relay's first request is the next open.
+    let opener = {
+        let client = client.clone();
+        tokio::spawn(async move { client.open_udp("h", 53).await })
+    };
+    let Some(Request::OpenFlow(request)) = timeout(WAIT, relay.next()).await.unwrap() else {
+        panic!("expected a flow request")
+    };
+    assert_eq!(request.host(), "h");
+    let _far = request.accept();
+    opener.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_of_a_pending_query_fails_it() {
+    let (client, _incoming, mut peer) = client_with_hand_peer();
+    let query = {
+        let client = client.clone();
+        tokio::spawn(async move { client.query(Bytes::from_static(b"q"), Transport::Udp).await })
+    };
+    let Frame::Query { stream, .. } = peer.next().await else { panic!("expected Query") };
+    peer.send(Frame::Rst { stream, reason: "bad id".into() }).await;
+
+    let err = timeout(WAIT, query).await.expect("the reset fails the query").unwrap().unwrap_err();
+    assert_eq!(err, QueryError { reason: "bad id".into() });
 }
