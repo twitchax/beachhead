@@ -10,7 +10,7 @@ use bytes::BytesMut;
 use sshunnel_mux::{
     Config, Incoming, OpenRequest, Request, ResolveError, ResolveRequest, Role,
     base::Void,
-    frame::{MAX_HOST, OpenErrKind, ResolveErrKind},
+    frame::{Capabilities, MAX_HOST, OpenErrKind, ResolveErrKind},
     hello::{recv_hello, send_hello},
     pump, start,
 };
@@ -38,10 +38,10 @@ pub fn run_stdio() -> Void {
         let mut stdout = tokio::io::stdout();
         let config = Config::default();
         // The relay speaks first: the client stays quiet until this Hello arrives.
-        send_hello(&mut stdout, config.window()).await?;
+        send_hello(&mut stdout, config.window(), Capabilities::default()).await?;
         let mut buf = BytesMut::new();
-        let client_window = recv_hello(&mut stdin, &mut buf).await?;
-        let (_mux, incoming, driver) = start(stdin, buf, stdout, Role::Relay, config, client_window);
+        let client = recv_hello(&mut stdin, &mut buf).await?;
+        let (_mux, incoming, driver) = start(stdin, buf, stdout, Role::Relay, config, client);
         tokio::spawn(serve(incoming));
         driver.await
     });

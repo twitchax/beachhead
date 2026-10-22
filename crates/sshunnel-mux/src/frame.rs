@@ -19,7 +19,7 @@ pub const MAX_REASON: usize = 1024;
 /// The first bytes of every `Hello`.
 pub const MAGIC: [u8; 4] = *b"SSHN";
 /// The protocol version both ends must agree on.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// Why a dial failed, as one wire byte ahead of the `OpenErr` reason. The discriminants are the wire
 /// values.
@@ -72,6 +72,95 @@ impl TryFrom<u8> for ResolveErrKind {
     }
 }
 
+/// What the relay can do beyond the basics, as one byte in its `Hello`. Bits this side does not know
+/// are ignored, so a newer relay may announce more without breaking an older client.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Bit 0: the relay can ping over IPv4.
+    pub ping4: bool,
+    /// Bit 1: the relay can ping over IPv6.
+    pub ping6: bool,
+}
+
+impl Capabilities {
+    const PING4: u8 = 0b01;
+    const PING6: u8 = 0b10;
+
+    /// The wire byte.
+    #[must_use]
+    pub fn to_byte(self) -> u8 {
+        (if self.ping4 { Self::PING4 } else { 0 }) | (if self.ping6 { Self::PING6 } else { 0 })
+    }
+
+    /// Reads the wire byte, ignoring bits this side does not know.
+    #[must_use]
+    pub fn from_byte(byte: u8) -> Self {
+        Self {
+            ping4: byte & Self::PING4 != 0,
+            ping6: byte & Self::PING6 != 0,
+        }
+    }
+}
+
+/// What a connected socket reported on a live flow, as the one wire byte of a `FlowErr`. The
+/// discriminants are the wire values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FlowErrKind {
+    /// `ECONNREFUSED`: the far host answered a datagram with port unreachable.
+    PortUnreachable = 0,
+    /// `EHOSTUNREACH`.
+    HostUnreachable = 1,
+    /// `ENETUNREACH`.
+    NetUnreachable = 2,
+}
+
+impl FlowErrKind {
+    /// The flow error a socket error stands for, or `None` for any other error.
+    #[must_use]
+    pub fn from_io(e: &std::io::Error) -> Option<Self> {
+        match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => Some(Self::PortUnreachable),
+            std::io::ErrorKind::HostUnreachable => Some(Self::HostUnreachable),
+            std::io::ErrorKind::NetworkUnreachable => Some(Self::NetUnreachable),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<u8> for FlowErrKind {
+    type Error = crate::base::Err;
+
+    fn try_from(byte: u8) -> Res<Self> {
+        Ok(match byte {
+            0 => Self::PortUnreachable,
+            1 => Self::HostUnreachable,
+            2 => Self::NetUnreachable,
+            other => bail!("unknown FlowErr kind {other}"),
+        })
+    }
+}
+
+/// The transport a `Query` was asked over, as one wire byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Transport {
+    Udp = 0,
+    Tcp = 1,
+}
+
+impl TryFrom<u8> for Transport {
+    type Error = crate::base::Err;
+
+    fn try_from(byte: u8) -> Res<Self> {
+        Ok(match byte {
+            0 => Self::Udp,
+            1 => Self::Tcp,
+            other => bail!("unknown Query transport {other}"),
+        })
+    }
+}
+
 /// A stream's id. The opener allocates them monotonically and never reuses one, so a late frame for
 /// a finished stream can be ignored. Id 0 is the connection itself (`Hello`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -92,8 +181,9 @@ impl std::fmt::Display for StreamId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     /// The first frame in each direction, on [`StreamId::CONNECTION`]: the protocol version, and
-    /// the sender's receive window, the most it lets the peer have in flight on one stream.
-    Hello { version: u16, window: u32 },
+    /// the sender's receive window, the most it lets the peer have in flight on one stream, and
+    /// what the sender can do (the relay's, in practice).
+    Hello { version: u16, window: u32, capabilities: Capabilities },
     /// Ask the peer to dial `host:port` for a new stream.
     Open { stream: StreamId, host: String, port: u16 },
     /// The peer dialed; data may flow.
@@ -114,6 +204,21 @@ pub enum Frame {
     Fin { stream: StreamId },
     /// Abort the stream in both directions.
     Rst { stream: StreamId, reason: String },
+    /// Ask the peer to open a UDP flow to `host:port`. Answered like `Open`.
+    OpenUdp { stream: StreamId, host: String, port: u16 },
+    /// Ask the peer to open an ICMP echo flow to `host`. Answered like `Open`.
+    OpenEcho { stream: StreamId, host: String },
+    /// One datagram on a flow, at most [`MAX_PAYLOAD`]; outside credit, and dropped when the
+    /// receiving flow's queue is full.
+    Datagram { stream: StreamId, data: Bytes },
+    /// A socket error on a live flow; the flow stays open.
+    FlowErr { stream: StreamId, kind: FlowErrKind },
+    /// One raw DNS message for the peer's resolvers, asked over `transport`. Rides a fresh stream id.
+    Query { stream: StreamId, transport: Transport, message: Bytes },
+    /// The raw DNS message that answers a `Query`.
+    Answer { stream: StreamId, message: Bytes },
+    /// A `Query` that got no answer.
+    QueryErr { stream: StreamId, reason: String },
 }
 
 impl Frame {
@@ -132,6 +237,13 @@ impl Frame {
             Self::Window { .. } => "Window",
             Self::Fin { .. } => "Fin",
             Self::Rst { .. } => "Rst",
+            Self::OpenUdp { .. } => "OpenUdp",
+            Self::OpenEcho { .. } => "OpenEcho",
+            Self::Datagram { .. } => "Datagram",
+            Self::FlowErr { .. } => "FlowErr",
+            Self::Query { .. } => "Query",
+            Self::Answer { .. } => "Answer",
+            Self::QueryErr { .. } => "QueryErr",
         }
     }
 
@@ -179,6 +291,9 @@ impl Frame {
         };
 
         Ok(match kind {
+            Kind::OpenUdp | Kind::OpenEcho | Kind::Datagram | Kind::FlowErr | Kind::Query | Kind::Answer | Kind::QueryErr => {
+                return Self::parse_v4(stream, kind, payload);
+            }
             Kind::Hello => {
                 if payload.len() < 6 || payload[..4] != MAGIC {
                     bail!("bad Hello magic {:?}", &payload[..payload.len().min(4)]);
@@ -187,24 +302,21 @@ impl Frame {
                 if version != VERSION {
                     // Another version may lay out the rest differently: report the version alone,
                     // and let the handshake refuse it by name rather than trip on the layout.
-                    return Ok(Self::Hello { version, window: 0 });
+                    return Ok(Self::Hello {
+                        version,
+                        window: 0,
+                        capabilities: Capabilities::default(),
+                    });
                 }
-                fixed(10)?;
+                fixed(11)?;
                 Self::Hello {
                     version,
                     window: u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]]),
+                    capabilities: Capabilities::from_byte(payload[10]),
                 }
             }
             Kind::Open => {
-                if payload.len() < 2 {
-                    bail!("Open payload is {} bytes, too short for a port", payload.len());
-                }
-                let port = payload.get_u16_at(0);
-                payload.advance(2);
-                if payload.len() > MAX_HOST {
-                    bail!("Open host is {} bytes, over the {MAX_HOST}-byte limit", payload.len());
-                }
-                let host = std::str::from_utf8(&payload).map_err(|e| anyhow!("Open host is not UTF-8: {e}"))?.to_owned();
+                let (host, port) = split_host_port(kind, &mut payload)?;
                 Self::Open { stream, host, port }
             }
             Kind::OpenOk => {
@@ -257,18 +369,63 @@ impl Frame {
         })
     }
 
+    /// The kinds protocol v4 added, apart from [`Self::parse`] to keep each readable.
+    fn parse_v4(stream: StreamId, kind: Kind, mut payload: Bytes) -> Res<Self> {
+        Ok(match kind {
+            Kind::OpenUdp => {
+                let (host, port) = split_host_port(kind, &mut payload)?;
+                Self::OpenUdp { stream, host, port }
+            }
+            Kind::OpenEcho => {
+                if payload.len() > MAX_HOST {
+                    bail!("OpenEcho host is {} bytes, over the {MAX_HOST}-byte limit", payload.len());
+                }
+                let host = std::str::from_utf8(&payload).map_err(|e| anyhow!("OpenEcho host is not UTF-8: {e}"))?.to_owned();
+                Self::OpenEcho { stream, host }
+            }
+            Kind::Datagram => Self::Datagram { stream, data: payload },
+            Kind::FlowErr => {
+                if payload.len() != 1 {
+                    bail!("FlowErr payload is {} bytes, expected 1", payload.len());
+                }
+                Self::FlowErr {
+                    stream,
+                    kind: FlowErrKind::try_from(payload[0])?,
+                }
+            }
+            Kind::Query => {
+                let Some(&transport) = payload.first() else {
+                    bail!("Query payload is empty, expected a transport byte");
+                };
+                payload.advance(1);
+                Self::Query {
+                    stream,
+                    transport: Transport::try_from(transport)?,
+                    message: payload,
+                }
+            }
+            Kind::Answer => Self::Answer { stream, message: payload },
+            Kind::QueryErr => Self::QueryErr {
+                stream,
+                reason: String::from_utf8_lossy(&payload).into_owned(),
+            },
+            other => bail!("{other:?} is not a v4 kind"),
+        })
+    }
+
     /// Appends this frame's encoding to `buf`.
     ///
     /// # Errors
     ///
-    /// Fails when a `Data` payload or an `Open` host exceeds its limit.
+    /// Fails when a `Data`, `Datagram`, `Answer` or `Query` payload or an `Open` host exceeds its limit.
     pub fn encode(&self, buf: &mut BytesMut) -> Void {
         match self {
-            Self::Hello { version, window } => {
-                put_header(buf, StreamId::CONNECTION, Kind::Hello, 10);
+            Self::Hello { version, window, capabilities } => {
+                put_header(buf, StreamId::CONNECTION, Kind::Hello, 11);
                 buf.put_slice(&MAGIC);
                 buf.put_u16(*version);
                 buf.put_u32(*window);
+                buf.put_u8(capabilities.to_byte());
             }
             Self::Open { stream, host, port } => {
                 if host.len() > MAX_HOST {
@@ -302,6 +459,48 @@ impl Frame {
             }
             Self::Fin { stream } => put_header(buf, *stream, Kind::Fin, 0),
             Self::Rst { stream, reason } => put_reason(buf, *stream, Kind::Rst, None, reason),
+            Self::OpenUdp { stream, host, port } => {
+                if host.len() > MAX_HOST {
+                    bail!("OpenUdp host is {} bytes, over the {MAX_HOST}-byte limit", host.len());
+                }
+                put_header(buf, *stream, Kind::OpenUdp, 2 + host.len());
+                buf.put_u16(*port);
+                buf.put_slice(host.as_bytes());
+            }
+            Self::OpenEcho { stream, host } => {
+                if host.len() > MAX_HOST {
+                    bail!("OpenEcho host is {} bytes, over the {MAX_HOST}-byte limit", host.len());
+                }
+                put_header(buf, *stream, Kind::OpenEcho, host.len());
+                buf.put_slice(host.as_bytes());
+            }
+            Self::Datagram { stream, data } => {
+                if data.len() > MAX_PAYLOAD {
+                    bail!("Datagram payload is {} bytes, over the {MAX_PAYLOAD}-byte limit", data.len());
+                }
+                put_header(buf, *stream, Kind::Datagram, data.len());
+                buf.put_slice(data);
+            }
+            Self::FlowErr { stream, kind } => {
+                put_header(buf, *stream, Kind::FlowErr, 1);
+                buf.put_u8(*kind as u8);
+            }
+            Self::Query { stream, transport, message } => {
+                if message.len() > MAX_PAYLOAD - 1 {
+                    bail!("Query message is {} bytes, over the {}-byte limit", message.len(), MAX_PAYLOAD - 1);
+                }
+                put_header(buf, *stream, Kind::Query, 1 + message.len());
+                buf.put_u8(*transport as u8);
+                buf.put_slice(message);
+            }
+            Self::Answer { stream, message } => {
+                if message.len() > MAX_PAYLOAD {
+                    bail!("Answer message is {} bytes, over the {MAX_PAYLOAD}-byte limit", message.len());
+                }
+                put_header(buf, *stream, Kind::Answer, message.len());
+                buf.put_slice(message);
+            }
+            Self::QueryErr { stream, reason } => put_reason(buf, *stream, Kind::QueryErr, None, reason),
         }
         Ok(())
     }
@@ -322,6 +521,13 @@ enum Kind {
     Resolve = 8,
     Resolved = 9,
     ResolveErr = 10,
+    OpenUdp = 11,
+    OpenEcho = 12,
+    Datagram = 13,
+    FlowErr = 14,
+    Query = 15,
+    Answer = 16,
+    QueryErr = 17,
 }
 
 impl TryFrom<u8> for Kind {
@@ -340,6 +546,13 @@ impl TryFrom<u8> for Kind {
             8 => Self::Resolve,
             9 => Self::Resolved,
             10 => Self::ResolveErr,
+            11 => Self::OpenUdp,
+            12 => Self::OpenEcho,
+            13 => Self::Datagram,
+            14 => Self::FlowErr,
+            15 => Self::Query,
+            16 => Self::Answer,
+            17 => Self::QueryErr,
             other => bail!("unknown frame kind {other}"),
         })
     }
@@ -373,6 +586,20 @@ fn split_kind(frame: Kind, payload: &[u8]) -> Res<(u8, String)> {
         bail!("{frame:?} payload is empty, expected a kind byte");
     };
     Ok((kind, String::from_utf8_lossy(reason).into_owned()))
+}
+
+/// Splits an `Open`-shaped payload (`port(2) host`) into its host and port, checking the host.
+fn split_host_port(frame: Kind, payload: &mut Bytes) -> Res<(String, u16)> {
+    if payload.len() < 2 {
+        bail!("{frame:?} payload is {} bytes, too short for a port", payload.len());
+    }
+    let port = payload.get_u16_at(0);
+    payload.advance(2);
+    if payload.len() > MAX_HOST {
+        bail!("{frame:?} host is {} bytes, over the {MAX_HOST}-byte limit", payload.len());
+    }
+    let host = std::str::from_utf8(payload).map_err(|e| anyhow!("{frame:?} host is not UTF-8: {e}"))?.to_owned();
+    Ok((host, port))
 }
 
 /// Big-endian reads at an offset, for payloads whose length was already checked.
@@ -410,7 +637,11 @@ mod unit {
     fn every_kind() -> Vec<Frame> {
         let s = StreamId(7);
         vec![
-            Frame::Hello { version: VERSION, window: 1 << 20 },
+            Frame::Hello {
+                version: VERSION,
+                window: 1 << 20,
+                capabilities: Capabilities { ping4: true, ping6: false },
+            },
             Frame::Open {
                 stream: s,
                 host: "server.lan".into(),
@@ -439,6 +670,30 @@ mod unit {
                 stream: s,
                 reason: "reset by peer".into(),
             },
+            Frame::OpenUdp {
+                stream: s,
+                host: "dns.corp.example".into(),
+                port: 53,
+            },
+            Frame::OpenEcho { stream: s, host: "192.0.2.1".into() },
+            Frame::Datagram {
+                stream: s,
+                data: Bytes::from_static(b"ping"),
+            },
+            Frame::FlowErr {
+                stream: s,
+                kind: FlowErrKind::PortUnreachable,
+            },
+            Frame::Query {
+                stream: s,
+                transport: Transport::Tcp,
+                message: Bytes::from_static(b"\x12\x34"),
+            },
+            Frame::Answer {
+                stream: s,
+                message: Bytes::from_static(b"\x12\x34\x81\x80"),
+            },
+            Frame::QueryErr { stream: s, reason: "timed out".into() },
         ]
     }
 
@@ -529,8 +784,12 @@ mod unit {
         let window = encoded(&Frame::Window { stream: StreamId(7), credit: 0x0102_0304 });
         assert_eq!(&window[..], &[0, 0, 0, 7, 5, 0, 0, 0, 4, 1, 2, 3, 4][..]);
 
-        let hello = encoded(&Frame::Hello { version: 1, window: 0x0010_0000 });
-        assert_eq!(&hello[..], &[0, 0, 0, 0, 0, 0, 0, 0, 10, b'S', b'S', b'H', b'N', 0, 1, 0, 0x10, 0, 0][..]);
+        let hello = encoded(&Frame::Hello {
+            version: 1,
+            window: 0x0010_0000,
+            capabilities: Capabilities::default(),
+        });
+        assert_eq!(&hello[..], &[0, 0, 0, 0, 0, 0, 0, 0, 11, b'S', b'S', b'H', b'N', 0, 1, 0, 0x10, 0, 0, 0][..]);
 
         let open = encoded(&Frame::Open {
             stream: StreamId(1),
@@ -588,15 +847,15 @@ mod unit {
 
     #[test]
     fn hello_with_bad_magic_is_rejected() {
-        let mut raw = header(0, 0, 10);
-        raw.extend_from_slice(b"SSH-\x00\x01\x00\x10\x00\x00");
+        let mut raw = header(0, 0, 11);
+        raw.extend_from_slice(b"SSH-\x00\x04\x00\x10\x00\x00\x00");
         assert!(Frame::decode(&mut BytesMut::from(&raw[..])).unwrap_err().to_string().contains("magic"));
     }
 
     #[test]
     fn hello_must_ride_the_connection_id_and_streams_must_not() {
-        let mut hello = header(5, 0, 10);
-        hello.extend_from_slice(b"SSHN\x00\x01\x00\x10\x00\x00");
+        let mut hello = header(5, 0, 11);
+        hello.extend_from_slice(b"SSHN\x00\x04\x00\x10\x00\x00\x00");
         assert!(Frame::decode(&mut BytesMut::from(&hello[..])).is_err());
 
         let fin_on_zero = header(0, 6, 0);
@@ -650,5 +909,145 @@ mod unit {
         };
         assert!(reason.len() <= MAX_REASON);
         assert!(reason.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn v4_frames_round_trip() {
+        let s = StreamId(9);
+        let mut frames = vec![
+            Frame::Hello {
+                version: VERSION,
+                window: 1024,
+                capabilities: Capabilities { ping4: true, ping6: true },
+            },
+            Frame::OpenUdp {
+                stream: s,
+                host: "fd99::1".into(),
+                port: 5353,
+            },
+            Frame::OpenEcho {
+                stream: s,
+                host: "wiki.corp.example".into(),
+            },
+            Frame::Datagram { stream: s, data: Bytes::new() },
+            Frame::Answer { stream: s, message: Bytes::new() },
+            Frame::QueryErr { stream: s, reason: String::new() },
+        ];
+        for kind in [FlowErrKind::PortUnreachable, FlowErrKind::HostUnreachable, FlowErrKind::NetUnreachable] {
+            frames.push(Frame::FlowErr { stream: s, kind });
+        }
+        for transport in [Transport::Udp, Transport::Tcp] {
+            frames.push(Frame::Query {
+                stream: s,
+                transport,
+                message: Bytes::from_static(b"q"),
+            });
+        }
+        for frame in frames {
+            let mut buf = encoded(&frame);
+            assert_eq!(Frame::decode(&mut buf).unwrap(), Some(frame));
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn v4_wire_layout_is_pinned() {
+        let s = StreamId(1);
+        let datagram = encoded(&Frame::Datagram {
+            stream: s,
+            data: Bytes::from_static(b"x"),
+        });
+        assert_eq!(&datagram[..], &[0, 0, 0, 1, 13, 0, 0, 0, 1, b'x'][..]);
+        let flow_err = encoded(&Frame::FlowErr {
+            stream: s,
+            kind: FlowErrKind::NetUnreachable,
+        });
+        assert_eq!(&flow_err[..], &[0, 0, 0, 1, 14, 0, 0, 0, 1, 2][..]);
+        let query = encoded(&Frame::Query {
+            stream: s,
+            transport: Transport::Tcp,
+            message: Bytes::from_static(b"q"),
+        });
+        assert_eq!(&query[..], &[0, 0, 0, 1, 15, 0, 0, 0, 2, 1, b'q'][..]);
+        let open_udp = encoded(&Frame::OpenUdp { stream: s, host: "h".into(), port: 53 });
+        assert_eq!(&open_udp[..], &[0, 0, 0, 1, 11, 0, 0, 0, 3, 0, 53, b'h'][..]);
+        let open_echo = encoded(&Frame::OpenEcho { stream: s, host: "h".into() });
+        assert_eq!(&open_echo[..], &[0, 0, 0, 1, 12, 0, 0, 0, 1, b'h'][..]);
+        let answer = encoded(&Frame::Answer {
+            stream: s,
+            message: Bytes::from_static(b"a"),
+        });
+        assert_eq!(&answer[..], &[0, 0, 0, 1, 16, 0, 0, 0, 1, b'a'][..]);
+        let query_err = encoded(&Frame::QueryErr { stream: s, reason: "x".into() });
+        assert_eq!(&query_err[..], &[0, 0, 0, 1, 17, 0, 0, 0, 1, b'x'][..]);
+        let hello = encoded(&Frame::Hello {
+            version: VERSION,
+            window: 1,
+            capabilities: Capabilities { ping4: false, ping6: true },
+        });
+        assert_eq!(&hello[..], &[0, 0, 0, 0, 0, 0, 0, 0, 11, b'S', b'S', b'H', b'N', 0, 4, 0, 0, 0, 1, 0b10][..]);
+    }
+
+    #[test]
+    fn a_query_message_fills_a_frame() {
+        let fits = Frame::Query {
+            stream: StreamId(1),
+            transport: Transport::Udp,
+            message: Bytes::from(vec![7; MAX_PAYLOAD - 1]),
+        };
+        let mut buf = encoded(&fits);
+        assert_eq!(Frame::decode(&mut buf).unwrap(), Some(fits));
+
+        let too_long = Frame::Query {
+            stream: StreamId(1),
+            transport: Transport::Udp,
+            message: Bytes::from(vec![7; MAX_PAYLOAD]),
+        };
+        assert!(too_long.encode(&mut BytesMut::new()).is_err());
+        // A decoded Query needs at least its transport byte.
+        assert!(Frame::decode(&mut BytesMut::from(&header(1, 15, 0)[..])).is_err());
+    }
+
+    #[test]
+    fn unknown_flow_err_kinds_and_transports_are_rejected() {
+        let flow_err = [header(1, 14, 1), vec![9]].concat();
+        assert!(Frame::decode(&mut BytesMut::from(&flow_err[..])).is_err());
+        let query = [header(1, 15, 2), vec![9, b'q']].concat();
+        assert!(Frame::decode(&mut BytesMut::from(&query[..])).is_err());
+    }
+
+    #[test]
+    fn capabilities_ignore_unknown_bits() {
+        assert_eq!(Capabilities::from_byte(0xFF), Capabilities { ping4: true, ping6: true });
+        assert_eq!(Capabilities::from_byte(0b100), Capabilities::default());
+        assert_eq!(Capabilities { ping4: true, ping6: false }.to_byte(), 0b01);
+    }
+
+    #[test]
+    fn flow_err_kinds_come_from_socket_errors() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(FlowErrKind::from_io(&Error::from(ErrorKind::ConnectionRefused)), Some(FlowErrKind::PortUnreachable));
+        assert_eq!(FlowErrKind::from_io(&Error::from(ErrorKind::HostUnreachable)), Some(FlowErrKind::HostUnreachable));
+        assert_eq!(FlowErrKind::from_io(&Error::from(ErrorKind::NetworkUnreachable)), Some(FlowErrKind::NetUnreachable));
+        assert_eq!(FlowErrKind::from_io(&Error::from(ErrorKind::PermissionDenied)), None);
+    }
+
+    #[test]
+    fn udp_and_echo_hosts_must_be_short_utf8() {
+        let long = Frame::OpenUdp {
+            stream: StreamId(1),
+            host: "a".repeat(MAX_HOST + 1),
+            port: 1,
+        };
+        assert!(long.encode(&mut BytesMut::new()).is_err());
+        let long = Frame::OpenEcho {
+            stream: StreamId(1),
+            host: "a".repeat(MAX_HOST + 1),
+        };
+        assert!(long.encode(&mut BytesMut::new()).is_err());
+        let bad_utf8 = [header(1, 11, 3), vec![0, 80, 0xFF]].concat();
+        assert!(Frame::decode(&mut BytesMut::from(&bad_utf8[..])).is_err());
+        let bad_utf8 = [header(1, 12, 1), vec![0xFF]].concat();
+        assert!(Frame::decode(&mut BytesMut::from(&bad_utf8[..])).is_err());
     }
 }

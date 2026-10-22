@@ -21,7 +21,8 @@ use tracing::debug;
 
 use crate::{
     base::{Res, Void},
-    frame::{Frame, HEADER_LEN, MAX_HOST, MAX_PAYLOAD, OpenErrKind, ResolveErrKind, StreamId},
+    frame::{Capabilities, Frame, HEADER_LEN, MAX_HOST, MAX_PAYLOAD, OpenErrKind, ResolveErrKind, StreamId},
+    hello::PeerHello,
     stream::{Inbound, State, Stream},
 };
 
@@ -170,6 +171,12 @@ pub struct Mux {
 }
 
 impl Mux {
+    /// What the peer announced it can do in its `Hello`.
+    #[must_use]
+    pub fn capabilities(&self) -> Capabilities {
+        self.shared.peer_capabilities
+    }
+
     /// Asks the peer to dial `host:port` and returns the stream once it has.
     ///
     /// # Errors
@@ -333,17 +340,18 @@ impl Drop for ResolveRequest {
 }
 
 /// Starts a connection over a pipe whose `Hello`s were already exchanged (see [`crate::hello`]).
-/// `buffered` holds bytes already read past the peer's `Hello`, and `peer_window` is the window it
-/// announced: every stream's starting credit, and the most the peer may ever return.
+/// `buffered` holds bytes already read past the peer's `Hello`, and `peer` is what it announced: its
+/// window is every stream's starting credit and the most the peer may ever return.
 ///
 /// Returns the opener, the peer's open requests, and the driver: the future that runs the reader
 /// and the writer. The caller spawns it; it resolves when the connection ends, after failing every
 /// open and live stream.
-pub fn start<R, W>(reader: R, buffered: BytesMut, writer: W, role: Role, config: Config, peer_window: u32) -> (Mux, Incoming, impl Future<Output = Void> + Send + 'static)
+pub fn start<R, W>(reader: R, buffered: BytesMut, writer: W, role: Role, config: Config, peer: PeerHello) -> (Mux, Incoming, impl Future<Output = Void> + Send + 'static)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let peer_window = peer.window;
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
     let (data_tx, data_rx) = mpsc::channel(DATA_QUEUE);
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -360,6 +368,7 @@ where
         data: data_tx,
         config,
         peer_window,
+        peer_capabilities: peer.capabilities,
         // Credit returns in half-window steps, so a chunk over half the peer's window could stall.
         send_chunk: config.chunk.min(peer_window as usize / 2).max(1),
         role,
@@ -392,6 +401,7 @@ pub(crate) struct Shared {
     pub(crate) config: Config,
     /// The window the peer announced: each stream's starting send credit.
     peer_window: u32,
+    peer_capabilities: Capabilities,
     /// The largest `Data` payload this side sends to this peer.
     pub(crate) send_chunk: usize,
     role: Role,
@@ -506,6 +516,27 @@ impl Shared {
                 if let Some(entry) = self.table().streams.get(&stream) {
                     let _ = entry.inbound.send(Inbound::Fin);
                 }
+            }
+            // Interim, until flows and queries get their behavior: refuse what opens, drop the rest.
+            Frame::OpenUdp { stream, .. } | Frame::OpenEcho { stream, .. } => {
+                if self.admit_peer_id(&mut self.table(), stream) {
+                    self.control(Frame::OpenErr {
+                        stream,
+                        kind: OpenErrKind::Other,
+                        reason: "not supported".to_owned(),
+                    });
+                }
+            }
+            Frame::Query { stream, .. } => {
+                if self.admit_peer_id(&mut self.table(), stream) {
+                    self.control(Frame::QueryErr {
+                        stream,
+                        reason: "not supported".to_owned(),
+                    });
+                }
+            }
+            Frame::Datagram { stream, .. } | Frame::FlowErr { stream, .. } | Frame::Answer { stream, .. } | Frame::QueryErr { stream, .. } => {
+                debug!(%stream, "ignoring a frame nothing handles yet");
             }
             Frame::Rst { stream, reason } => {
                 let entry = self.table().streams.remove(&stream);

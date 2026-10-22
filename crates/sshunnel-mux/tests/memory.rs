@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use sshunnel_mux::{Config, Request, Role, pump, start};
+use sshunnel_mux::{Config, Request, Role, frame::Capabilities, hello::PeerHello, pump, start};
 use tokio::{
     io::{AsyncWriteExt as _, duplex, split},
     time::sleep,
@@ -44,6 +44,13 @@ static ALLOCATOR: Counting = Counting;
 
 const WINDOW: u32 = 16 * 1024;
 const CHUNK: usize = 4 * 1024;
+
+fn peer() -> PeerHello {
+    PeerHello {
+        window: WINDOW,
+        capabilities: Capabilities::default(),
+    }
+}
 /// A chatty source: a log tail, SSE, websocket pings.
 const WRITE: usize = 100;
 
@@ -52,8 +59,8 @@ async fn stalled_stream_heap_is_bounded_by_its_window() {
     let config = Config::new(WINDOW, CHUNK).unwrap();
     let (a, b) = duplex(64 * 1024);
     let ((ar, aw), (br, bw)) = (split(a), split(b));
-    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, config, WINDOW);
-    let (_relay, mut relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, config, WINDOW);
+    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, config, peer());
+    let (_relay, mut relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, config, peer());
     tokio::spawn(client_driver);
     tokio::spawn(relay_driver);
     // The stalled consumer: accepted, then never pumped, so every byte stays queued in the mux.

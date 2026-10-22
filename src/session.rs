@@ -8,6 +8,7 @@ use bytes::BytesMut;
 use sshunnel_mux::{
     Config, Mux, Role,
     base::{Res, Void},
+    frame::Capabilities,
     hello::{recv_hello, send_hello},
     start,
 };
@@ -131,9 +132,9 @@ impl Session {
         // The relay speaks first; until its Hello arrives, `head -c` may still be reading the pipe.
         let config = Config::default();
         let mut buf = BytesMut::new();
-        let relay_window = recv_hello(&mut stdout, &mut buf).await.context("waiting for the relay's Hello")?;
-        send_hello(&mut stdin, config.window()).await?;
-        let (mux, _incoming, driver) = start(stdout, buf, stdin, Role::Client, config, relay_window);
+        let relay_hello = recv_hello(&mut stdout, &mut buf).await.context("waiting for the relay's Hello")?;
+        send_hello(&mut stdin, config.window(), Capabilities::default()).await?;
+        let (mux, _incoming, driver) = start(stdout, buf, stdin, Role::Client, config, relay_hello);
         Ok(Self {
             mux,
             relay,

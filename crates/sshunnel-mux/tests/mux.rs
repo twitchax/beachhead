@@ -13,11 +13,12 @@ use std::{
     time::Duration,
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
     Config, Incoming, Mux, Request, ResolveError, Role, Stream,
-    frame::{Frame, OpenErrKind, ResolveErrKind, StreamId},
+    frame::{Capabilities, Frame, OpenErrKind, ResolveErrKind, StreamId, Transport},
+    hello::PeerHello,
     pump, start,
 };
 use tokio::{
@@ -30,6 +31,13 @@ const WINDOW: u32 = 16 * 1024;
 const CHUNK: usize = 4 * 1024;
 const PIPE_CAP: usize = 8 * 1024;
 const SOCK_CAP: usize = 4 * 1024;
+
+fn hello(window: u32) -> PeerHello {
+    PeerHello {
+        window,
+        capabilities: Capabilities::default(),
+    }
+}
 
 fn small() -> Config {
     Config::new(WINDOW, CHUNK).unwrap()
@@ -59,8 +67,8 @@ fn connect_pair(client_config: Config, relay_config: Config) -> Mux {
     let (ar, aw) = split(a);
     let (br, bw) = split(b);
     // Each end learns the other's window from its Hello; here the test hands it over directly.
-    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, client_config, relay_config.window());
-    let (_relay, relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, relay_config, client_config.window());
+    let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, client_config, hello(relay_config.window()));
+    let (_relay, relay_incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, relay_config, hello(client_config.window()));
     tokio::spawn(client_driver);
     tokio::spawn(relay_driver);
     tokio::spawn(serve(relay_incoming));
@@ -324,7 +332,7 @@ async fn a_vanished_target_resets_the_client_stream() {
 async fn a_dead_connection_fails_opens_and_live_streams() {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
-    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
+    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), hello(WINDOW));
     let driver = tokio::spawn(driver);
 
     let (mut br, mut bw) = split(b);
@@ -388,7 +396,7 @@ impl HandPeer {
 fn client_with_hand_peer() -> (Mux, Incoming, HandPeer) {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
-    let (client, incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
+    let (client, incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), hello(WINDOW));
     tokio::spawn(driver);
     let (r, w) = split(b);
     (client, incoming, HandPeer { r, w, buf: BytesMut::new() })
@@ -618,7 +626,7 @@ async fn a_teardown_fails_an_open_in_flight() {
 async fn a_peer_exceeding_its_credit_is_reset() {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
-    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
+    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), hello(WINDOW));
     tokio::spawn(driver);
     let (mut br, mut bw) = split(b);
 
@@ -660,7 +668,7 @@ async fn an_open_with_the_wrong_parity_is_reset() {
     let (a, b) = duplex(PIPE_CAP);
     let (ar, aw) = split(a);
     // The client opens odd ids, so an odd id arriving from the relay is the client's own space.
-    let (_client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), WINDOW);
+    let (_client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), hello(WINDOW));
     tokio::spawn(driver);
     let (mut br, mut bw) = split(b);
 
@@ -684,4 +692,58 @@ fn config_rejects_a_chunk_larger_than_half_the_window() {
     assert!(Config::new(16 * 1024, 8 * 1024 + 1).is_err());
     assert!(Config::new(1 << 20, 128 * 1024).is_err(), "a chunk must fit one frame");
     assert!(Config::new(16 * 1024, 0).is_err());
+}
+
+#[tokio::test]
+async fn the_peers_capabilities_are_reported_and_new_opens_are_refused_for_now() {
+    let (a, b) = duplex(PIPE_CAP);
+    let (ar, aw) = split(a);
+    let capabilities = Capabilities { ping4: true, ping6: false };
+    let peer = PeerHello { window: WINDOW, capabilities };
+    let (client, _incoming, driver) = start(ar, BytesMut::new(), aw, Role::Client, small(), peer);
+    tokio::spawn(driver);
+    assert_eq!(client.capabilities(), capabilities);
+
+    // Play the relay by hand: its udp, echo and query opens get a refusal, until Task 3 serves them.
+    let (mut br, mut bw) = split(b);
+    let mut wire = BytesMut::new();
+    for frame in [
+        Frame::OpenUdp {
+            stream: StreamId(2),
+            host: "h".into(),
+            port: 53,
+        },
+        Frame::OpenEcho { stream: StreamId(4), host: "h".into() },
+        Frame::Query {
+            stream: StreamId(6),
+            transport: Transport::Udp,
+            message: Bytes::from_static(b"q"),
+        },
+    ] {
+        frame.encode(&mut wire).unwrap();
+    }
+    bw.write_all(&wire).await.unwrap();
+    let mut buf = BytesMut::new();
+    let mut replies = Vec::new();
+    while replies.len() < 3 {
+        if let Some(frame) = Frame::decode(&mut buf).unwrap() {
+            replies.push(frame);
+        } else {
+            assert!(timeout(Duration::from_secs(10), br.read_buf(&mut buf)).await.unwrap().unwrap() > 0);
+        }
+    }
+    let refused = |stream| Frame::OpenErr {
+        stream: StreamId(stream),
+        kind: OpenErrKind::Other,
+        reason: "not supported".into(),
+    };
+    assert_eq!(replies[0], refused(2));
+    assert_eq!(replies[1], refused(4));
+    assert_eq!(
+        replies[2],
+        Frame::QueryErr {
+            stream: StreamId(6),
+            reason: "not supported".into()
+        }
+    );
 }

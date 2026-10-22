@@ -7,6 +7,10 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Added
+
+- Protocol v4: UDP and echo flows, datagrams outside credit, raw DNS queries, and the relay's capabilities in its `Hello`.
+
 ### Changed
 
 - A published package refuses to build with relays from a commit other than its own.
