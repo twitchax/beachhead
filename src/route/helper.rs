@@ -9,7 +9,8 @@
 //! The helper is the privilege boundary, not the client. With a `NOPASSWD` sudoers line anything
 //! running as the user can start it, so it takes targets, never routes or domains: it parses them
 //! again, re-runs every refusal against its own route snapshot, honors only pins inside a route,
-//! and works out their gateways itself. What it runs is a closed set ([`plan`]).
+//! and works out their gateways itself. Whether matched names get fake v6 addresses is its call too
+//! ([`decide_fake_v6`]), reported in [`Reply::Ready`]. What it runs is a closed set ([`plan`]).
 
 use std::{
     ffi::{OsStr, OsString},
@@ -43,7 +44,7 @@ use tokio::{
 use crate::{
     base::{Res, Void},
     route::{
-        DEVICE, DNS_ADDR, FAKE_RANGE, MTU, PIN_PROTO, TUN_ADDR, TUN_ADDR6,
+        DEVICE, DNS_ADDR, FAKE_RANGE, FAKE_RANGE6, MTU, PIN_PROTO, TUN_ADDR, TUN_ADDR6,
         system::{self, Via},
         targets::{MAX_ROUTES, Targets},
     },
@@ -64,10 +65,11 @@ pub struct Setup {
     pub pins: Vec<IpAddr>,
 }
 
-/// The helper's one answer. `Ready` arrives with the device's fd.
+/// The helper's one answer. `Ready` arrives with the device's fd, and says whether matched names get
+/// fake v6 addresses: the helper decides, since only it knows whether the device took its v6 address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
-    Ready { warnings: Vec<String> },
+    Ready { warnings: Vec<String>, fake_v6: bool },
     Failed { error: String },
 }
 
@@ -76,6 +78,7 @@ pub enum Reply {
 pub struct Helper {
     tun: Option<OwnedFd>,
     warnings: Vec<String>,
+    fake_v6: bool,
     conn: UnixStream,
     /// sudo, or the helper itself when already root.
     child: Child,
@@ -110,7 +113,13 @@ impl Helper {
         // The path is done with either way: the helper connected, or now can't.
         drop((listener, dir));
         match handshake {
-            Ok((conn, tun, warnings)) => Ok(Self { tun: Some(tun), warnings, conn, child }),
+            Ok((conn, tun, Ready { warnings, fake_v6 })) => Ok(Self {
+                tun: Some(tun),
+                warnings,
+                fake_v6,
+                conn,
+                child,
+            }),
             Err(e) => {
                 // A helper that connected undoes its work on EOF and exits, one that didn't fails
                 // to connect, and sudo follows it out. sudo isn't killed: under `use_pty` that can
@@ -136,6 +145,12 @@ impl Helper {
         &self.warnings
     }
 
+    /// Whether the helper routed [`FAKE_RANGE6`] to the device, so matched names get AAAA answers.
+    #[must_use]
+    pub fn fake_v6(&self) -> bool {
+        self.fake_v6
+    }
+
     /// Resolves when the helper's end of the socket closes: it died, or a signal stopped it.
     pub async fn closed(&mut self) {
         closed(&mut self.conn).await;
@@ -148,7 +163,7 @@ impl Helper {
     /// Fails when the helper exits unsuccessfully, which means a pin may be left (the next start
     /// sweeps it).
     pub async fn stop(self) -> Void {
-        let Self { tun, conn, mut child, warnings: _ } = self;
+        let Self { tun, conn, mut child, .. } = self;
         drop((tun, conn));
         let status = child.wait().await.context("waiting for the root helper")?;
         ensure!(status.success(), "the root helper exited with {status}");
@@ -182,8 +197,14 @@ fn helper_process(program: &Path, args: &[OsString]) -> Command {
     process
 }
 
+/// What a `Ready` reply carries besides the fd.
+struct Ready {
+    warnings: Vec<String>,
+    fake_v6: bool,
+}
+
 /// Accepts the helper's connection, checks it is root, sends the setup and reads the answer.
-async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, setup: &Setup) -> Res<(UnixStream, OwnedFd, Vec<String>)> {
+async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, setup: &Setup) -> Res<(UnixStream, OwnedFd, Ready)> {
     let mut conn = tokio::select! {
         biased;
         accepted = listener.accept() => accepted.context("accepting the helper's connection")?.0,
@@ -198,7 +219,7 @@ async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, s
 
     conn.write_all(&encode(setup)?).await.context("sending the setup to the helper")?;
     match receive(&conn).await? {
-        (Reply::Ready { warnings }, Some(tun)) => Ok((conn, tun, warnings)),
+        (Reply::Ready { warnings, fake_v6 }, Some(tun)) => Ok((conn, tun, Ready { warnings, fake_v6 })),
         (Reply::Ready { .. }, None) => bail!("the root helper sent no TUN device"),
         (Reply::Failed { error }, _) => bail!("the root helper failed: {error}"),
     }
@@ -231,7 +252,7 @@ async fn serve_with(socket: &Path, uid: u32) -> Void {
         setup = read_setup(&mut conn) => setup,
         () = signals.recv() => bail!("stopped by a signal before the setup arrived"),
     };
-    let (applied, warnings) = match setup.and_then(|setup| apply(&setup)) {
+    let (applied, Ready { warnings, fake_v6 }) = match setup.and_then(|setup| apply(&setup)) {
         Ok(applied) => applied,
         // The client prints what it is sent, on the terminal the helper shares through sudo, so
         // the helper reports an error itself only when the client is gone.
@@ -243,7 +264,7 @@ async fn serve_with(socket: &Path, uid: u32) -> Void {
         }
     };
 
-    let delivered = send(&mut conn, &Reply::Ready { warnings }, applied.tun.as_ref().map(|tun| tun.as_fd())).await;
+    let delivered = send(&mut conn, &Reply::Ready { warnings, fake_v6 }, applied.tun.as_ref().map(|tun| tun.as_fd())).await;
     if delivered.is_ok() {
         tokio::select! {
             () = closed(&mut conn) => {}
@@ -398,7 +419,7 @@ impl<R: FnMut(&Step) -> Void> Drop for Applied<R> {
 
 /// Checks `setup` again and sets the device up. A failure after the device exists undoes the pins
 /// first and drops the fd, which takes the device and everything on it along.
-fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
+fn apply(setup: &Setup) -> Res<(Applied, Ready)> {
     let targets = Targets::parse(&setup.include, &setup.exclude)?;
     let snapshot = system::snapshot()?;
     let mut warnings = targets.check(&snapshot)?;
@@ -413,6 +434,7 @@ fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
     within_cap(&routes, &pins)?;
 
     let tun = system::create_tun()?;
+    let fake_v6 = decide_fake_v6(&targets, &routes, &mut run_step);
     // Holding the device means no other session is running, so any pinned route left is a dead one's.
     let proto = PIN_PROTO.to_string();
     for family in ["-4", "-6"] {
@@ -420,11 +442,11 @@ fn apply(setup: &Setup) -> Res<(Applied, Vec<String>)> {
     }
     // Each pin copies the route its address has before the device has any.
     let vias = pins.into_iter().map(|pin| Ok((pin, system::route_get(pin)?))).collect::<Res<Vec<_>>>()?;
-    let plan = plan(&targets, &routes, &vias);
+    let plan = plan(&targets, &routes, &vias, fake_v6);
     let pins = execute(&plan.steps, &mut run_step)?;
     warnings.extend(plan.warnings);
 
-    Ok((Applied { tun: Some(tun), pins, run: run_step }, warnings))
+    Ok((Applied { tun: Some(tun), pins, run: run_step }, Ready { warnings, fake_v6 }))
 }
 
 /// The pins a route would capture, each once. A pin outside every route needs nothing, and is never
@@ -490,12 +512,13 @@ struct Plan {
 }
 
 /// Everything the helper does to the machine, in order: the device's addresses, MTU and link; the
-/// pins, before a route could capture what they keep; the routes; and with names, the resolver's
-/// link config, DNS server last, so resolved never takes the link for a default route.
+/// pins, before a route could capture what they keep; the routes, and [`FAKE_RANGE6`]'s with fake v6
+/// on; and with names, the resolver's link config, DNS server last, so resolved never takes the link
+/// for a default route.
 ///
 /// A pin whose address the machine delivers locally needs nothing (the local table outranks main),
 /// and a route that is exactly a pinned host is left out: the pin wins.
-fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)]) -> Plan {
+fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)], fake_v6: bool) -> Plan {
     let pins: Vec<(IpNet, &Via)> = vias.iter().filter(|(_, via)| via.unicast).map(|(pin, via)| (IpNet::from(*pin), via)).collect();
     let mut warnings = Vec::new();
     let mut device_routes = Vec::with_capacity(routes.len());
@@ -509,8 +532,9 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)]) -> Plan {
 
     let mut steps = vec![Step::new("ip", ["addr", "add", &format!("{TUN_ADDR}/{}", FAKE_RANGE.prefix_len()), "dev", DEVICE])];
     // Only v6 routes need a v6 source, and adding one where IPv6 is disabled would fail every run.
+    // Fake v6 wants it too: without v6 routes, `decide_fake_v6` added it already.
     if device_routes.iter().any(|route| matches!(route, IpNet::V6(_))) {
-        steps.push(Step::new("ip", ["addr", "add", &TUN_ADDR6.to_string(), "dev", DEVICE]));
+        steps.push(addr6());
     }
     steps.push(Step::new("ip", ["link", "set", "dev", DEVICE, "mtu", &MTU.to_string(), "up"]));
 
@@ -533,6 +557,9 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)]) -> Plan {
         }
         steps.push(step);
     }
+    if fake_v6 {
+        steps.push(Step::new("ip", ["route", "add", &FAKE_RANGE6.to_string(), "dev", DEVICE]));
+    }
 
     if targets.has_names() {
         steps.push(Step::new("resolvectl", ["default-route", DEVICE, "false"]));
@@ -544,6 +571,31 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)]) -> Plan {
         steps.push(Step::new("resolvectl", ["dns", DEVICE, &DNS_ADDR.to_string()]));
     }
     Plan { steps, warnings }
+}
+
+/// The device's v6 address.
+fn addr6() -> Step {
+    Step::new("ip", ["addr", "add", &TUN_ADDR6.to_string(), "dev", DEVICE])
+}
+
+/// Whether matched names get fake v6 addresses, run right after the device exists: only with names,
+/// and only where the device can have its v6 address, the source apps reach the fakes from. v6 routes
+/// need that address anyway, and the plan adds it (a failure there fails the run); without them it
+/// is tried here, and a failure (IPv6 disabled) only turns fake v6 off.
+fn decide_fake_v6(targets: &Targets, routes: &[IpNet], run: &mut impl FnMut(&Step) -> Void) -> bool {
+    if !targets.has_names() {
+        return false;
+    }
+    if routes.iter().any(|route| matches!(route, IpNet::V6(_))) {
+        return true;
+    }
+    match run(&addr6()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("fake IPv6 is off, since the device can't have its IPv6 address: {e:#}");
+            false
+        }
+    }
 }
 
 fn run_step(step: &Step) -> Void {
@@ -789,7 +841,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<Setup>(&json).unwrap(), setup());
         assert!(serde_json::from_str::<Setup>(r#"{"include":[],"exclude":[],"pins":[],"routes":["0.0.0.0/0"]}"#).is_err());
 
-        let ready = Reply::Ready { warnings: strings(&["careful"]) };
+        let ready = Reply::Ready {
+            warnings: strings(&["careful"]),
+            fake_v6: true,
+        };
         assert_eq!(serde_json::from_slice::<Reply>(&serde_json::to_vec(&ready).unwrap()).unwrap(), ready);
     }
 
@@ -1101,7 +1156,7 @@ mod tests {
         let vias = [(addr("10.99.0.5"), via("eth0", Some("192.0.2.1"))), (addr("fd99::5"), via("eth0", None))];
 
         assert_eq!(
-            rendered(&plan(&targets, &targets.routes(), &vias).steps),
+            rendered(&plan(&targets, &targets.routes(), &vias, true).steps),
             [
                 "ip addr add 198.18.0.1/15 dev sshunnel0",
                 "ip addr add fd73:7368::1/64 dev sshunnel0",
@@ -1110,6 +1165,7 @@ mod tests {
                 "ip route add fd99::5/128 dev eth0 proto 222",
                 "ip route add 10.99.0.0/17 dev sshunnel0",
                 "ip route add fd99::/64 dev sshunnel0 metric 1",
+                "ip route add 2001:2::/96 dev sshunnel0",
                 "resolvectl default-route sshunnel0 false",
                 "resolvectl dnssec sshunnel0 no",
                 "resolvectl dnsovertls sshunnel0 no",
@@ -1120,11 +1176,74 @@ mod tests {
     }
 
     #[test]
+    fn fake_v6_helper_routes_the_range_when_on() {
+        let targets = Targets::parse(&strings(&["10.99.0.0/16", "*.corp.example"]), &[]).unwrap();
+
+        // No v6 routes: the device's v6 address came from the decision's trial, not the plan.
+        assert_eq!(
+            rendered(&plan(&targets, &targets.routes(), &[], true).steps),
+            [
+                "ip addr add 198.18.0.1/15 dev sshunnel0",
+                "ip link set dev sshunnel0 mtu 65535 up",
+                "ip route add 10.99.0.0/16 dev sshunnel0",
+                "ip route add 2001:2::/96 dev sshunnel0",
+                "resolvectl default-route sshunnel0 false",
+                "resolvectl dnssec sshunnel0 no",
+                "resolvectl dnsovertls sshunnel0 no",
+                "resolvectl domain sshunnel0 ~corp.example",
+                "resolvectl dns sshunnel0 198.18.0.2",
+            ]
+        );
+        let off = rendered(&plan(&targets, &targets.routes(), &[], false).steps);
+        assert!(!off.iter().any(|step| step.contains("2001:2::") || step.contains("fd73:")), "{off:#?}");
+    }
+
+    #[test]
+    fn fake_v6_helper_turns_off_when_the_address_fails() {
+        const ADDR6: &str = "ip addr add fd73:7368::1/64 dev sshunnel0";
+        let names = Targets::parse(&strings(&["10.99.0.0/16", "*.corp.example"]), &[]).unwrap();
+
+        // IPv6 disabled: the address fails, fake v6 is off, and the run goes on without it.
+        let mut log = Vec::new();
+        let mut run = recorder(&mut log, &[ADDR6]);
+        assert!(!decide_fake_v6(&names, &names.routes(), &mut run));
+        assert!(execute(&plan(&names, &names.routes(), &[], false).steps, &mut run).is_ok());
+        drop(run);
+        assert_eq!(log[0], ADDR6);
+        assert!(log[1..].iter().all(|step| !step.contains("fd73:") && !step.contains("2001:2::")), "{log:#?}");
+
+        // The address takes: fake v6 is on.
+        let mut log = Vec::new();
+        assert!(decide_fake_v6(&names, &names.routes(), &mut recorder(&mut log, &[])));
+        assert_eq!(log, [ADDR6]);
+
+        // v6 routes need the address anyway, and the plan adds it (a failure there fails the run).
+        let v6 = Targets::parse(&strings(&["fd99::/64", "*.corp.example"]), &[]).unwrap();
+        let mut log = Vec::new();
+        assert!(decide_fake_v6(&v6, &v6.routes(), &mut recorder(&mut log, &[])));
+        // Without names, fake v6 is off and nothing is tried.
+        let cidrs = Targets::parse(&strings(&["10.99.0.0/16"]), &[]).unwrap();
+        assert!(!decide_fake_v6(&cidrs, &cidrs.routes(), &mut recorder(&mut log, &[])));
+        assert_eq!(log, Vec::<String>::new());
+    }
+
+    #[test]
+    fn fake_v6_ready_round_trips_as_json() {
+        for fake_v6 in [true, false] {
+            let ready = Reply::Ready { warnings: Vec::new(), fake_v6 };
+            let json = serde_json::to_string(&ready).unwrap();
+
+            assert!(json.contains(&format!(r#""fake_v6":{fake_v6}"#)), "{json}");
+            assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), ready);
+        }
+    }
+
+    #[test]
     fn a_v4_cidr_setup_skips_ipv6_and_the_resolver() {
         let targets = Targets::parse(&strings(&["10.99.0.0/16"]), &[]).unwrap();
 
         assert_eq!(
-            rendered(&plan(&targets, &targets.routes(), &[]).steps),
+            rendered(&plan(&targets, &targets.routes(), &[], false).steps),
             [
                 "ip addr add 198.18.0.1/15 dev sshunnel0",
                 "ip link set dev sshunnel0 mtu 65535 up",
@@ -1139,7 +1258,7 @@ mod tests {
         let targets = Targets::parse(&strings(&["0.0.0.0/1", "128.0.0.0/1"]), &[]).unwrap();
         let local = Via { unicast: false, ..via("lo", None) };
 
-        let plan = plan(&targets, &targets.routes(), &[(addr("127.0.0.1"), local)]);
+        let plan = plan(&targets, &targets.routes(), &[(addr("127.0.0.1"), local)], false);
 
         assert!(rendered(&plan.steps).iter().all(|step| !step.contains("proto 222")), "{:#?}", rendered(&plan.steps));
         assert!(rendered(&plan.steps).contains(&"ip route add 0.0.0.0/1 dev sshunnel0".to_owned()));
@@ -1149,7 +1268,7 @@ mod tests {
     fn a_target_that_is_a_pin_keeps_its_route() {
         let targets = Targets::parse(&strings(&["10.99.0.5", "10.98.0.0/16"]), &[]).unwrap();
 
-        let plan = plan(&targets, &targets.routes(), &[(addr("10.99.0.5"), via("eth0", Some("192.0.2.1")))]);
+        let plan = plan(&targets, &targets.routes(), &[(addr("10.99.0.5"), via("eth0", Some("192.0.2.1")))], false);
 
         assert_eq!(
             rendered(&plan.steps),
@@ -1168,7 +1287,7 @@ mod tests {
     fn a_failed_setup_deletes_the_pins_it_added() {
         let targets = Targets::parse(&strings(&["10.99.0.0/16", "fd99::/64"]), &[]).unwrap();
         let vias = [(addr("10.99.0.5"), via("eth0", Some("192.0.2.1"))), (addr("fd99::5"), via("eth0", None))];
-        let steps = plan(&targets, &targets.routes(), &vias).steps;
+        let steps = plan(&targets, &targets.routes(), &vias, false).steps;
         let mut log = Vec::new();
 
         let error = execute(&steps, &mut recorder(&mut log, &["ip route add fd99::/64 dev sshunnel0 metric 1"])).unwrap_err();
@@ -1235,6 +1354,7 @@ mod tests {
         let device = tempfile::tempfile().unwrap();
         let ready = Reply::Ready {
             warnings: strings(&["'10.0.0.0/8' contains the connected subnet 10.1.0.0/16, which stays local"]),
+            fake_v6: false,
         };
 
         send(&mut helper, &ready, Some(device.as_fd())).await.unwrap();

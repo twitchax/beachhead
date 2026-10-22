@@ -1,7 +1,7 @@
 //! The DNS server behind [`DNS_ADDR`](crate::route::DNS_ADDR). The resolver sends it only queries
 //! under the routed domains. A name the targets route is checked on the remote through the relay
-//! and, if it exists, an `A` query gets the name's fake address; every other name goes, byte for
-//! byte, to the normal upstream servers.
+//! and, if it exists, an `A` query gets the name's fake address, and with fake v6 on an `AAAA` query
+//! gets its v6 fake; every other name goes, byte for byte, to the normal upstream servers.
 
 use std::{
     collections::HashMap,
@@ -14,7 +14,7 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use simple_dns::{
     CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE,
-    rdata::{A, RData, SOA},
+    rdata::{A, AAAA, RData, SOA},
 };
 use sshunnel_mux::frame::ResolveErrKind;
 use tokio::{
@@ -25,7 +25,7 @@ use tokio::{
 use crate::{
     base::Res,
     route::{
-        names::today,
+        names::{fake_v6, today},
         router::Router,
         stack::Dns,
         targets::{normalize, plausible},
@@ -52,19 +52,23 @@ pub struct Server<T: Tunnel> {
     tunnel: T,
     router: Arc<Router>,
     upstreams: Vec<SocketAddr>,
+    /// Whether AAAA answers a matched name's v6 fake, as the helper decided; NODATA otherwise.
+    fake_v6: bool,
     /// Normalized name to when the relay last said whether it exists. Holds only the last
     /// [`CACHE`] of names: inserting prunes the rest.
     cache: Mutex<HashMap<String, (Instant, bool)>>,
 }
 
 impl<T: Tunnel> Server<T> {
-    /// A server whose unrouted names go to `upstreams`, tried in order.
+    /// A server whose unrouted names go to `upstreams`, tried in order, and whose matched names get
+    /// AAAA answers when `fake_v6` is on.
     #[must_use]
-    pub fn new(tunnel: T, router: Arc<Router>, upstreams: Vec<SocketAddr>) -> Self {
+    pub fn new(tunnel: T, router: Arc<Router>, upstreams: Vec<SocketAddr>, fake_v6: bool) -> Self {
         Self {
             tunnel,
             router,
             upstreams,
+            fake_v6,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -94,9 +98,14 @@ impl<T: Tunnel> Server<T> {
         match self.exists(&name).await {
             Ok(false) => reply(&packet, RCODE::NameError, Vec::new(), true),
             Err(()) => reply(&packet, RCODE::ServerFailure, Vec::new(), false),
-            Ok(true) if is_a_in(question) => {
+            Ok(true) if is_in(question, TYPE::A) => {
                 let addr = self.router.names().address(&name, today());
                 let record = ResourceRecord::new(question.qname.clone(), CLASS::IN, ttl_secs(), RData::A(A::from(addr)));
+                reply(&packet, RCODE::NoError, vec![record], false)
+            }
+            Ok(true) if self.fake_v6 && is_in(question, TYPE::AAAA) => {
+                let addr = fake_v6(self.router.names().address(&name, today()));
+                let record = ResourceRecord::new(question.qname.clone(), CLASS::IN, ttl_secs(), RData::AAAA(AAAA::from(addr)));
                 reply(&packet, RCODE::NoError, vec![record], false)
             }
             Ok(true) => reply(&packet, RCODE::NoError, Vec::new(), true),
@@ -217,6 +226,7 @@ const fn ttl_secs() -> u32 {
     TTL.as_secs() as u32
 }
 
-fn is_a_in(question: &Question<'_>) -> bool {
-    question.qtype == QTYPE::TYPE(TYPE::A) && matches!(question.qclass, QCLASS::CLASS(CLASS::IN) | QCLASS::ANY)
+/// Whether `question` asks for `qtype` in class IN (or any class).
+fn is_in(question: &Question<'_>, qtype: TYPE) -> bool {
+    question.qtype == QTYPE::TYPE(qtype) && matches!(question.qclass, QCLASS::CLASS(CLASS::IN) | QCLASS::ANY)
 }

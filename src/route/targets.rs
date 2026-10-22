@@ -17,7 +17,7 @@ use ipnet::IpNet;
 
 use crate::{
     base::{Err, Res},
-    route::FAKE_RANGE,
+    route::{FAKE_RANGE, FAKE_RANGE6},
 };
 
 /// How specific a name rule is: more labels first, then exact beats wildcard.
@@ -26,6 +26,9 @@ type Rank = (usize, bool);
 /// The longest hostname, and the longest label in one.
 const MAX_NAME: usize = 253;
 const MAX_LABEL: usize = 63;
+
+/// The fake ranges, each sshunnel's own whatever the targets: no target is routed into one.
+const FAKE_RANGES: [IpNet; 2] = [IpNet::V4(FAKE_RANGE), IpNet::V6(FAKE_RANGE6)];
 
 /// The most routes one setup may add. Each is an `ip` run as root, and excludes inside a wide v6
 /// target can carve one into a hundred thousand. The helper counts its pins against it too.
@@ -188,8 +191,8 @@ pub struct Targets {
 
 impl Targets {
     /// Parses the targets and applies the refusals that don't depend on the machine: `/0`s, a
-    /// bare `*`, anything equal to or inside the fake range, and more than [`MAX_ROUTES`] routes.
-    /// A target that merely contains the fake range is allowed; [`Self::check`] warns and the range
+    /// bare `*`, anything equal to or inside a fake range, and more than [`MAX_ROUTES`] routes.
+    /// A target that merely contains a fake range is allowed; [`Self::check`] warns and the range
     /// is carved out of the routes.
     ///
     /// # Errors
@@ -229,7 +232,7 @@ impl Targets {
         Ok(targets)
     }
 
-    /// The CIDR includes minus the CIDR excludes inside them and minus the fake range, sorted, each
+    /// The CIDR includes minus the CIDR excludes inside them and minus the fake ranges, sorted, each
     /// once. Nothing merges, not even nested or adjacent targets: each target's route must beat an
     /// equal one elsewhere on its own, which a merged, broader route would lose on prefix length.
     #[must_use]
@@ -242,8 +245,8 @@ impl Targets {
     /// Carves the routes into `carving`, until they pass its cap. An include given twice is carved
     /// once: its routes would be the same, and each copy would cost the carving again.
     fn carve_into(&self, carving: &mut Carving) -> ControlFlow<()> {
-        // The fake range belongs to sshunnel, so it is always a hole in what a wider include routes.
-        let excludes: Vec<IpNet> = nets(&self.exclude).chain([IpNet::V4(FAKE_RANGE)]).collect();
+        // The fake ranges belong to sshunnel, so each is always a hole in what a wider include routes.
+        let excludes: Vec<IpNet> = nets(&self.exclude).chain(FAKE_RANGES).collect();
         let mut includes: Vec<IpNet> = nets(&self.include).collect();
         includes.sort_unstable();
         includes.dedup();
@@ -256,10 +259,10 @@ impl Targets {
     }
 
     /// Whether traffic to `addr` goes through the tunnel: the most specific CIDR rule wins, an
-    /// exclude on a tie. The fake range is never routed by address.
+    /// exclude on a tie. The fake ranges are never routed by address.
     #[must_use]
     pub fn routes_addr(&self, addr: IpAddr) -> bool {
-        if matches!(addr, IpAddr::V4(v4) if FAKE_RANGE.contains(&v4)) {
+        if FAKE_RANGES.iter().any(|fake| fake.contains(&addr)) {
             return false;
         }
         let best = |entries: &[Entry]| nets(entries).filter(|n| n.contains(&addr)).map(|n| n.prefix_len()).max();
@@ -291,13 +294,13 @@ impl Targets {
     ///
     /// # Errors
     ///
-    /// Every refusal at once: a target equal to or inside a connected subnet, the fake range
+    /// Every refusal at once: a target equal to or inside a connected subnet, a fake range in use
     /// overlapping one, or a route sshunnel would add that the main table already has at the same
     /// metric.
     ///
     /// # Returns
     ///
-    /// Warnings: a broader target keeps its connected part local, and a target containing the fake
+    /// Warnings: a broader target keeps its connected part local, and a target containing a fake
     /// range leaves that range to sshunnel.
     pub fn check(&self, snapshot: &Snapshot) -> Res<Vec<String>> {
         self.findings(snapshot).into_result()
@@ -309,9 +312,14 @@ impl Targets {
     pub fn findings(&self, snapshot: &Snapshot) -> Findings {
         let mut found = Findings::default();
 
+        // The device's own addresses sit in the v4 range whatever the targets; the v6 range holds only
+        // names' fakes, so without names it may be anyone's.
+        let in_use = [Some(IpNet::V4(FAKE_RANGE)), self.has_names().then_some(IpNet::V6(FAKE_RANGE6))];
         for connected in &snapshot.connected {
-            if overlaps_fake_range(connected) {
-                found.refusals.push(format!("the fake range {FAKE_RANGE} overlaps the connected subnet {connected}"));
+            for fake in in_use.iter().flatten() {
+                if connected.contains(fake) || fake.contains(connected) {
+                    found.refusals.push(format!("the fake range {fake} overlaps the connected subnet {connected}"));
+                }
             }
         }
 
@@ -324,8 +332,8 @@ impl Targets {
                     found.warnings.push(format!("'{}' contains the connected subnet {connected}, which stays local", entry.raw));
                 }
             }
-            if net.contains(&IpNet::V4(FAKE_RANGE)) {
-                found.warnings.push(format!("'{}' contains the fake range {FAKE_RANGE}, which stays sshunnel's", entry.raw));
+            for fake in FAKE_RANGES.iter().filter(|fake| net.contains(*fake)) {
+                found.warnings.push(format!("'{}' contains the fake range {fake}, which stays sshunnel's", entry.raw));
             }
         }
 
@@ -390,11 +398,6 @@ fn wins<T: Ord>(include: Option<T>, exclude: Option<T>) -> bool {
     }
 }
 
-fn overlaps_fake_range(net: &IpNet) -> bool {
-    let fake = IpNet::V4(FAKE_RANGE);
-    net.contains(&fake) || fake.contains(net)
-}
-
 /// Why an include may never be routed, whatever the machine looks like.
 fn refusal_for(target: &Target) -> Option<String> {
     let Target::Net(net) = target else { return None };
@@ -402,7 +405,7 @@ fn refusal_for(target: &Target) -> Option<String> {
     if net.prefix_len() == 0 {
         return Some("a full tunnel is not supported".to_owned());
     }
-    IpNet::V4(FAKE_RANGE).contains(net).then(|| format!("is the fake range {FAKE_RANGE} or inside it"))
+    FAKE_RANGES.iter().find(|fake| fake.contains(net)).map(|fake| format!("is the fake range {fake} or inside it"))
 }
 
 /// Routes being carved: the distinct ones so far, how many may be kept before carving stops, and
@@ -690,6 +693,37 @@ mod tests {
         let warnings = t.check(&Snapshot::default()).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("'128.0.0.0/1'") && warnings[0].contains("198.18.0.0/15"), "{warnings:?}");
+    }
+
+    #[test]
+    fn fake_v6_range_targets_are_refused_or_carved() {
+        let fake = net("2001:2::/96");
+        for inside in ["2001:2::/112", "2001:2::/96", "2001:2::c612:102"] {
+            let error = Targets::parse(&strings(&[inside]), &[]).unwrap_err().to_string();
+            assert!(error.contains(&format!("is the fake range {fake} or inside it")) && error.contains(&format!("'{inside}'")), "{error}");
+        }
+
+        let around = targets(&["2001::/16"], &[]);
+        assert!(around.routes().iter().all(|r| !r.contains(&fake) && !fake.contains(r)), "{:?}", around.routes());
+        assert!(!around.routes_addr(addr("2001:2::c612:102")));
+        assert!(around.routes_addr(addr("2001:3::1")));
+        assert_eq!(around.check(&Snapshot::default()).unwrap(), ["'2001::/16' contains the fake range 2001:2::/96, which stays sshunnel's"]);
+
+        // Carving a /96 out of a /3 costs a route per level between them.
+        let wide = targets(&["2000::/3"], &[]).routes();
+        assert!(wide.len() <= MAX_ROUTES, "{} routes", wide.len());
+        assert!(wide.iter().all(|r| !r.contains(&fake) && !fake.contains(r)), "{wide:?}");
+    }
+
+    #[test]
+    fn fake_v6_connected_overlap_is_refused_with_names() {
+        for connected in ["2001:2::/64", "2001:2::/120"] {
+            let error = targets(&["*.corp.example"], &[]).check(&snapshot(&[connected])).unwrap_err().to_string();
+            assert!(error.contains(&format!("the fake range 2001:2::/96 overlaps the connected subnet {connected}")), "{error}");
+        }
+
+        // Without names the range is never used, so it may be anyone's.
+        assert_eq!(targets(&["10.99.0.0/16"], &[]).check(&snapshot(&["2001:2::/64"])).unwrap(), Vec::<String>::new());
     }
 
     #[test]

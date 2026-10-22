@@ -3,13 +3,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use pretty_assertions::assert_eq;
 use simple_dns::{CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, TYPE, rdata::RData};
 use sshunnel::{
     route::{
+        FAKE_RANGE6,
         dns::{Server, TTL},
         names::{self, FakeMap, today},
         router::Router,
@@ -28,19 +33,20 @@ struct Fixture {
     _state: TempDir,
 }
 
-fn fixture(include: &[&str], exclude: &[&str], upstreams: Vec<SocketAddr>) -> Fixture {
+/// `fake_v6` as the helper reports it: whether the machine gives matched names v6 fakes.
+fn fixture(include: &[&str], exclude: &[&str], upstreams: Vec<SocketAddr>, fake_v6: bool) -> Fixture {
     let state = TempDir::new().unwrap();
     let owned = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     let targets = Targets::parse(&owned(include), &owned(exclude)).unwrap();
     let names = FakeMap::load(state.path().join("names"), today()).unwrap();
     let router = Arc::new(Router::new(targets, names));
     let tunnel = FakeTunnel::new();
-    let server = Server::new(tunnel.clone(), router, upstreams);
+    let server = Server::new(tunnel.clone(), router, upstreams, fake_v6);
     Fixture { tunnel, server, _state: state }
 }
 
 fn corp() -> Fixture {
-    fixture(&["*.corp.example"], &["private.corp.example"], Vec::new())
+    fixture(&["*.corp.example"], &["private.corp.example"], Vec::new(), true)
 }
 
 fn query(id: u16, name: &str, qtype: TYPE) -> Bytes {
@@ -94,8 +100,31 @@ async fn a_matched_name_gets_its_fake_address() {
 }
 
 #[tokio::test]
-async fn aaaa_for_a_matched_name_is_nodata() {
+async fn fake_v6_aaaa_answers_when_on() {
     let f = corp();
+    f.tunnel.name("wiki.corp.example", Ok(()));
+
+    // AAAA first: it hands out the name's v4 fake too, so the two pair whichever comes first.
+    let aaaa = ask(&f.server, 1, "wiki.corp.example", TYPE::AAAA).await;
+    let a = ask(&f.server, 2, "wiki.corp.example", TYPE::A).await;
+    let (aaaa, a) = (Packet::parse(&aaaa).unwrap(), Packet::parse(&a).unwrap());
+
+    assert_eq!(aaaa.rcode(), RCODE::NoError);
+    assert_eq!(aaaa.answers.len(), 1);
+    assert_eq!(u64::from(aaaa.answers[0].ttl), TTL.as_secs());
+    let RData::AAAA(v6) = &aaaa.answers[0].rdata else {
+        panic!("not an AAAA record: {:?}", aaaa.answers[0])
+    };
+    let RData::A(v4) = &a.answers[0].rdata else { panic!("not an A record: {:?}", a.answers[0]) };
+    let v6 = Ipv6Addr::from(v6.address);
+    assert_eq!(v6, names::fake_v6(Ipv4Addr::from(v4.address)));
+    assert!(FAKE_RANGE6.contains(&v6), "{v6}");
+    assert_eq!(f.tunnel.resolves(), vec!["wiki.corp.example"]);
+}
+
+#[tokio::test]
+async fn fake_v6_aaaa_is_nodata_when_off() {
+    let f = fixture(&["*.corp.example"], &[], Vec::new(), false);
     f.tunnel.name("wiki.corp.example", Ok(()));
 
     let bytes = ask(&f.server, 1, "wiki.corp.example", TYPE::AAAA).await;
@@ -193,7 +222,7 @@ const CANNED: &[u8] = b"\x00\x00\x81\x80\x00\x00\x00\x00\x00\x00\x00\x00 the stu
 #[tokio::test]
 async fn an_excluded_name_is_answered_by_the_upstream() {
     let (upstream, mut queries) = stub(CANNED).await;
-    let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream]);
+    let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream], true);
     let asked = query(0xbeef, "private.corp.example", TYPE::A);
 
     let answer = f.server.answer(asked.clone()).await.unwrap();
@@ -211,7 +240,7 @@ static LARGE: [u8; 6000] = [0x2a; 6000];
 #[tokio::test]
 async fn a_large_upstream_answer_is_relayed_whole() {
     let (upstream, _queries) = stub(&LARGE).await;
-    let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream]);
+    let f = fixture(&["*.corp.example"], &["private.corp.example"], vec![upstream], true);
 
     let answer = f.server.answer(query(0xbeef, "private.corp.example", TYPE::TXT)).await.unwrap();
 
@@ -222,7 +251,7 @@ async fn a_large_upstream_answer_is_relayed_whole() {
 #[tokio::test]
 async fn an_unmatched_name_under_an_exact_target_goes_upstream() {
     let (upstream, _queries) = stub(CANNED).await;
-    let f = fixture(&["host.corp.example"], &[], vec![upstream]);
+    let f = fixture(&["host.corp.example"], &[], vec![upstream], true);
 
     let answer = f.server.answer(query(5, "a.host.corp.example", TYPE::A)).await.unwrap();
 
@@ -249,7 +278,7 @@ async fn no_upstream_answers_is_servfail() {
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let upstreams = vec![dead.local_addr().unwrap(), silent.local_addr().unwrap()];
     drop(dead);
-    let f = fixture(&["*.corp.example"], &[], upstreams);
+    let f = fixture(&["*.corp.example"], &[], upstreams, true);
 
     let bytes = ask(&f.server, 3, "elsewhere.example", TYPE::A).await;
     let reply = Packet::parse(&bytes).unwrap();

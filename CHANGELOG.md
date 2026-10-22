@@ -31,9 +31,17 @@ why the version moved the way it did.
   each reply comes back in the app's own family under its identifier. Where the remote doesn't
   allow unprivileged ping (`net.ipv4.ping_group_range`), `route` warns once its routes are up, and
   ping through it gets administratively prohibited.
+- Fake IPv6 addresses for names under a pattern: where the machine has IPv6, AAAA answers the
+  name's v4 fake in the low 32 bits of `2001:2::/96`, which `route` sends to its device, so TCP, UDP
+  and ping reach the name over IPv6 too. The root helper decides, by trying the device's IPv6
+  address. `2001:2::/96` is reserved like `198.18.0.0/15`: a target inside it is refused, one
+  containing it is routed around it with a warning, and with a domain pattern a connected subnet
+  overlapping it is refused.
 
 ### Changed
 
+- AAAA for a name under a pattern is no longer always empty (NODATA): it stays empty only where the
+  machine has no IPv6.
 - The relay resolves every open through its bounded lookup path, and raises its open-file limit to
   the hard limit.
 - A published package refuses to build with relays from a commit other than its own.

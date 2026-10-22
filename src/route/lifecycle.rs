@@ -141,8 +141,9 @@ async fn connect(ssh: &SshCommand, destination: &str, relays: &Relays, upstreams
 }
 
 /// Puts the device's packets through the netstack, with the DNS server on it, on its own thread.
+/// The DNS server hands out v6 fakes only when the helper routed their range.
 async fn start(helper: &mut Helper, mux: &Mux, router: &Arc<Router>, upstreams: &[IpAddr]) -> Res<Netstack> {
-    Netstack::start(helper.take_tun()?, mux.clone(), Arc::clone(router), upstreams).await
+    Netstack::start(helper.take_tun()?, mux.clone(), Arc::clone(router), upstreams, helper.fake_v6()).await
 }
 
 /// Runs until a signal (a clean exit), or the session, the helper or the netstack ends (an error,

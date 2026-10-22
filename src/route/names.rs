@@ -4,13 +4,16 @@
 //! An address starts at the name's hash slot and probes past collisions. The assignment is
 //! persisted, and the persisted entry wins over the hash, so a collided name keeps its probed
 //! address across restarts. Entries unused for [`PRUNE_AFTER_DAYS`] are dropped on load.
+//!
+//! A name's v6 fake ([`fake_v6`]) derives from its v4 one, so it needs no state of its own and the
+//! two always pair.
 
 use std::{
     collections::HashMap,
     ffi::OsString,
     fmt::Write as _,
     fs,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -20,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     base::{Res, Void},
-    route::targets::normalize,
+    route::{FAKE_RANGE, FAKE_RANGE6, targets::normalize},
 };
 
 /// The first assignable address; `198.18.0.0/24` stays reserved for the device and the DNS server.
@@ -160,6 +163,21 @@ impl FakeMap {
     }
 }
 
+/// The v6 fake paired with a v4 one: [`FAKE_RANGE6`] with the v4 fake in its low 32 bits.
+#[must_use]
+pub fn fake_v6(v4: Ipv4Addr) -> Ipv6Addr {
+    Ipv6Addr::from_bits(FAKE_RANGE6.network().to_bits() | u128::from(v4.to_bits()))
+}
+
+/// The v4 fake inside a v6 one: `None` outside [`FAKE_RANGE6`], or when the low 32 bits fall
+/// outside [`FAKE_RANGE`].
+#[must_use]
+pub fn fake_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let [.., a, b, c, d] = v6.octets();
+    let v4 = Ipv4Addr::new(a, b, c, d);
+    (FAKE_RANGE6.contains(&v6) && FAKE_RANGE.contains(&v4)).then_some(v4)
+}
+
 /// The address a name hashes to before probing.
 #[must_use]
 pub fn slot(name: &str) -> Ipv4Addr {
@@ -226,7 +244,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::route::FAKE_RANGE;
 
     fn map_in(dir: &TempDir, today: u32) -> FakeMap {
         FakeMap::load(dir.path().join("names"), today).unwrap()
@@ -402,6 +419,22 @@ mod tests {
         // No other name lost its address, and the newcomer keeps this one.
         assert_eq!(map.address("full8.corp.example", 200), slot_addr(8));
         assert_eq!(map.address("newcomer.corp.example", 200), addr);
+    }
+
+    #[test]
+    fn fake_v6_embeds_the_v4_fake() {
+        let v4 = Ipv4Addr::new(198, 18, 1, 2);
+        let v6: Ipv6Addr = "2001:2::c612:102".parse().unwrap();
+
+        assert_eq!(fake_v6(v4), v6);
+        assert_eq!(fake_v4(v6), Some(v4));
+        let last = Ipv4Addr::new(198, 19, 255, 254);
+        assert_eq!(fake_v4(fake_v6(last)), Some(last));
+        assert!(FAKE_RANGE6.contains(&fake_v6(last)));
+
+        // Low bits outside the v4 range, and an address outside the v6 one.
+        assert_eq!(fake_v4("2001:2::1".parse().unwrap()), None);
+        assert_eq!(fake_v4("2001:3::c612:102".parse().unwrap()), None);
     }
 
     #[test]

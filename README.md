@@ -120,7 +120,10 @@ a pattern routes a name whatever address it has on the remote.
 Names resolve on the remote. The relay looks each one up with the remote's own resolver, and a name
 that exists there gets a stable fake address from `198.18.0.0/15`, remembered in
 `$XDG_STATE_HOME/sshunnel/names` (by default `~/.local/state/sshunnel/names`); one that doesn't is
-NXDOMAIN here too. Connections refused or unreachable on the remote look the same to the app.
+NXDOMAIN here too. Where the machine has IPv6, the name gets a fake IPv6 address as well, its AAAA
+answer: the v4 fake in the low 32 bits of `2001:2::/96` (`198.18.1.2` is `2001:2::c612:102`), so
+the two always pair. Without IPv6, AAAA is empty (NODATA) and apps use the v4 fake. Connections
+refused or unreachable on the remote look the same to the app.
 
 UDP goes as flows, as in a UDP forward: each app socket and destination it sends to is a flow, a
 UDP socket on the remote connected to that destination and opened by the first datagram. Datagrams
@@ -140,8 +143,9 @@ ICMP administratively prohibited.
 Before ssh even starts, `route` refuses `0.0.0.0/0` and `::/0`, a bare `*`, a pattern no hostname
 can match (labels are ASCII letters, digits, `-` and `_`; an IDN goes in its `xn--` form), a target
 equal to or inside a directly connected subnet (a broader one is allowed, and the connected part
-stays local, with a warning), a target equal to or inside `198.18.0.0/15`, a connected subnet
-overlapping `198.18.0.0/15` (whatever the targets), targets that come to more than 4096 routes (an
+stays local, with a warning), a target equal to or inside `198.18.0.0/15` or `2001:2::/96`, a
+connected subnet overlapping `198.18.0.0/15` (whatever the targets) or `2001:2::/96` (with a domain
+pattern, the only time that range is used), targets that come to more than 4096 routes (an
 exclude carves its target into pieces, each a route), and a route the main table already has at the
 metric sshunnel's own would get (0 for IPv4, 1 for IPv6, so either wins a tie with a route at the
 kernel's default; the kernel won't hold two at the same metric), reporting every problem at once.
@@ -267,8 +271,9 @@ in the [PRD log](.prds/PRD-0004.log.md).
 - `route` adds its routes to the main table and no `ip rule` of its own. A more specific route, or
   another tool's policy routing (Tailscale's subnet routes, say), can still win a target; `route`
   warns, naming the device that won, and leaves it be.
-- A target containing `198.18.0.0/15` (such as `128.0.0.0/1`) leaves that range to sshunnel's fake
-  addresses, with a warning.
+- A target containing `198.18.0.0/15` (such as `128.0.0.0/1`) or `2001:2::/96` (such as
+  `2000::/3`) leaves that range to sshunnel's fake addresses, with a warning, whether or not the
+  machine has IPv6.
 
 ## Install
 

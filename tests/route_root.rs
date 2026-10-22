@@ -15,7 +15,7 @@ use std::{
 use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, geteuid, kill_process};
 use sshunnel::{
-    route::FAKE_RANGE,
+    route::{FAKE_RANGE, FAKE_RANGE6, names::fake_v6},
     tests::{FakeRemote, Pinged, Watched, echo_server, pattern, ping, relay_dir, resolved_leftovers, round_trip, route_command, udp_echo_server},
 };
 use tempfile::TempDir;
@@ -74,6 +74,23 @@ fn is_fake(addr: &IpAddr) -> bool {
     }
 }
 
+/// A native v6 fake, which a v4-mapped one is not.
+fn is_fake_v6(addr: &IpAddr) -> bool {
+    matches!(addr, IpAddr::V6(v6) if FAKE_RANGE6.contains(v6))
+}
+
+/// Whether the machine has IPv6, which the helper needs to turn fake v6 on.
+fn ipv6_on() -> bool {
+    std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6").is_ok_and(|disabled| disabled.trim() == "0")
+}
+
+/// `name`'s v6 fake, the one address an IPv6 lookup finds once AAAA answers.
+fn v6_fake(name: &str) -> IpAddr {
+    let v6 = getent("ahostsv6", name).unwrap_or_else(|| panic!("{name} resolves over IPv6"));
+    assert!(v6.len() == 1 && is_fake_v6(&v6[0]), "{v6:?}");
+    v6[0]
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs root and the host's systemd-resolved; CI runs it under sudo"]
 async fn e2e_route_name_connects_by_name() {
@@ -92,10 +109,18 @@ async fn e2e_route_name_connects_by_name() {
 
     // A name the remote doesn't know doesn't resolve here either.
     assert_eq!(getent("ahostsv4", "nonexistent.corp.example"), None);
-    // AAAA is NODATA: an IPv6 lookup (glibc's ahostsv6 asks with AI_V4MAPPED) finds the A record
-    // alone, v4-mapped. A failed lookup would mean NXDOMAIN or SERVFAIL instead.
-    let v6 = getent("ahostsv6", "wiki.corp.example").expect("an IPv6 lookup finds the A record, v4-mapped");
-    assert!(!v6.is_empty() && v6.iter().all(|addr| matches!(addr, IpAddr::V6(_)) && is_fake(addr)), "{v6:?}");
+    if ipv6_on() {
+        // AAAA is the v6 fake, paired with the v4 one.
+        eprintln!("IPv6 is on: AAAA answers the name's v6 fake");
+        let IpAddr::V4(v4) = fake[0] else { panic!("{fake:?}") };
+        assert_eq!(v6_fake("wiki.corp.example"), IpAddr::V6(fake_v6(v4)));
+    } else {
+        // AAAA is NODATA: an IPv6 lookup (glibc's ahostsv6 asks with AI_V4MAPPED) finds the A record
+        // alone, v4-mapped. A failed lookup would mean NXDOMAIN or SERVFAIL instead.
+        eprintln!("IPv6 is off: AAAA is NODATA, so an IPv6 lookup finds the v4 fake, v4-mapped");
+        let v6 = getent("ahostsv6", "wiki.corp.example").expect("an IPv6 lookup finds the A record, v4-mapped");
+        assert!(!v6.is_empty() && v6.iter().all(|addr| matches!(addr, IpAddr::V6(_)) && is_fake(addr)), "{v6:?}");
+    }
     stop(route).await;
 }
 
@@ -118,6 +143,52 @@ async fn e2e_route_name_udp_reaches_the_remote_by_name() {
     let mut back = [0; 64];
     let n = timeout(WITHIN, app.recv(&mut back)).await.expect("the echo comes back").unwrap();
     assert_eq!(&back[..n], b"by name");
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and the host's systemd-resolved; CI runs it under sudo"]
+async fn e2e_route_name_udp_reaches_the_remote_over_its_v6_fake() {
+    if !root() {
+        return;
+    }
+    if !ipv6_on() {
+        eprintln!("skipped: IPv6 is disabled here (net.ipv6.conf.all.disable_ipv6), so route leaves fake v6 off");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let echo = udp_echo_server().await.unwrap();
+    let route = route_names(&dir).await;
+
+    let fake = v6_fake("wiki.corp.example");
+    // The app sends over IPv6; the relay opens the flow by name, which the remote's /etc/hosts sends
+    // to the echo server on 127.0.0.1.
+    let app = UdpSocket::bind("[::]:0").await.unwrap();
+    app.connect(SocketAddr::new(fake, echo.port())).await.unwrap();
+    app.send(b"by name over v6").await.unwrap();
+    let mut back = [0; 64];
+    let n = timeout(WITHIN, app.recv(&mut back)).await.expect("the echo comes back").unwrap();
+    assert_eq!(&back[..n], b"by name over v6");
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and the host's systemd-resolved; CI runs it under sudo"]
+async fn e2e_route_name_ping_reaches_the_remote_over_its_v6_fake() {
+    if !root() {
+        return;
+    }
+    if !ipv6_on() {
+        eprintln!("skipped: IPv6 is disabled here (net.ipv6.conf.all.disable_ipv6), so route leaves fake v6 off");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let route = route_names(&dir).await;
+
+    let fake = v6_fake("wiki.corp.example");
+    // The app pings over IPv6, and the relay over IPv4: the remote's /etc/hosts has the name at
+    // 127.0.0.1 alone. The reply still comes back as ICMPv6, under the app's identifier.
+    assert_eq!(ping(fake, WITHIN).await.unwrap(), Pinged::Reply, "{fake}");
     stop(route).await;
 }
 

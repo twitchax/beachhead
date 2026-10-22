@@ -50,16 +50,17 @@ pub(crate) struct Netstack {
 
 impl Netstack {
     /// Starts the netstack on `tun`: the device's reader and writer, the packet loop dialing through
-    /// `tunnel`, and the DNS server, which forwards names it doesn't route to `upstreams`.
+    /// `tunnel`, and the DNS server, which forwards names it doesn't route to `upstreams` and answers
+    /// AAAA for the ones it does when `fake_v6` is on.
     ///
     /// # Errors
     ///
     /// Fails when the thread or its runtime can't start, or the device can't join the runtime.
-    pub(crate) async fn start<T: Tunnel>(tun: OwnedFd, tunnel: T, router: Arc<Router>, upstreams: &[IpAddr]) -> Res<Self> {
+    pub(crate) async fn start<T: Tunnel>(tun: OwnedFd, tunnel: T, router: Arc<Router>, upstreams: &[IpAddr], fake_v6: bool) -> Res<Self> {
         let upstreams = upstreams.iter().map(|&addr| SocketAddr::new(addr, DNS_PORT)).collect();
         Self::spawn(move |tasks| {
             let packets = device::spawn(tun, tasks)?;
-            let dns = Arc::new(dns::Server::new(tunnel.clone(), Arc::clone(&router), upstreams));
+            let dns = Arc::new(dns::Server::new(tunnel.clone(), Arc::clone(&router), upstreams, fake_v6));
             tasks.spawn(stack::run(packets, tunnel, router, dns));
             Ok(())
         })
@@ -279,7 +280,7 @@ mod tests {
         let router = Arc::new(Router::new(Targets::parse(&["10.99.0.0/16".to_owned()], &[]).unwrap(), names));
         let (dialed, dials) = mpsc::unbounded_channel();
         let (tun, kernel) = device_pair().unwrap();
-        let netstack = Netstack::start(tun, Recorder(dialed), router, &[]).await.unwrap();
+        let netstack = Netstack::start(tun, Recorder(dialed), router, &[], false).await.unwrap();
         let (app, packets) = AppStack::new().unwrap();
         let far = kernel.as_fd().try_clone_to_owned().unwrap();
         let wire = tokio::spawn(carry(kernel, packets));

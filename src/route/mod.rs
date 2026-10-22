@@ -32,6 +32,9 @@ pub use lifecycle::{Options, run};
 pub const DEVICE: &str = "sshunnel0";
 /// The range fake addresses for routed names are drawn from; `198.18.0.0/24` is reserved.
 pub const FAKE_RANGE: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15);
+/// The range fake IPv6 addresses for routed names live in, inside RFC 5180's benchmarking range: each
+/// is a name's v4 fake in the low 32 bits ([`names::fake_v6`]).
+pub const FAKE_RANGE6: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0), 96);
 /// The device's IPv4 address, inside [`FAKE_RANGE`].
 pub const TUN_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 /// Where the in-process DNS server answers.

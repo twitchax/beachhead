@@ -20,7 +20,7 @@ use sshunnel::{
     flows::MAX_FLOWS,
     route::{
         DNS_ADDR, TUN_ADDR, TUN_ADDR6,
-        names::{FakeMap, today},
+        names::{FakeMap, fake_v6, today},
         router::Router,
         stack::{self, Dns, MAX_HELD, MAX_QUERIES, Packets},
         targets::Targets,
@@ -547,6 +547,24 @@ async fn ping_to_a_fake_address_opens_an_echo_flow_by_name() {
 
     assert_eq!(reply, Some(echo_reply(fake, 9, 1, b"by name")));
     assert_eq!(rig.tunnel.flows(), [echo_flow("wiki.corp.example")]);
+}
+
+#[tokio::test]
+async fn fake_v6_addresses_open_by_name_over_tcp_udp_and_ping() {
+    let rig = rig(&["*.corp.example"]);
+    rig.tunnel.dial("wiki.corp.example", 443, echo_server().await.unwrap());
+    rig.tunnel.udp("wiki.corp.example", 5353, udp_echo_server().await.unwrap());
+    rig.tunnel.echo("wiki.corp.example");
+    let fake = IpAddr::V6(fake_v6(rig.router.names().address("wiki.corp.example", today())));
+
+    assert_echoes(&rig.app, SocketAddr::new(fake, 443), 4096).await;
+    let answer = rig.app.exchange(SocketAddr::new(fake, 5353), b"by name").await;
+    let reply = rig.app.echo(fake, 9, 1, b"by name").await;
+
+    assert_eq!(answer.as_deref(), Some(&b"by name"[..]));
+    assert_eq!(reply, Some(echo_reply(fake, 9, 1, b"by name")));
+    assert_eq!(rig.tunnel.opens(), [("wiki.corp.example".to_owned(), 443)]);
+    assert_eq!(rig.tunnel.flows(), [udp_flow("wiki.corp.example", 5353), echo_flow("wiki.corp.example")]);
 }
 
 #[tokio::test]

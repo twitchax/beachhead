@@ -59,7 +59,8 @@ every connection.
 and with a `NOPASSWD` sudoers line anything running as the user can too, so it trusts nothing the
 client sends: it connects only to a socket that user owns (checked through an `O_PATH` fd, never by
 name), re-parses the targets and re-runs every refusal as root against its own route snapshot,
-honors only pins inside a route and works out their gateways itself, runs iproute2 and
+honors only pins inside a route and works out their gateways itself, decides whether fake v6 is on
+(it tries the device's v6 address) and reports it in `Ready`, runs iproute2 and
 resolvectl from a fixed `PATH`, and at teardown deletes the device itself while its fd still holds
 it (any fd's holder can make the device persistent, so the last fd closing proves nothing). It and
 `route::system` (the system calls behind it) are Linux only. In product code, the two TUN ioctls

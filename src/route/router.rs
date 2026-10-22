@@ -7,7 +7,11 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
-use crate::route::{FAKE_RANGE, names::FakeMap, targets::Targets};
+use crate::route::{
+    FAKE_RANGE,
+    names::{FakeMap, fake_v4},
+    targets::Targets,
+};
 
 /// A session's targets and the fake-address map they route names through.
 #[derive(Debug)]
@@ -23,17 +27,22 @@ impl Router {
     }
 
     /// The host the relay should dial for a connection to `addr`: the name behind a fake address
-    /// when the targets route that name, the address itself when the targets route it, else
-    /// `None`. A fake address with no name, or a name this session doesn't route, is `None`.
+    /// (a v6 fake through its v4 one) when the targets route that name, the address itself when the
+    /// targets route it, else `None`. A fake address with no name, or a name this session doesn't
+    /// route, is `None`.
     #[must_use]
     pub fn destination(&self, addr: IpAddr) -> Option<String> {
-        match addr {
-            IpAddr::V4(v4) if FAKE_RANGE.contains(&v4) => {
+        let fake = match addr {
+            IpAddr::V4(v4) => FAKE_RANGE.contains(&v4).then_some(v4),
+            IpAddr::V6(v6) => fake_v4(v6),
+        };
+        match fake {
+            Some(v4) => {
                 let names = self.names();
                 let name = names.name(v4)?;
                 self.targets.routes_name(name).then(|| name.to_owned())
             }
-            _ => self.targets.routes_addr(addr).then(|| addr.to_string()),
+            None => self.targets.routes_addr(addr).then(|| addr.to_string()),
         }
     }
 
@@ -59,7 +68,10 @@ mod unit {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::route::{DNS_ADDR, TUN_ADDR, names::today};
+    use crate::route::{
+        DNS_ADDR, TUN_ADDR,
+        names::{fake_v6, today},
+    };
 
     fn router(include: &[&str], exclude: &[&str]) -> (Router, TempDir) {
         let state = TempDir::new().unwrap();
@@ -100,5 +112,28 @@ mod unit {
         assert_eq!(router.destination(DNS_ADDR.into()), None);
         assert_eq!(router.destination(TUN_ADDR.into()), None);
         assert_eq!(router.destination(Ipv4Addr::new(198, 17, 0, 1).into()), Some("198.17.0.1".to_owned()));
+    }
+
+    #[test]
+    fn fake_v6_addresses_dial_by_name() {
+        let (router, _state) = router(&["*.corp.example"], &["secret.corp.example"]);
+        let wiki = router.names().address("wiki.corp.example", today());
+        let secret = router.names().address("secret.corp.example", today());
+
+        assert_eq!(router.destination(fake_v6(wiki).into()), Some("wiki.corp.example".to_owned()));
+        assert_eq!(router.destination(fake_v6(secret).into()), None);
+        assert_eq!(router.destination(fake_v6(Ipv4Addr::new(198, 18, 200, 7)).into()), None);
+    }
+
+    #[test]
+    fn fake_v6_range_is_never_routed_by_address() {
+        // A CIDR target containing the v6 fake range reaches neither its unassigned fakes nor the
+        // addresses whose low bits fall outside the v4 range.
+        let (router, _state) = router(&["2001::/16"], &[]);
+
+        assert_eq!(router.destination(fake_v6(Ipv4Addr::new(198, 18, 200, 7)).into()), None);
+        assert_eq!(router.destination(fake_v6(DNS_ADDR).into()), None);
+        assert_eq!(router.destination("2001:2::1".parse().unwrap()), None);
+        assert_eq!(router.destination("2001:3::1".parse().unwrap()), Some("2001:3::1".to_owned()));
     }
 }
