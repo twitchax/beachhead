@@ -434,7 +434,7 @@ fn apply(setup: &Setup) -> Res<(Applied, Ready)> {
     within_cap(&routes, &pins)?;
 
     let tun = system::create_tun()?;
-    let fake_v6 = decide_fake_v6(&targets, &routes, &mut run_step);
+    let fake_v6 = decide_fake_v6(&targets, &mut run_step);
     // Holding the device means no other session is running, so any pinned route left is a dead one's.
     let proto = PIN_PROTO.to_string();
     for family in ["-4", "-6"] {
@@ -531,9 +531,10 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)], fake_v6: bo
     }
 
     let mut steps = vec![Step::new("ip", ["addr", "add", &format!("{TUN_ADDR}/{}", FAKE_RANGE.prefix_len()), "dev", DEVICE])];
-    // Only v6 routes need a v6 source, and adding one where IPv6 is disabled would fail every run.
-    // Fake v6 wants it too: without v6 routes, `decide_fake_v6` added it already.
-    if device_routes.iter().any(|route| matches!(route, IpNet::V6(_))) {
+    // Only v6 routes and fake v6 need a v6 source, and adding one where IPv6 is disabled would fail
+    // every run. With fake v6 on, `decide_fake_v6` added it already; otherwise v6 routes add it here,
+    // and where its trial failed, this fails the run.
+    if !fake_v6 && device_routes.iter().any(|route| matches!(route, IpNet::V6(_))) {
         steps.push(addr6());
     }
     steps.push(Step::new("ip", ["link", "set", "dev", DEVICE, "mtu", &MTU.to_string(), "up"]));
@@ -548,17 +549,9 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)], fake_v6: bo
         step.pin = Some(host.addr());
         steps.push(step);
     }
-    for route in device_routes {
-        let mut step = Step::new("ip", ["route", "add", &route.to_string(), "dev", DEVICE]);
-        // The metric the refusals checked for; v6 has to name it, since a 0 there means 1024.
-        let metric = system::add_metric(route);
-        if metric != 0 {
-            step.args.extend(["metric".to_owned(), metric.to_string()]);
-        }
-        steps.push(step);
-    }
+    steps.extend(device_routes.into_iter().map(device_route));
     if fake_v6 {
-        steps.push(Step::new("ip", ["route", "add", &FAKE_RANGE6.to_string(), "dev", DEVICE]));
+        steps.push(device_route(&IpNet::V6(FAKE_RANGE6)));
     }
 
     if targets.has_names() {
@@ -573,21 +566,29 @@ fn plan(targets: &Targets, routes: &[IpNet], vias: &[(IpAddr, Via)], fake_v6: bo
     Plan { steps, warnings }
 }
 
+/// `route` on the device, at the metric the refusals checked for: v6 has to name it, since a 0 there
+/// means 1024.
+fn device_route(route: &IpNet) -> Step {
+    let mut step = Step::new("ip", ["route", "add", &route.to_string(), "dev", DEVICE]);
+    let metric = system::add_metric(route);
+    if metric != 0 {
+        step.args.extend(["metric".to_owned(), metric.to_string()]);
+    }
+    step
+}
+
 /// The device's v6 address.
 fn addr6() -> Step {
     Step::new("ip", ["addr", "add", &TUN_ADDR6.to_string(), "dev", DEVICE])
 }
 
 /// Whether matched names get fake v6 addresses, run right after the device exists: only with names,
-/// and only where the device can have its v6 address, the source apps reach the fakes from. v6 routes
-/// need that address anyway, and the plan adds it (a failure there fails the run); without them it
-/// is tried here, and a failure (IPv6 disabled) only turns fake v6 off.
-fn decide_fake_v6(targets: &Targets, routes: &[IpNet], run: &mut impl FnMut(&Step) -> Void) -> bool {
+/// and only with the device's v6 address up, the source apps reach the fakes from. With names this
+/// adds that address, and fake v6 is whether it took: a failure (IPv6 disabled) only turns fake v6
+/// off, unless v6 routes need the address too, when the plan's own add fails the run.
+fn decide_fake_v6(targets: &Targets, run: &mut impl FnMut(&Step) -> Void) -> bool {
     if !targets.has_names() {
         return false;
-    }
-    if routes.iter().any(|route| matches!(route, IpNet::V6(_))) {
-        return true;
     }
     match run(&addr6()) {
         Ok(()) => true,
@@ -1158,14 +1159,14 @@ mod tests {
         assert_eq!(
             rendered(&plan(&targets, &targets.routes(), &vias, true).steps),
             [
+                // The device's v6 address is fake v6's trial, before the plan.
                 "ip addr add 198.18.0.1/15 dev sshunnel0",
-                "ip addr add fd73:7368::1/64 dev sshunnel0",
                 "ip link set dev sshunnel0 mtu 65535 up",
                 "ip route add 10.99.0.5/32 via 192.0.2.1 dev eth0 proto 222",
                 "ip route add fd99::5/128 dev eth0 proto 222",
                 "ip route add 10.99.0.0/17 dev sshunnel0",
                 "ip route add fd99::/64 dev sshunnel0 metric 1",
-                "ip route add 2001:2::/96 dev sshunnel0",
+                "ip route add 2001:2::/96 dev sshunnel0 metric 1",
                 "resolvectl default-route sshunnel0 false",
                 "resolvectl dnssec sshunnel0 no",
                 "resolvectl dnsovertls sshunnel0 no",
@@ -1186,7 +1187,7 @@ mod tests {
                 "ip addr add 198.18.0.1/15 dev sshunnel0",
                 "ip link set dev sshunnel0 mtu 65535 up",
                 "ip route add 10.99.0.0/16 dev sshunnel0",
-                "ip route add 2001:2::/96 dev sshunnel0",
+                "ip route add 2001:2::/96 dev sshunnel0 metric 1",
                 "resolvectl default-route sshunnel0 false",
                 "resolvectl dnssec sshunnel0 no",
                 "resolvectl dnsovertls sshunnel0 no",
@@ -1198,33 +1199,79 @@ mod tests {
         assert!(!off.iter().any(|step| step.contains("2001:2::") || step.contains("fd73:")), "{off:#?}");
     }
 
+    const ADDR6: &str = "ip addr add fd73:7368::1/64 dev sshunnel0";
+
+    /// What `apply` runs once the device exists, with the commands in `failing` failing: the fake v6
+    /// decision, then the plan. Returns the decision, the plan's result and every command run.
+    fn set_up(targets: &Targets, vias: &[(IpAddr, Via)], failing: &[&str]) -> (bool, Res<Vec<IpAddr>>, Vec<String>) {
+        let mut log = Vec::new();
+        let mut run = recorder(&mut log, failing);
+        let fake_v6 = decide_fake_v6(targets, &mut run);
+        let executed = execute(&plan(targets, &targets.routes(), vias, fake_v6).steps, &mut run);
+        drop(run);
+        (fake_v6, executed, log)
+    }
+
+    fn adds_of_addr6(log: &[String]) -> usize {
+        log.iter().filter(|step| *step == ADDR6).count()
+    }
+
     #[test]
     fn fake_v6_helper_turns_off_when_the_address_fails() {
-        const ADDR6: &str = "ip addr add fd73:7368::1/64 dev sshunnel0";
         let names = Targets::parse(&strings(&["10.99.0.0/16", "*.corp.example"]), &[]).unwrap();
 
         // IPv6 disabled: the address fails, fake v6 is off, and the run goes on without it.
-        let mut log = Vec::new();
-        let mut run = recorder(&mut log, &[ADDR6]);
-        assert!(!decide_fake_v6(&names, &names.routes(), &mut run));
-        assert!(execute(&plan(&names, &names.routes(), &[], false).steps, &mut run).is_ok());
-        drop(run);
+        let (fake_v6, executed, log) = set_up(&names, &[], &[ADDR6]);
+        assert!(!fake_v6 && executed.is_ok(), "{executed:?}");
         assert_eq!(log[0], ADDR6);
         assert!(log[1..].iter().all(|step| !step.contains("fd73:") && !step.contains("2001:2::")), "{log:#?}");
 
-        // The address takes: fake v6 is on.
-        let mut log = Vec::new();
-        assert!(decide_fake_v6(&names, &names.routes(), &mut recorder(&mut log, &[])));
-        assert_eq!(log, [ADDR6]);
+        // The address takes: fake v6 is on, and the plan doesn't add it again.
+        let (fake_v6, executed, log) = set_up(&names, &[], &[]);
+        assert!(fake_v6 && executed.is_ok(), "{executed:?}");
+        assert_eq!((log[0].as_str(), adds_of_addr6(&log)), (ADDR6, 1));
+        assert!(log.contains(&"ip route add 2001:2::/96 dev sshunnel0 metric 1".to_owned()), "{log:#?}");
 
-        // v6 routes need the address anyway, and the plan adds it (a failure there fails the run).
+        // With v6 routes the trial decides too, and its failure fails the run at the plan's own add.
         let v6 = Targets::parse(&strings(&["fd99::/64", "*.corp.example"]), &[]).unwrap();
-        let mut log = Vec::new();
-        assert!(decide_fake_v6(&v6, &v6.routes(), &mut recorder(&mut log, &[])));
-        // Without names, fake v6 is off and nothing is tried.
-        let cidrs = Targets::parse(&strings(&["10.99.0.0/16"]), &[]).unwrap();
-        assert!(!decide_fake_v6(&cidrs, &cidrs.routes(), &mut recorder(&mut log, &[])));
-        assert_eq!(log, Vec::<String>::new());
+        let (fake_v6, executed, log) = set_up(&v6, &[], &[]);
+        assert!(fake_v6 && executed.is_ok(), "{executed:?}");
+        assert_eq!((log[0].as_str(), adds_of_addr6(&log)), (ADDR6, 1));
+        let (fake_v6, executed, log) = set_up(&v6, &[], &[ADDR6]);
+        assert!(!fake_v6);
+        assert_eq!(format!("{:#}", executed.unwrap_err()), "RTNETLINK answers: File exists");
+        assert_eq!(adds_of_addr6(&log), 2, "{log:#?}");
+
+        // Without names, nothing is tried: the plan adds the address for its v6 routes alone.
+        let cidrs = Targets::parse(&strings(&["fd99::/64"]), &[]).unwrap();
+        let (fake_v6, executed, log) = set_up(&cidrs, &[], &[]);
+        assert!(!fake_v6 && executed.is_ok(), "{executed:?}");
+        assert_eq!((log[0].as_str(), adds_of_addr6(&log)), ("ip addr add 198.18.0.1/15 dev sshunnel0", 1));
+    }
+
+    #[test]
+    fn fake_v6_has_its_address_when_every_v6_target_is_a_pin() {
+        // fd99::5 keeps its route, so no v6 route goes on the device; fake v6 still needs the address.
+        let pinned = Targets::parse(&strings(&["fd99::5", "*.corp.example"]), &[]).unwrap();
+
+        let (fake_v6, executed, log) = set_up(&pinned, &[(addr("fd99::5"), via("eth0", None))], &[]);
+
+        assert!(fake_v6 && executed.is_ok(), "{executed:?}");
+        assert_eq!(
+            log,
+            [
+                ADDR6,
+                "ip addr add 198.18.0.1/15 dev sshunnel0",
+                "ip link set dev sshunnel0 mtu 65535 up",
+                "ip route add fd99::5/128 dev eth0 proto 222",
+                "ip route add 2001:2::/96 dev sshunnel0 metric 1",
+                "resolvectl default-route sshunnel0 false",
+                "resolvectl dnssec sshunnel0 no",
+                "resolvectl dnsovertls sshunnel0 no",
+                "resolvectl domain sshunnel0 ~corp.example",
+                "resolvectl dns sshunnel0 198.18.0.2",
+            ]
+        );
     }
 
     #[test]

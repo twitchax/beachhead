@@ -21,9 +21,9 @@ use crate::{
     base::{Res, Void},
     relays::Relays,
     route::{
-        DEVICE, FAKE_RANGE, PING_WARNING,
+        DEVICE, FAKE_RANGE, FAKE_RANGE6, PING_WARNING,
         helper::{Helper, Setup, Signals},
-        names::{FakeMap, state_path, today},
+        names::{self, FakeMap, state_path, today},
         peers,
         router::Router,
         system::{self, Via},
@@ -34,7 +34,7 @@ use crate::{
 };
 
 /// An address in the fake range past its reserved `/24`: where the kernel sends it, it sends
-/// every name's fake address.
+/// every name's fake address. Its v6 fake does the same for the v6 range.
 const FAKE_PROBE: Ipv4Addr = Ipv4Addr::new(198, 18, 1, 1);
 
 /// What to route, as the user wrote it.
@@ -71,14 +71,15 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
         connected = connect(ssh, destination, relays, &upstreams) => connected?,
     };
     warned.warn(&pins.warnings);
-    let probes = probes(&targets.routes(), targets.has_names(), &pins.addrs, &connected);
     let status = status_line(&targets, destination);
 
     let (include, exclude) = targets.args();
+    let setup = Setup { include, exclude, pins: pins.addrs };
     // Uncancellable: sudo handles a Ctrl-C itself, and the helper, which sees it too, tears down
     // right after it answers. A signal meanwhile waits for the select below.
-    let mut helper = Helper::start(&Setup { include, exclude, pins: pins.addrs }).await?;
+    let mut helper = Helper::start(&setup).await?;
     warned.warn(helper.warnings());
+    let probes = probes(&targets.routes(), targets.has_names(), helper.fake_v6(), &setup.pins, &connected);
 
     let router = Arc::new(Router::new(targets, names));
     let mut netstack = None;
@@ -189,9 +190,10 @@ struct Probe {
     label: String,
 }
 
-/// Each route's first address, and with names a fake address. An address that keeps its route by
-/// design is skipped: a pin, or one in a connected subnet (the checks already said so).
-fn probes(routes: &[IpNet], names: bool, pins: &[IpAddr], connected: &[IpNet]) -> Vec<Probe> {
+/// Each route's first address, with names a fake address, and with fake v6 on (the helper's call)
+/// its v6 fake. An address that keeps its route by design is skipped: a pin, or one in a connected
+/// subnet (the checks already said so).
+fn probes(routes: &[IpNet], names: bool, fake_v6: bool, pins: &[IpAddr], connected: &[IpNet]) -> Vec<Probe> {
     let mut probes: Vec<Probe> = routes
         .iter()
         .map(|route| Probe {
@@ -204,6 +206,12 @@ fn probes(routes: &[IpNet], names: bool, pins: &[IpAddr], connected: &[IpNet]) -
         probes.push(Probe {
             addr: FAKE_PROBE.into(),
             label: format!("the fake range {FAKE_RANGE}"),
+        });
+    }
+    if fake_v6 {
+        probes.push(Probe {
+            addr: names::fake_v6(FAKE_PROBE).into(),
+            label: format!("the fake range {FAKE_RANGE6}"),
         });
     }
     probes
@@ -353,10 +361,22 @@ mod tests {
     fn each_route_is_probed_at_its_first_address() {
         let routes = [net("10.99.0.0/16"), net("fd99::/64")];
 
-        assert_eq!(probes(&routes, false, &[], &[]), [probe("10.99.0.0", "10.99.0.0/16"), probe("fd99::", "fd99::/64")]);
+        assert_eq!(probes(&routes, false, false, &[], &[]), [probe("10.99.0.0", "10.99.0.0/16"), probe("fd99::", "fd99::/64")]);
         assert_eq!(
-            probes(&routes[..1], true, &[], &[]),
+            probes(&routes[..1], true, false, &[], &[]),
             [probe("10.99.0.0", "10.99.0.0/16"), probe("198.18.1.1", "the fake range 198.18.0.0/15")]
+        );
+    }
+
+    #[test]
+    fn fake_v6_range_is_probed_when_on() {
+        let routes = [net("10.99.0.0/16")];
+        let v4 = [probe("10.99.0.0", "10.99.0.0/16"), probe("198.18.1.1", "the fake range 198.18.0.0/15")];
+
+        assert_eq!(probes(&routes, true, false, &[], &[]), v4);
+        assert_eq!(
+            probes(&routes, true, true, &[], &[]),
+            [v4[0].clone(), v4[1].clone(), probe("2001:2::c612:101", "the fake range 2001:2::/96")]
         );
     }
 
@@ -364,7 +384,7 @@ mod tests {
     fn each_target_is_probed_on_its_own() {
         let routes = targets(&["10.98.0.0/16", "10.99.0.0/16"], &[]).routes();
 
-        assert_eq!(probes(&routes, false, &[], &[]), [probe("10.98.0.0", "10.98.0.0/16"), probe("10.99.0.0", "10.99.0.0/16")]);
+        assert_eq!(probes(&routes, false, false, &[], &[]), [probe("10.98.0.0", "10.98.0.0/16"), probe("10.99.0.0", "10.99.0.0/16")]);
     }
 
     #[test]
@@ -372,7 +392,7 @@ mod tests {
         // A pinned peer that is a whole target, and a target whose start is a connected subnet.
         let routes = [net("192.0.2.7/32"), net("10.0.0.0/8"), net("10.99.0.0/16")];
 
-        let probed = probes(&routes, false, &[addr("192.0.2.7")], &[net("10.0.0.0/24")]);
+        let probed = probes(&routes, false, false, &[addr("192.0.2.7")], &[net("10.0.0.0/24")]);
 
         assert_eq!(probed, [probe("10.99.0.0", "10.99.0.0/16")]);
     }

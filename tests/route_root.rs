@@ -79,9 +79,12 @@ fn is_fake_v6(addr: &IpAddr) -> bool {
     matches!(addr, IpAddr::V6(v6) if FAKE_RANGE6.contains(v6))
 }
 
-/// Whether the machine has IPv6, which the helper needs to turn fake v6 on.
+/// Whether the machine has IPv6, which the helper needs to turn fake v6 on: `all` disables it on
+/// every device, and a new device, as `sshunnel0` is, starts with `default`'s setting.
 fn ipv6_on() -> bool {
-    std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6").is_ok_and(|disabled| disabled.trim() == "0")
+    ["all", "default"]
+        .into_iter()
+        .all(|conf| std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{conf}/disable_ipv6")).is_ok_and(|disabled| disabled.trim() == "0"))
 }
 
 /// `name`'s v6 fake, the one address an IPv6 lookup finds once AAAA answers.
@@ -153,7 +156,7 @@ async fn e2e_route_name_udp_reaches_the_remote_over_its_v6_fake() {
         return;
     }
     if !ipv6_on() {
-        eprintln!("skipped: IPv6 is disabled here (net.ipv6.conf.all.disable_ipv6), so route leaves fake v6 off");
+        eprintln!("skipped: IPv6 is disabled here (net.ipv6.conf.all or .default.disable_ipv6), so route leaves fake v6 off");
         return;
     }
     let dir = TempDir::new().unwrap();
@@ -179,7 +182,7 @@ async fn e2e_route_name_ping_reaches_the_remote_over_its_v6_fake() {
         return;
     }
     if !ipv6_on() {
-        eprintln!("skipped: IPv6 is disabled here (net.ipv6.conf.all.disable_ipv6), so route leaves fake v6 off");
+        eprintln!("skipped: IPv6 is disabled here (net.ipv6.conf.all or .default.disable_ipv6), so route leaves fake v6 off");
         return;
     }
     let dir = TempDir::new().unwrap();
