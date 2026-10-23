@@ -7,6 +7,12 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-23
+
+UDP through `forward` and `route`, and ping and every DNS record type through `route`. A minor
+version rather than a patch because the libraries' public API changes (listed under Changed), which
+below 1.0 moves the minor version.
+
 ### Added
 
 - Protocol v4: UDP and echo flows, datagrams outside credit, raw DNS queries, and the relay's

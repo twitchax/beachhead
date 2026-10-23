@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "sshunnel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "sshunnel-mux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "sshunnel-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",

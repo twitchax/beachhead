@@ -7,7 +7,7 @@ default-members = [".", "crates/sshunnel-mux", "crates/sshunnel-relay"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Aaron Roney <twitchax@gmail.com>"]
 license = "MIT"
@@ -19,8 +19,8 @@ bytes = "1"
 # Each crate opts into exactly the tokio features it needs: the relay's list is its size budget.
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
-sshunnel = { path = ".", version = "0.1.0", default-features = false }
-sshunnel-mux = { path = "crates/sshunnel-mux", version = "0.1.0" }
+sshunnel = { path = ".", version = "0.2.0", default-features = false }
+sshunnel-mux = { path = "crates/sshunnel-mux", version = "0.2.0" }
 
 [package]
 name = "sshunnel"
