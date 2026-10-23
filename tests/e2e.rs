@@ -411,13 +411,17 @@ async fn e2e_udp_flood_does_not_stall_tcp() {
 
 /// uat-005: a UDP flood on the session leaves another flow's request and reply exchanges (a
 /// ping-pong, as DNS does) succeeding, within a loss bound tuned from measured runs
-/// (`.prds/PRD-0006.log.md`, T-004). The two senders share the listener and the echo server.
+/// (`.prds/PRD-0006.log.md`, T-004). Each flow has a forward and an echo server of its own, so
+/// what they share is sshunnel's: the session, the mux, the ssh pipe and the relay. A listener's
+/// socket buffer is the kernel's, shared by every sender on its port: a flood that outruns the
+/// forward fills it, and whatever else arrives then is dropped before sshunnel sees it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_udp_flood_does_not_starve_another_flow() {
     let dir = TempDir::new().unwrap();
-    let echo = udp_echo_server().await.unwrap();
-    let (_child, addrs, _) = start_forwards(sshunnel(&dir), &dir, &[&format!("0:127.0.0.1:{}/udp", echo.port())]).await;
-    let socket = udp_to("127.0.0.1:0", &addrs[0]).await;
+    let (flooded, exchanged) = (udp_echo_server().await.unwrap(), udp_echo_server().await.unwrap());
+    let specs = [format!("0:127.0.0.1:{}/udp", flooded.port()), format!("0:127.0.0.1:{}/udp", exchanged.port())];
+    let (_child, addrs, _) = start_forwards(sshunnel(&dir), &dir, &specs.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    let socket = udp_to("127.0.0.1:0", &addrs[1]).await;
 
     let unloaded = exchanges(&socket, 200, 0).await;
     assert_eq!(unloaded, 200, "every exchange succeeds without the flood");

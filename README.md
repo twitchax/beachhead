@@ -84,7 +84,9 @@ it sent to. A flow idles out after 30 s without traffic, or 120 s once it has ca
 reply (conntrack's timeouts), and a session holds at most 4096 flows across its UDP forwards,
 closing the least recently used to open another. Each flow queues at most 32 datagrams (64 KiB)
 each way and drops what doesn't fit, so a flood on one flow stalls neither another flow nor TCP on
-the same session.
+the same session. Senders on one local port do share that port's socket buffer, which is the
+kernel's: a sender flooding a forward faster than it can carry fills it, and the others' datagrams
+are dropped there too. Give a busy flow a forward of its own.
 
 ```text
 $ sshunnel forward --help
