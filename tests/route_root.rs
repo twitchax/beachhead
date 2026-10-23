@@ -49,7 +49,10 @@ fn root() -> bool {
 /// `route` routing `*.corp.example` through `remote`, once its routes are up.
 async fn route_through(dir: &TempDir, remote: &FakeRemote) -> Watched {
     let relays = relay_dir(dir.path()).unwrap();
-    let command = route_command(env!("CARGO_BIN_EXE_sshunnel"), dir.path(), remote.ssh_path(), &relays, &["*.corp.example"]);
+    let mut command = route_command(env!("CARGO_BIN_EXE_sshunnel"), dir.path(), remote.ssh_path(), &relays, &["*.corp.example"]);
+    // As root, the helper runs without sudo and inherits this, so a failure's stderr says why the
+    // helper decided what it did (fake v6 on or off, above all).
+    command.env("RUST_LOG", "sshunnel::route::helper=debug");
     let mut route = Watched::spawn(command).unwrap();
     route.line("sshunnel: routing ", WITHIN).await.unwrap();
     route
@@ -322,7 +325,7 @@ async fn e2e_resolved_routes_only_the_patterns() {
         eprintln!("IPv6 is off: fake v6 is off, so the link routes the v4 reverse zones alone");
     }
     for zone in zones {
-        assert!(link.contains(zone), "{zone} missing from the link: {link}");
+        assert!(link.contains(zone), "{zone} missing from the link: {link}\nroute's stderr:\n{}", route.stderr());
     }
     // Every other name goes where it went before.
     assert_eq!(getent("ahosts", "localhost"), localhost);

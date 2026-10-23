@@ -60,6 +60,12 @@ jobs:
       - name: Namespace tests in Docker
         id: route-docker
         run: SSHUNNEL_NETNS=docker cargo nextest run --workspace --test route
+      # The root tests ping through route, and both their app and the relay (the remote is this
+      # host) open unprivileged ping sockets as root, which the runner's ping_group_range refuses.
+      - name: Allow unprivileged ping
+        run: |
+          sysctl net.ipv4.ping_group_range
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
       # systemd-resolved serves only the host's namespace, so the name tests run as root on the host.
       # No retries here or below: a flake in a step that runs nowhere else must fail, not pass as
       # FLAKY. No fail-fast either, and the sudo step runs even when this one fails: these run only
