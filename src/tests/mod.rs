@@ -644,11 +644,23 @@ pub fn resolved_leftovers() -> Res<Vec<String>> {
     Ok(device_links(&String::from_utf8(out.stdout).context("resolvectl printed something other than UTF-8")?))
 }
 
-/// The lines of a `resolvectl` listing that name [`DEVICE`]'s link.
+/// The entries of a `resolvectl` listing that name [`DEVICE`]'s link, each on one line. resolvectl
+/// wraps an entry at the terminal's width (80 without one) onto indented lines, which belong to it.
 #[cfg(target_os = "linux")]
 fn device_links(listing: &str) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for line in listing.lines() {
+        match entries.last_mut() {
+            Some(entry) if line.starts_with(char::is_whitespace) => {
+                entry.push(' ');
+                entry.push_str(line.trim());
+            }
+            _ => entries.push(line.trim().to_owned()),
+        }
+    }
     let link = format!("({DEVICE})");
-    listing.lines().filter(|line| line.contains(&link)).map(|line| line.trim().to_owned()).collect()
+    entries.retain(|entry| entry.contains(&link));
+    entries
 }
 
 /// Every route in every table, v4 then v6, one line of `ip` each.
@@ -798,5 +810,13 @@ mod unit {
         let listing = "Global:\nLink 2 (eth0): ~.\nLink 15 (sshunnel0): ~corp.example\nLink 16 (sshunnel0x):\n";
         assert_eq!(device_links(listing), ["Link 15 (sshunnel0): ~corp.example"]);
         assert_eq!(device_links("Global:\nLink 2 (eth0): ~.\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn resolved_leftovers_join_a_wrapped_link() {
+        // resolvectl wraps a link's list at the terminal's width (80 without one), indenting the
+        // rest as wide as "Global: ".
+        let listing = "Global:\nLink 9 (sshunnel0): ~corp.example ~18.198.in-addr.arpa\n        ~19.198.in-addr.arpa\n        ~0.ip6.arpa\nLink 10 (eth1): ~a\n        ~b\n";
+        assert_eq!(device_links(listing), ["Link 9 (sshunnel0): ~corp.example ~18.198.in-addr.arpa ~19.198.in-addr.arpa ~0.ip6.arpa"]);
     }
 }
