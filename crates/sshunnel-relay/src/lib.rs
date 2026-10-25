@@ -112,13 +112,23 @@ pub async fn serve(mut incoming: Incoming, capabilities: Capabilities) {
     }
 }
 
-async fn dial(request: OpenRequest, permits: Arc<Semaphore>) {
-    let result = match addresses(&permits, request.host(), request.port()).await {
-        Ok(found) => connect_first(&found).await,
-        Err(e) => {
-            request.reject(e.kind, &e.reason);
-            return;
-        }
+async fn dial(mut request: OpenRequest, permits: Arc<Semaphore>) {
+    // Owned, because waiting on `cancelled` borrows the request for the whole dial.
+    let (host, port) = (request.host().to_owned(), request.port());
+    let dialing = async {
+        let found = addresses(&permits, &host, port).await?;
+        connect_first(&found).await.map_err(|e| OpenError {
+            kind: open_err_kind(&e),
+            reason: format!("dialing {host}:{port}: {e}"),
+        })
+    };
+    let result = tokio::select! {
+        result = dialing => result,
+        // The client dropped its open (a `route` dial evicted past the held-dial cap, say), so
+        // nothing waits on this connect, which could otherwise take the OS connect timeout. The
+        // request drops unanswered, which says nothing: the client has no stream left to answer.
+        // No `debug!`: the relay has no log, as its stderr is the user's terminal.
+        () = request.cancelled() => return,
     };
     match result {
         Ok(socket) => {
@@ -127,10 +137,7 @@ async fn dial(request: OpenRequest, permits: Arc<Semaphore>) {
             // The pump resets the stream itself on failure, which tells the client why.
             let _ = pump(request.accept(), socket).await;
         }
-        Err(e) => {
-            let reason = format!("dialing {}:{}: {e}", request.host(), request.port());
-            request.reject(open_err_kind(&e), &reason);
-        }
+        Err(e) => request.reject(e.kind, &e.reason),
     }
 }
 
@@ -448,6 +455,7 @@ mod unit {
     use std::io::{Error, ErrorKind};
 
     use pretty_assertions::assert_eq;
+    use sshunnel_mux::hello::PeerHello;
 
     use super::*;
 
@@ -545,6 +553,34 @@ mod unit {
         let permits = Semaphore::new(1);
         let found = addresses(&permits, "localhost", 80).await.unwrap();
         assert!(found.contains(&"127.0.0.1:80".parse::<SocketAddr>().unwrap()), "{found:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_given_up_stops() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let config = Config::default();
+        let hello = PeerHello {
+            window: config.window(),
+            capabilities: Capabilities::default(),
+        };
+        let (client, _client_incoming, client_driver) = start(ar, BytesMut::new(), aw, Role::Client, config, hello);
+        let (_relay, mut incoming, relay_driver) = start(br, BytesMut::new(), bw, Role::Relay, config, hello);
+        tokio::spawn(client_driver);
+        tokio::spawn(relay_driver);
+        let opener = {
+            let client = client.clone();
+            tokio::spawn(async move { client.open("localhost", 80).await })
+        };
+        let Some(Request::Open(request)) = incoming.next().await else {
+            panic!("expected an open request")
+        };
+
+        // A name waits for a lookup permit, and there are none: only the client giving up ends it.
+        let permits = Arc::new(Semaphore::new(0));
+        opener.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(1), dial(request, permits)).await.unwrap();
     }
 
     #[tokio::test]

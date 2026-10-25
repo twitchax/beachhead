@@ -67,6 +67,18 @@ impl Stream {
         self.id
     }
 
+    /// Completes once the reader has dropped this stream: the peer reset it, broke the protocol on
+    /// it, or the connection ended. Cancel-safe, and it takes no inbound data. `&mut`, because the
+    /// abort wakes a single waiter.
+    pub(crate) async fn aborted(&mut self) {
+        // The abort closes the credit before it wakes `reset`, and a wake with no one waiting is
+        // kept for the next, so one that lands before the first poll, or between the check and the
+        // wait, still counts.
+        while !self.credit.is_closed() {
+            self.reset.notified().await;
+        }
+    }
+
     /// Resets the stream unless the peer already did.
     fn reset(&mut self, reason: &str) {
         let was_pending = self.state == State::Pending;

@@ -16,10 +16,10 @@ use std::{
 };
 
 use bytes::BytesMut;
-use common::{CHUNK, PIPE_CAP, SOCK_CAP, WINDOW, client_with_hand_peer, connect, connect_pair, hello, next_frame, open_by_hand, small};
+use common::{CHUNK, PIPE_CAP, SOCK_CAP, WINDOW, client_with_hand_peer, connect, connect_pair, hello, next_frame, open_by_hand, pair, small};
 use pretty_assertions::assert_eq;
 use sshunnel_mux::{
-    Config, Mux, Request, ResolveError, Role,
+    Config, Incoming, Mux, OpenError, OpenRequest, Request, ResolveError, Role, Stream,
     frame::{Capabilities, Frame, OpenErrKind, ResolveErrKind, StreamId},
     hello::PeerHello,
     pump, start,
@@ -344,6 +344,68 @@ async fn dropping_an_unanswered_open_request_rejects_it() {
     drop(incoming.next().await.unwrap());
     let frame = peer.next().await;
     assert!(matches!(&frame, Frame::OpenErr { stream, .. } if *stream == id), "{frame:?}");
+}
+
+/// The relay's side of an open the client is still waiting on, and the client's open task.
+async fn open_request(client: &Mux, incoming: &mut Incoming) -> (OpenRequest, JoinHandle<Result<Stream, OpenError>>) {
+    let opener = {
+        let client = client.clone();
+        tokio::spawn(async move { client.open("x", 7).await })
+    };
+    let Some(Request::Open(request)) = incoming.next().await else {
+        panic!("expected an open request")
+    };
+    (request, opener)
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_open_given_up_cancels_its_request() {
+    let (client, mut incoming) = pair(small(), small());
+    let (mut request, opener) = open_request(&client, &mut incoming).await;
+    opener.abort();
+    timeout(Duration::from_secs(1), request.cancelled()).await.expect("dropping the open cancels the request");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_open_still_wanted_is_not_cancelled() {
+    let (client, mut incoming) = pair(small(), small());
+    let (mut request, opener) = open_request(&client, &mut incoming).await;
+    assert!(timeout(Duration::from_secs(10), request.cancelled()).await.is_err(), "an open the client waits on was cancelled");
+    // Waiting took nothing from the request: it still answers.
+    drop(request.accept());
+    opener.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_ending_cancels_an_open_request() {
+    let (_client, mut incoming, mut peer) = client_with_hand_peer();
+    peer.send(Frame::Open {
+        stream: StreamId(2),
+        host: "x".into(),
+        port: 1,
+    })
+    .await;
+    let Some(Request::Open(mut request)) = incoming.next().await else {
+        panic!("expected an open request")
+    };
+    drop(peer);
+    timeout(Duration::from_secs(1), request.cancelled()).await.expect("the session's end cancels the request");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_open_request_drops_without_an_answer() {
+    let (_client, mut incoming, mut peer) = client_with_hand_peer();
+    let id = StreamId(2);
+    peer.send(Frame::Open { stream: id, host: "x".into(), port: 1 }).await;
+    let Some(Request::Open(mut request)) = incoming.next().await else {
+        panic!("expected an open request")
+    };
+    peer.send(Frame::Rst { stream: id, reason: "gave up".into() }).await;
+    timeout(Duration::from_secs(1), request.cancelled()).await.expect("the reset cancels the request");
+    timeout(Duration::from_secs(1), request.cancelled()).await.expect("a cancelled request stays cancelled");
+    // The peer has no stream left to answer, so the drop sends nothing, not even the usual refusal.
+    drop(request);
+    assert_eq!(peer.next_within(Duration::from_secs(1)).await, None);
 }
 
 #[tokio::test(start_paused = true)]

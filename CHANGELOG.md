@@ -12,6 +12,8 @@ why the version moved the way it did.
 - `route` no longer stalls new connections behind dials that hang: past 256 dials in flight (a
   firewall that drops SYNs makes each take about two minutes), the oldest gives way to the new
   connection instead of the new one being dropped.
+- The relay stops dialing when the client gives up on an open, such as a `route` dial evicted past
+  the held-dial cap, instead of trying to connect for up to two minutes.
 
 ## [0.2.0] - 2026-10-23
 
