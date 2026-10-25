@@ -8,8 +8,7 @@ use std::{
 };
 
 use crate::route::{
-    FAKE_RANGE,
-    names::{FakeMap, fake_v4},
+    names::{FakeMap, fake_v4_of},
     targets::Targets,
 };
 
@@ -32,11 +31,7 @@ impl Router {
     /// route, is `None`.
     #[must_use]
     pub fn destination(&self, addr: IpAddr) -> Option<String> {
-        let fake = match addr {
-            IpAddr::V4(v4) => FAKE_RANGE.contains(&v4).then_some(v4),
-            IpAddr::V6(v6) => fake_v4(v6),
-        };
-        match fake {
+        match fake_v4_of(addr) {
             Some(v4) => {
                 let names = self.names();
                 let name = names.name(v4)?;

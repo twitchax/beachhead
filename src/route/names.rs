@@ -13,7 +13,7 @@ use std::{
     ffi::OsString,
     fmt::Write as _,
     fs,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -176,6 +176,16 @@ pub fn fake_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let [.., a, b, c, d] = v6.octets();
     let v4 = Ipv4Addr::new(a, b, c, d);
     (FAKE_RANGE6.contains(&v6) && FAKE_RANGE.contains(&v4)).then_some(v4)
+}
+
+/// The v4 fake behind a fake address of either family: a v4 one inside [`FAKE_RANGE`], or a v6 one
+/// inside [`FAKE_RANGE6`] through [`fake_v4`]. `None` for any other address.
+#[must_use]
+pub fn fake_v4_of(addr: IpAddr) -> Option<Ipv4Addr> {
+    match addr {
+        IpAddr::V4(v4) => FAKE_RANGE.contains(&v4).then_some(v4),
+        IpAddr::V6(v6) => fake_v4(v6),
+    }
 }
 
 /// The address a name hashes to before probing.
@@ -419,6 +429,16 @@ mod tests {
         // No other name lost its address, and the newcomer keeps this one.
         assert_eq!(map.address("full8.corp.example", 200), slot_addr(8));
         assert_eq!(map.address("newcomer.corp.example", 200), addr);
+    }
+
+    #[test]
+    fn fake_v4_of_maps_both_families() {
+        let v4 = Ipv4Addr::new(198, 18, 0, 5);
+
+        assert_eq!(fake_v4_of(v4.into()), Some(v4));
+        assert_eq!(fake_v4_of("2001:2::c612:5".parse().unwrap()), Some(v4));
+        assert_eq!(fake_v4_of("10.99.0.5".parse().unwrap()), None);
+        assert_eq!(fake_v4_of("fd99::1".parse().unwrap()), None);
     }
 
     #[test]

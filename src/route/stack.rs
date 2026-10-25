@@ -70,8 +70,9 @@ use crate::{
 pub const MAX_HELD: usize = 256;
 /// DNS queries answered at once; past this a query is dropped, and the client retries it.
 pub const MAX_QUERIES: usize = 256;
-/// TCP connections the DNS server serves at once; past this a new one is reset, so a burst of them
-/// costs bounded memory and tasks.
+/// TCP connections the DNS server serves at once; past this a new one is reset, so a burst costs
+/// bounded tasks (a socket closed behind data its asker never reads lingers until it does, like
+/// routed TCP's).
 pub const MAX_DNS_CONNS: usize = 64;
 /// Each socket's receive and send buffer: four full-size segments at the default MTU, which lets
 /// window scaling keep a fast app busy without much memory per connection.

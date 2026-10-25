@@ -825,3 +825,40 @@ async fn dns_over_tcp_ends_a_connection_whose_asker_stops_reading() {
     let ended = timeout(Duration::from_secs(2), served).await.expect("ended once the asker took nothing for TCP_IDLE").unwrap();
     assert!(ended.is_err(), "{ended:?}");
 }
+
+#[tokio::test]
+async fn serve_tcp_reads_a_length_and_body_written_apart() {
+    let f = corp();
+    f.tunnel.name("wiki.corp.example", Ok(()));
+    let (mut asker, io) = tokio::io::duplex(1024);
+    let served = tokio::spawn(serve_tcp(Arc::clone(&f.server), io));
+    let framed = framed_dns(&query(9, "wiki.corp.example", TYPE::A)).unwrap();
+
+    // The length alone first: the server has to wait for the body behind it.
+    asker.write_all(&framed[..2]).await.unwrap();
+    asker.flush().await.unwrap();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    asker.write_all(&framed[2..]).await.unwrap();
+
+    let answer = read_framed_dns(&mut asker).await.unwrap();
+    let answer = Packet::parse(&answer).unwrap();
+    assert_eq!((answer.id(), answer.rcode(), answer.answers.len()), (9, RCODE::NoError, 1));
+
+    drop(asker);
+    served.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn serve_tcp_handles_a_zero_length_message() {
+    let f = corp();
+    let (mut asker, io) = tokio::io::duplex(1024);
+    let served = tokio::spawn(serve_tcp(Arc::clone(&f.server), io));
+
+    // An empty message isn't a query: the connection closes with no answer, and no error.
+    asker.write_all(&0_u16.to_be_bytes()).await.unwrap();
+
+    served.await.unwrap().unwrap();
+    assert!(read_framed_dns(&mut asker).await.is_err(), "an answer to an empty message");
+}

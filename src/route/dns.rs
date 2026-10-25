@@ -35,7 +35,7 @@ use crate::{
     base::{Res, Void},
     route::{
         FAKE_RANGE, FAKE_RANGE6,
-        names::{fake_v4, fake_v6, today},
+        names::{fake_v4_of, fake_v6, today},
         reverse::{self, Reverse},
         router::Router,
         stack::Dns,
@@ -134,11 +134,7 @@ impl<T: Tunnel> Server<T> {
     /// The query for the reverse name of `addr`, a fake address: PTR answers the name it was handed
     /// out for, and any other type gets NODATA. An address no name holds is NXDOMAIN.
     fn reverse(&self, packet: &Packet<'_>, question: &Question<'_>, addr: IpAddr) -> Option<Bytes> {
-        let v4 = match addr {
-            IpAddr::V4(v4) => Some(v4),
-            IpAddr::V6(v6) => fake_v4(v6),
-        };
-        let Some(name) = v4.and_then(|v4| self.router.names().name(v4).map(str::to_owned)) else {
+        let Some(name) = fake_v4_of(addr).and_then(|v4| self.router.names().name(v4).map(str::to_owned)) else {
             return reply(packet, RCODE::NameError, Vec::new(), true);
         };
         if !is_in(question, TYPE::PTR) {
