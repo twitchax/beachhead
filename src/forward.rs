@@ -216,7 +216,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(1);
 ///
 /// None: like `ssh -L`, it outlives a failed accept (EMFILE once the process is out of
 /// descriptors) by logging it and retrying after a backoff, and a failed connection is logged and
-/// dropped.
+/// reset. A session that ends resets the app's connections too, best-effort: the binary exits right
+/// after, so a connection task not yet polled closes with a FIN.
 pub async fn serve<T: Tunnel>(tunnel: T, listener: TcpListener, host: Arc<str>, port: u16) -> Void {
     let mut backoff = MIN_BACKOFF;
     loop {

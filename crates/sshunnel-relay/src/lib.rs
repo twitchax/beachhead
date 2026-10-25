@@ -129,7 +129,8 @@ async fn dial(mut request: OpenRequest, permits: Arc<Semaphore>) {
         // The client dropped its open (a `route` dial evicted past the held-dial cap, say), so
         // nothing waits on this connect, which could otherwise take the OS connect timeout. The
         // request drops unanswered, which says nothing: the client has no stream left to answer.
-        // No `debug!`: the relay has no log, as its stderr is the user's terminal.
+        // The relay has no log (its stderr is the user's terminal), and the client's mux already logs
+        // the reset.
         () = request.cancelled() => return,
     };
     match result {

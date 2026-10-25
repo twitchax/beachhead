@@ -19,7 +19,9 @@ use tokio::{task::AbortHandle, time::Instant};
 
 /// The most flows one session holds; the next insert evicts the least recently used.
 pub const MAX_FLOWS: usize = 4096;
-/// How long a flow lives without traffic until it has carried more than one reply.
+/// How long a flow lives without traffic until it has carried more than one reply. A flow still
+/// opening is refreshed by its sender's datagrams too, so a sender that keeps sending keeps a slow
+/// open alive, as conntrack does.
 pub const IDLE: Duration = Duration::from_secs(30);
 /// How long a flow lives without traffic once it has carried more than one reply.
 pub const IDLE_REPLIED: Duration = Duration::from_secs(120);

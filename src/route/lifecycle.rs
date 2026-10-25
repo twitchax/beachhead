@@ -177,7 +177,9 @@ async fn wait(signals: &mut Signals, session: Session, helper: &mut Helper, nets
 
 /// How long an end other than a signal waits for one. A terminal's Ctrl-C (or a service manager
 /// stopping the whole group) reaches ssh and the helper in the same kill, and either can exit before
-/// this process's handler has run: an end followed at once by a signal is the signal's doing.
+/// this process's handler has run: an end followed at once by a signal is the signal's doing. Longer
+/// than the helper's grace because this one waits for the signal to be delivered at all, not just
+/// read.
 const SIGNAL_GRACE: Duration = Duration::from_millis(250);
 
 /// `ended`, unless it is an error and `signal` resolves within [`SIGNAL_GRACE`]: then a clean exit.

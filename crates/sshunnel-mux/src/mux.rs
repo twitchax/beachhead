@@ -404,8 +404,9 @@ impl OpenRequest {
 
     /// Completes once the peer gives up on this open (it resets the stream, as dropping its
     /// [`Mux::open`] does) or the connection ends, so a dial no one waits for can stop; pending
-    /// otherwise. Cancel-safe, for `select!`. Once it has completed, dropping the request tells the
-    /// peer nothing: it has no stream left to answer.
+    /// otherwise. It also completes when the peer breaks the protocol on the pending stream. Cancel-safe,
+    /// for `select!`. Once it has completed, answering is pointless: drop the request, which tells
+    /// the peer nothing, as it has no stream left to answer.
     pub async fn cancelled(&mut self) {
         self.stream.aborted().await;
     }

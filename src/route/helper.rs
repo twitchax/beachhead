@@ -322,7 +322,8 @@ async fn connect_client(socket: &Path, uid: u32) -> Res<UnixStream> {
     Ok(conn)
 }
 
-/// How long [`Signals::arrived`] waits for a signal that was sent before the call.
+/// How long [`Signals::arrived`] waits for a signal that was sent before the call: one already
+/// delivered to the process only has to reach tokio's driver, so this is short.
 const SIGNAL_GRACE: Duration = Duration::from_millis(100);
 
 /// SIGINT, SIGTERM and SIGHUP, the ways a terminal or a service manager asks sshunnel to stop. The

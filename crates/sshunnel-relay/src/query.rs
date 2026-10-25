@@ -52,7 +52,7 @@ async fn answer_from(servers: std::io::Result<Vec<SocketAddr>>, message: &[u8], 
 }
 
 /// The first [`MAXNS`] `nameserver` lines of a resolv.conf that parse, on port 53. An IPv6 server
-/// keeps its `%scope`, a number or an interface's name; as in libc, a server whose interface isn't
+/// keeps its `%scope`, a number or an interface's name; as musl does, a server whose interface isn't
 /// there is skipped, and so is an IPv4 server with a scope. An interface's index is read from
 /// sysfs, so this may block.
 #[must_use]

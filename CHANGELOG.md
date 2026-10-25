@@ -7,6 +7,13 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Added
+
+- `sshunnel-mux`: `OpenRequest::cancelled`, which completes when the peer gives up on an open, so a
+  server can abandon its dial.
+- `sshunnel`: `route::names::fake_v4_of`, `route::system::{has_ipv6, families}` and
+  `route::targets::Targets::ipv6_refusal`.
+
 ### Changed
 
 - `forward` resets the app's connection when the remote resets it, where it used to close it
@@ -28,7 +35,8 @@ why the version moved the way it did.
 - Ctrl-C at `route`'s sudo password prompt exits cleanly instead of failing with `sudo exited before
   the root helper started`.
 - The relay asks at most three nameservers, as libc does, and can use a link-local IPv6 nameserver
-  (it kept dropping the `%scope`).
+  (it kept dropping the `%scope`). It also skips a nameserver line libc would, such as an IPv4
+  address with a `%scope` (0.2.0 kept the address and dropped the scope).
 - `cargo xtask package` refuses a tree with uncommitted changes, so `relays/COMMIT` can't name a
   commit the packaged files have left.
 - The 64th unreported socket error in a row now ends a relay flow, as the 0.2.0 notes said (the code

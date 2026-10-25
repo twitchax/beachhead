@@ -48,7 +48,7 @@ jobs:
       # Ubuntu's AppArmor blocks by default; this runner is thrown away after the job.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      # The relay's ping e2e (in the suite) and the root tests open unprivileged ping sockets, which
+      # The relay's ping e2es (in the suite) and the root tests open unprivileged ping sockets, which
       # the runner's ping_group_range refuses.
       - name: Allow unprivileged ping
         run: |
@@ -100,7 +100,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh fish tcsh busybox
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      # The relay's ping e2e (in the suite) opens unprivileged ping sockets, which the runner's
+      # The relay's ping e2es (in the suite) open unprivileged ping sockets, which the runner's
       # ping_group_range refuses.
       - name: Allow unprivileged ping
         run: |

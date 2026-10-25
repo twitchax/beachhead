@@ -293,8 +293,8 @@ in the [PRD log](.prds/PRD-0004.log.md).
   another tool's policy routing (Tailscale's subnet routes, say), can still win a target; `route`
   warns, naming the device that won, and leaves it be.
 - A target containing `198.18.0.0/15` (such as `128.0.0.0/1`) or `2001:2::/96` (such as
-  `2000::/3`) leaves that range to sshunnel's fake addresses, with a warning, whether or not the
-  machine has IPv6.
+  `2000::/3`) leaves that range to sshunnel's fake addresses, with a warning, on a machine with
+  IPv6; without it (next bullet), an IPv6 target is refused.
 - On a kernel booted with `ipv6.disable=1`, `route` takes IPv4 targets only (an IPv6 target is
   refused), and names get v4 fakes only.
 
