@@ -475,7 +475,7 @@ mod unit {
     use pretty_assertions::assert_eq;
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
-        net::TcpStream,
+        net::{TcpSocket, TcpStream},
         time::timeout,
     };
 
@@ -603,15 +603,20 @@ mod unit {
         panic!("the condition never held");
     }
 
-    /// Serves a forward of `dns.corp.example:80` to `target` on a loopback listener; returns an
-    /// app connected to it.
-    async fn app_through(target: SocketAddr) -> TcpStream {
+    /// Serves a forward of `dns.corp.example:80` to `target` on a loopback listener; returns the
+    /// listener's address.
+    async fn forwarded_to(target: SocketAddr) -> SocketAddr {
         let tunnel = FakeTunnel::new();
         tunnel.dial("dns.corp.example", 80, target);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(tunnel, listener, Arc::from("dns.corp.example"), 80));
-        TcpStream::connect(addr).await.unwrap()
+        addr
+    }
+
+    /// An app connected to a forward of `target`.
+    async fn app_through(target: SocketAddr) -> TcpStream {
+        TcpStream::connect(forwarded_to(target).await).await.unwrap()
     }
 
     #[tokio::test]
@@ -630,19 +635,29 @@ mod unit {
 
     #[tokio::test]
     async fn a_remote_close_still_ends_the_app_with_eof() {
+        // Enough that a slow app leaves bytes queued in the forward's socket when the pump ends.
+        let data = tests::pattern(7, 64 * 1024);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap();
+        let sent = data.clone();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            socket.write_all(b"whole").await.unwrap();
+            socket.write_all(&sent).await.unwrap();
             socket.shutdown().await.unwrap();
         });
-        let mut app = app_through(target).await;
+        let forward = forwarded_to(target).await;
+
+        // A small receive window keeps the bytes queued, and the app's own half-close lets the pump
+        // finish while they are: a zero-linger close then would discard them.
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut app = socket.connect(forward).await.unwrap();
+        app.shutdown().await.unwrap();
 
         let mut everything = Vec::new();
-        let read = timeout(Duration::from_secs(5), app.read_to_end(&mut everything)).await.expect("the app's read ends");
-        assert_eq!(read.unwrap(), 5);
-        assert_eq!(everything, b"whole");
+        let read = timeout(Duration::from_secs(10), app.read_to_end(&mut everything)).await.expect("the app's read ends");
+        assert_eq!(read.unwrap(), data.len());
+        assert!(everything == data, "every byte arrives, then EOF");
     }
 
     #[tokio::test]
