@@ -220,7 +220,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(1);
 pub async fn serve<T: Tunnel>(tunnel: T, listener: TcpListener, host: Arc<str>, port: u16) -> Void {
     let mut backoff = MIN_BACKOFF;
     loop {
-        let (socket, peer) = match listener.accept().await {
+        let (mut socket, peer) = match listener.accept().await {
             Ok(accepted) => {
                 backoff = MIN_BACKOFF;
                 accepted
@@ -239,9 +239,14 @@ pub async fn serve<T: Tunnel>(tunnel: T, listener: TcpListener, host: Arc<str>, 
             // Frames already batch; Nagle would only add latency on top.
             let _ = socket.set_nodelay(true);
             match tunnel.open(&host, port).await {
-                Ok(conn) => match conn.pump(socket).await {
+                Ok(conn) => match conn.pump(&mut socket).await {
                     Ok(traffic) => debug!(%peer, sent = traffic.sent, received = traffic.received, "connection closed"),
-                    Err(e) => debug!(%peer, "connection failed: {e:#}"),
+                    Err(e) => {
+                        // The remote reset (or the session ended): a clean close here would let an
+                        // app reading to EOF take the cut-short stream for a whole one.
+                        let _ = socket.set_zero_linger();
+                        debug!(%peer, "connection failed: {e:#}");
+                    }
                 },
                 Err(e) => warn!(%peer, "{e:#}"),
             }
@@ -468,6 +473,11 @@ mod unit {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use pretty_assertions::assert_eq;
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::TcpStream,
+        time::timeout,
+    };
 
     use super::*;
     use crate::tests::{self, FakeTunnel, until};
@@ -591,6 +601,48 @@ mod unit {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the condition never held");
+    }
+
+    /// Serves a forward of `dns.corp.example:80` to `target` on a loopback listener; returns an
+    /// app connected to it.
+    async fn app_through(target: SocketAddr) -> TcpStream {
+        let tunnel = FakeTunnel::new();
+        tunnel.dial("dns.corp.example", 80, target);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(tunnel, listener, Arc::from("dns.corp.example"), 80));
+        TcpStream::connect(addr).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_remote_reset_resets_the_app() {
+        let target = tests::resetting_server(b"partial").await.unwrap();
+        let mut app = app_through(target).await;
+
+        let mut partial = [0u8; 7];
+        app.read_exact(&mut partial).await.unwrap();
+        assert_eq!(&partial, b"partial");
+        // The server resets once it has the byte, so the payload is read before the reset.
+        app.write_all(b"!").await.unwrap();
+        let next = timeout(Duration::from_secs(5), app.read(&mut partial)).await.expect("the app's read ends");
+        assert_eq!(next.unwrap_err().kind(), ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test]
+    async fn a_remote_close_still_ends_the_app_with_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"whole").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let mut app = app_through(target).await;
+
+        let mut everything = Vec::new();
+        let read = timeout(Duration::from_secs(5), app.read_to_end(&mut everything)).await.expect("the app's read ends");
+        assert_eq!(read.unwrap(), 5);
+        assert_eq!(everything, b"whole");
     }
 
     #[tokio::test]

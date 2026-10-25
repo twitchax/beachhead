@@ -68,6 +68,9 @@ sshunnel: forwarding [::1]:8080 -> server.lan:80
 The relay resolves and dials `server.lan` on the remote, so names that only exist inside that
 network work. `-L` repeats, and every connection rides the one SSH session.
 
+When the remote resets a connection, `forward` resets the app's too, where `ssh -L` closes it
+cleanly, so an app reading to EOF can't take a cut-short stream for a whole one.
+
 A `/udp` suffix forwards UDP instead (`/tcp`, the default, may be written too):
 
 ```text

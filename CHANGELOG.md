@@ -7,6 +7,11 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Changed
+
+- `forward` resets the app's connection when the remote resets it, where it used to close it
+  cleanly, so an app reading to EOF can't take a cut-short stream for a whole one.
+
 ### Fixed
 
 - `route` no longer stalls new connections behind dials that hang: past 256 dials in flight (a

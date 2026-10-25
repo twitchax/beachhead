@@ -360,6 +360,29 @@ pub async fn echo_server() -> Res<SocketAddr> {
     echo_on(listener)
 }
 
+/// Starts a TCP server on a loopback port that writes `payload` to each connection, waits for the
+/// client to send a byte (so the payload has been read before the reset can discard it), then
+/// resets it (zero linger, so the close is an RST rather than a FIN); returns its address.
+///
+/// # Errors
+///
+/// Fails when no loopback port can be bound.
+pub async fn resetting_server(payload: &'static [u8]) -> Res<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.context("binding the resetting server")?;
+    let addr = listener.local_addr().context("reading the resetting server's address")?;
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // Dropping with zero linger sends the RST; a failed write or read has nothing to reset after.
+                if socket.write_all(payload).await.is_ok() && socket.read_u8().await.is_ok() {
+                    let _ = socket.set_zero_linger();
+                }
+            });
+        }
+    });
+    Ok(addr)
+}
+
 /// Echoes every connection `listener` accepts, half-closing after each, on the current runtime;
 /// returns its address.
 ///

@@ -18,7 +18,7 @@ use sshunnel::{
     arch::Arch,
     forward::Forward,
     relays::Relays,
-    tests::{FakeRemote, echo_server, host_arch, pattern, relay_dir, udp_echo_server, udp_peer_server},
+    tests::{FakeRemote, echo_server, host_arch, pattern, relay_dir, resetting_server, udp_echo_server, udp_peer_server},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -199,6 +199,20 @@ async fn e2e_forward_survives_running_out_of_file_descriptors() {
     let served = TcpStream::connect(&addr).await.is_ok() && echo_through(&addr, &data).await == data;
     assert!(served, "the forwarder serves again once descriptors free up; stderr:\n{}", stderr.borrow().join("\n"));
     assert!(child.try_wait().unwrap().is_none(), "the forwarder is still running");
+}
+
+#[tokio::test]
+async fn e2e_forward_remote_reset_reaches_the_app() {
+    let dir = TempDir::new().unwrap();
+    let target = resetting_server(b"partial").await.unwrap();
+    let (_child, addr, _) = start_forward(sshunnel(&dir), &dir, &target.to_string()).await;
+    let mut socket = TcpStream::connect(&addr).await.unwrap();
+    let mut partial = [0u8; 7];
+    timeout(Duration::from_secs(10), socket.read_exact(&mut partial)).await.expect("the payload arrives").unwrap();
+    assert_eq!(&partial, b"partial");
+    socket.write_all(b"!").await.unwrap();
+    let next = timeout(Duration::from_secs(10), socket.read(&mut partial)).await.expect("the app's read ends");
+    assert_eq!(next.unwrap_err().kind(), std::io::ErrorKind::ConnectionReset);
 }
 
 #[tokio::test]
