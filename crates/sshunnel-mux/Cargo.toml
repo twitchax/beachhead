@@ -3,6 +3,7 @@ name = "sshunnel-mux"
 description = "sshunnel's wire protocol and stream multiplexer, shared by the client and the relay."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -17,8 +17,10 @@ over the SSH login I already have. [sshuttle](https://github.com/sshuttle/sshutt
 shape, but it pipes Python to the remote, which leaves it beholden to whatever interpreter (if any)
 the server happens to have. `ssh -D` plus [tun2proxy](https://github.com/tun2proxy/tun2proxy)
 also exists, so sshunnel is worth building only if it beats that combination on UDP, ICMP, DNS
-interception and subnet routing. Milestone 1 builds the push-exec-cache loop and the multiplexed
-transport those features need, and measures their overhead against `ssh -L`.
+interception and subnet routing. Milestone 1 built the push-exec-cache loop and the multiplexed
+transport those features need, with TCP forwarding, and measured their overhead against `ssh -L`.
+Milestone 2 added `route`'s split tunneling over TUN, and milestone 3 added UDP, ping and more DNS
+record types.
 
 ## How it works
 
@@ -278,9 +280,11 @@ in the [PRD log](.prds/PRD-0004.log.md).
 - There are no reverse (`-R`) forwards yet, and a dropped session isn't re-established.
 - A UDP forward has no ICMP to pass on: when the remote reports a closed port or an unreachable
   host, the flow just ends, and the local sender hears nothing.
-- `route` carries TCP, UDP and ping; any other ICMP to a routed address gets ICMP administratively
-  prohibited, and so do UDP to an address nothing routes and, when the remote doesn't allow
-  unprivileged ping, ping itself. One `route` runs at a time.
+- `route` carries TCP, UDP and ping.
+- Any other ICMP to a routed address gets ICMP administratively prohibited.
+- So does UDP to an address nothing routes.
+- So does ping itself, when the remote doesn't allow unprivileged ping.
+- One `route` runs at a time.
 - Apps that resolve names themselves bypass domain patterns: a browser using DNS over HTTPS never
   asks the system resolver. CIDR targets still catch their traffic.
 - Fake addresses only mean something while `route` runs. Answers carry a 5-second TTL, so a cached

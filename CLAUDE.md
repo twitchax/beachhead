@@ -14,10 +14,10 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
 - `.` (`sshunnel`): the client library and a thin binary (`src/bin.rs`) behind the default `cli`
   feature. The binary parses arguments and calls the library; everything testable lives in the
   library. `tests` is the shared fixture factory. `build.rs` embeds the relays in
-  `SSHUNNEL_EMBED_RELAY_DIR`, else a package's own `relays/` (no `.git` beside the manifest), never a
-  checkout's, and fails when its directory's `SHA256SUMS` and relays disagree either way, or when a
-  package's `relays/COMMIT` isn't the commit cargo packaged. A package
-  (`Cargo.toml.orig` beside the manifest) with neither fails to build, so cargo won't publish it.
+  `SSHUNNEL_EMBED_RELAY_DIR`, else a package's own `relays/` (no `.git` beside the manifest), never
+  a checkout's, and fails when its directory's `SHA256SUMS` and relays disagree either way, or when
+  a package's `relays/COMMIT` isn't the commit cargo packaged. A package (`Cargo.toml.orig` beside
+  the manifest) with neither fails to build, so cargo won't publish it.
 - `src/forward.rs`: `sshunnel forward`, on every platform (no Linux-only API). TCP pumps a stream
   per connection; `UdpForwards` keeps one flow table across the session's UDP listeners, a flow per
   local sender. Its listeners never wait (a full queue drops); an entry that goes aborts its open,
@@ -91,14 +91,15 @@ crates.io, `sshunnel`'s binary included (it's what `cargo install sshunnel` buil
 `sshunnel-relay` and `sshunnel`, from this machine, never from CI, with Aaron confirming each
 publish at the time. In order (`.prds/PRD-0005.md`'s Shipping section has the reasons):
 
-1. Tag `vX.Y.Z`, then push `main` and the tag. `release.yml` creates the GitHub release (clients,
+1. `cargo make ci` passes on the commit you tag, and so do the UATs of the PRD that ships.
+2. Tag `vX.Y.Z`, then push `main` and the tag. `release.yml` creates the GitHub release (clients,
    relays, `SHA256SUMS`), in place of a `gh release create` by hand.
-2. `cargo xtask package` from the tagged tree: it rebuilds `relays/` and writes `relays/COMMIT`, packages the crates, and
-   proves the stable build embeds both relays.
-3. `git status --porcelain` prints nothing.
-4. `cargo publish -p sshunnel-mux`, then `-p sshunnel-relay`, then `-p sshunnel --allow-dirty`.
+3. `cargo xtask package` from the tagged tree: it rebuilds `relays/` and writes `relays/COMMIT`,
+   packages the crates, and proves the stable build embeds both relays.
+4. `git status --porcelain` prints nothing.
+5. `cargo publish -p sshunnel-mux`, then `-p sshunnel-relay`, then `-p sshunnel --allow-dirty`.
    Only `sshunnel` takes the flag: cargo refuses the gitignored `relays/` without it, and the flag
-   also drops cargo's own dirty-tree check, which step 3 replaces.
+   also drops cargo's own dirty-tree check, which step 4 replaces.
 
 ## Conventions
 
@@ -107,7 +108,8 @@ publish at the time. In order (`.prds/PRD-0005.md`'s Shipping section has the re
 - **Lints:** the `[workspace.lints]` table in `Cargo.toml` (`all` + `pedantic` + `unused` +
   `unwrap_used` / `expect_used` denied). No new `allow`s beyond a narrow, commented one, and never
   for `too_many_*` or `needless_pass_by_value`: refactor instead.
-- **Errors:** `anyhow` through the `Res` / `Void` aliases, with `.context()` on every `?` that crosses an I/O or parse boundary.
+- **Errors:** `anyhow` through the `Res` / `Void` aliases, with `.context()` on every `?` that
+  crosses an I/O or parse boundary.
 - **Tests:** unit tests in-module, integration and e2e in `tests/` (one subsystem per file, `e2e_*`
   names for tests that spawn the binary), fixtures from the `tests` factory module, behind the
   `testing` feature, which the crate's self dev-dependency turns on for its own tests. Every

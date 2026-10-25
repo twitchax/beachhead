@@ -3,6 +3,7 @@ name = "sshunnel-relay"
 description = "sshunnel's remote half: a small static binary pushed over SSH that dials TCP on the client's behalf."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
