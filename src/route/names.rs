@@ -439,6 +439,8 @@ mod tests {
         assert_eq!(fake_v4_of("2001:2::c612:5".parse().unwrap()), Some(v4));
         assert_eq!(fake_v4_of("10.99.0.5".parse().unwrap()), None);
         assert_eq!(fake_v4_of("fd99::1".parse().unwrap()), None);
+        // Low bits that look like a v4 fake, behind a prefix that is not the v6 range.
+        assert_eq!(fake_v4_of("2001:3::c612:5".parse().unwrap()), None);
     }
 
     #[test]
