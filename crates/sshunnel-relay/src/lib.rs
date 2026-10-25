@@ -26,7 +26,7 @@ use sshunnel_mux::{
 };
 use tokio::{
     net::{TcpStream, UdpSocket},
-    sync::Semaphore,
+    sync::{AcquireError, Semaphore},
 };
 
 /// How many lookups may block at once. Stdio reads and writes share tokio's blocking pool with
@@ -116,7 +116,7 @@ async fn dial(mut request: OpenRequest, permits: Arc<Semaphore>) {
     // Owned, because waiting on `cancelled` borrows the request for the whole dial.
     let (host, port) = (request.host().to_owned(), request.port());
     let dialing = async {
-        let found = addresses(&permits, &host, port).await?;
+        let found = open_addresses(&permits, &host, port).await?;
         connect_first(&found).await.map_err(|e| OpenError {
             kind: open_err_kind(&e),
             reason: format!("dialing {host}:{port}: {e}"),
@@ -154,19 +154,38 @@ async fn connect_first(found: &[SocketAddr]) -> std::io::Result<TcpStream> {
 }
 
 /// Every address `host:port` names: an IP literal at once, a name through the lookup limit
-/// (`getaddrinfo` on the blocking pool). Every open comes through here, so no connect does a
-/// lookup the limit doesn't see.
+/// (`getaddrinfo` on the blocking pool). The permit lasts only while this is awaited, so a caller
+/// that drops it mid-lookup frees the permit before `getaddrinfo` returns; the relay's own opens,
+/// which their client may give up, keep it with the lookup instead.
 ///
 /// # Errors
 ///
 /// An [`OpenError`] of kind `Other` when the name doesn't resolve.
 pub async fn addresses(permits: &Semaphore, host: &str, port: u16) -> Result<Vec<SocketAddr>, OpenError> {
+    addresses_with(host, port, |name| async move {
+        let _permit = permits.acquire().await.map_err(|e| limiter_closed(&e))?;
+        on_blocking_pool(move || resolve_all(&name)).await
+    })
+    .await
+}
+
+/// [`addresses`] for the relay's opens. Every open comes through here, so no connect does a lookup
+/// the limit doesn't see, and a lookup keeps its permit until `getaddrinfo` returns, even once its
+/// open is given up.
+async fn open_addresses(permits: &Arc<Semaphore>, host: &str, port: u16) -> Result<Vec<SocketAddr>, OpenError> {
+    addresses_with(host, port, |name| bounded_lookup(permits, move || resolve_all(&name))).await
+}
+
+/// Every address `host:port` names: an IP literal at once, a name through `lookup`.
+async fn addresses_with<F, L>(host: &str, port: u16, lookup: F) -> Result<Vec<SocketAddr>, OpenError>
+where
+    F: FnOnce(String) -> L,
+    L: Future<Output = Result<Vec<IpAddr>, ResolveError>>,
+{
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    let name = host.to_owned();
-    let found = bounded_lookup(permits, move || resolve_all(&name)).await;
-    match found {
+    match lookup(host.to_owned()).await {
         Ok(ips) => Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()),
         Err(e) => Err(OpenError {
             kind: OpenErrKind::Other,
@@ -178,7 +197,7 @@ pub async fn addresses(permits: &Semaphore, host: &str, port: u16) -> Result<Vec
 /// A UDP flow: a connected socket to the first address that takes one, with datagrams carried
 /// both ways until the client ends the flow.
 async fn udp(request: FlowRequest, permits: Arc<Semaphore>) {
-    let found = match addresses(&permits, request.host(), request.port()).await {
+    let found = match open_addresses(&permits, request.host(), request.port()).await {
         Ok(found) => found,
         Err(e) => {
             request.reject(e.kind, &e.reason);
@@ -200,7 +219,7 @@ async fn udp(request: FlowRequest, permits: Arc<Semaphore>) {
 /// with each datagram (a sequence, then a payload) carried as an echo request, and each echo
 /// reply back as one.
 async fn echo(request: FlowRequest, permits: Arc<Semaphore>, capabilities: Capabilities) {
-    let found = match addresses(&permits, request.host(), 0).await {
+    let found = match open_addresses(&permits, request.host(), 0).await {
         Ok(found) => found,
         Err(e) => {
             request.reject(e.kind, &e.reason);
@@ -357,16 +376,42 @@ async fn resolve(request: ResolveRequest, permits: Arc<Semaphore>) {
 }
 
 /// Runs `lookup` on the blocking pool once a permit is free. Waiting happens here, in the
-/// request's own task, never in the serve loop.
-async fn bounded_lookup<T, F>(permits: &Semaphore, lookup: F) -> Result<T, ResolveError>
+/// request's own task, never in the serve loop. The permit goes to the lookup's thread: a caller
+/// that gives up leaves the queue, but a `getaddrinfo` already running holds its permit until it
+/// returns, so the limit bounds the threads lookups take.
+async fn bounded_lookup<T, F>(permits: &Arc<Semaphore>, lookup: F) -> Result<T, ResolveError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ResolveError> + Send + 'static,
 {
-    let failed = |reason: String| ResolveError { kind: ResolveErrKind::Failed, reason };
-    let _permit = permits.acquire().await.map_err(|e| failed(format!("the lookup limiter closed: {e}")))?;
-    // getaddrinfo blocks, and may for seconds on a slow resolver.
-    tokio::task::spawn_blocking(lookup).await.unwrap_or_else(|e| Err(failed(format!("the lookup task failed: {e}"))))
+    let permit = Arc::clone(permits).acquire_owned().await.map_err(|e| limiter_closed(&e))?;
+    on_blocking_pool(move || {
+        let _permit = permit;
+        lookup()
+    })
+    .await
+}
+
+/// Runs `lookup` on the blocking pool: getaddrinfo blocks, and may for seconds on a slow resolver.
+async fn on_blocking_pool<T, F>(lookup: F) -> Result<T, ResolveError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ResolveError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(lookup).await.unwrap_or_else(|e| {
+        Err(ResolveError {
+            kind: ResolveErrKind::Failed,
+            reason: format!("the lookup task failed: {e}"),
+        })
+    })
+}
+
+/// A lookup that got no permit because the limiter closed.
+fn limiter_closed(e: &AcquireError) -> ResolveError {
+    ResolveError {
+        kind: ResolveErrKind::Failed,
+        reason: format!("the lookup limiter closed: {e}"),
+    }
 }
 
 /// Resolves `host` with the platform resolver (musl's `getaddrinfo` in the shipped relay), which
@@ -530,6 +575,34 @@ mod unit {
         }
         assert_eq!(done.load(Ordering::SeqCst), 6);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_given_up_keeps_its_permit_until_it_returns() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let lookup = tokio::spawn({
+            let permits = Arc::clone(&permits);
+            async move {
+                bounded_lookup(&permits, move || {
+                    started_tx.send(()).unwrap();
+                    // A `getaddrinfo` stuck on a slow resolver, until the gate opens.
+                    let _ = gate_rx.recv();
+                    Ok(())
+                })
+                .await
+            }
+        });
+        started_rx.await.unwrap();
+        lookup.abort();
+        assert!(lookup.await.unwrap_err().is_cancelled());
+        assert_eq!(permits.available_permits(), 0, "a lookup given up freed its permit while its thread still ran");
+        gate_tx.send(()).unwrap();
+        let _returned = tokio::time::timeout(std::time::Duration::from_secs(10), permits.acquire())
+            .await
+            .expect("the permit returns once the lookup does")
+            .unwrap();
     }
 
     #[tokio::test]
