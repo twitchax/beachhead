@@ -11,6 +11,7 @@ why the version moved the way it did.
 
 - `forward` resets the app's connection when the remote resets it, where it used to close it
   cleanly, so an app reading to EOF can't take a cut-short stream for a whole one.
+- A DNS answer that panics ends only its query or connection, not the `route` session.
 
 ### Fixed
 

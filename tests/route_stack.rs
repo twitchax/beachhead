@@ -79,6 +79,22 @@ impl Dns for GatedDns {
     }
 }
 
+/// A query [`PanickyDns`] panics on: its id is `0xdead`.
+const DEADLY: &[u8] = b"\xde\xad a query";
+/// A query it answers: its id is `0x0001`.
+const HARMLESS: &[u8] = b"\x00\x01 a query";
+
+/// Echoes every query back as its answer, as [`GatedDns`] does, but panics on one whose id is
+/// `0xdead`: a bug in answering one query.
+struct PanickyDns;
+
+impl Dns for PanickyDns {
+    fn answer(&self, query: Bytes, _transport: Transport) -> impl Future<Output = Option<Bytes>> + Send {
+        assert!(!query.starts_with(&[0xde, 0xad]), "PanickyDns panics on a query with id 0xdead");
+        std::future::ready(Some(query))
+    }
+}
+
 /// An app, the stack between it and a fake tunnel, and the router the stack consults.
 struct Rig {
     app: AppStack,
@@ -810,6 +826,35 @@ async fn dns_over_tcp_connections_beyond_the_cap_are_reset() {
     first.shutdown().await.unwrap();
     assert_eq!(timeout(Duration::from_secs(5), first.read(&mut [0; 1])).await.expect("closed").unwrap(), 0);
     assert!(rig.app.connect(dns_tcp()).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_dns_query_costs_only_itself() {
+    let rig = rig_with(&["10.99.0.0/16"], PanickyDns);
+    // Echoes in memory, which keeps the paused clock deterministic.
+    let echo = rig.tunnel.gate("10.99.0.6", 80);
+    echo.open();
+    let dns = SocketAddr::new(DNS_ADDR.into(), 53);
+
+    assert_eq!(rig.app.exchange(dns, DEADLY).await, None);
+    assert_eq!(rig.app.exchange(dns, HARMLESS).await.as_deref(), Some(HARMLESS));
+    assert_echoes(&rig.app, at("10.99.0.6", 80), 4096).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_dns_connection_is_reset() {
+    let rig = rig_with(&["10.99.0.0/16"], PanickyDns);
+
+    let mut deadly = rig.app.connect(dns_tcp()).await.unwrap();
+    deadly.write_all(&framed_dns(DEADLY).unwrap()).await.unwrap();
+    let read = timeout(Duration::from_secs(5), read_framed_dns(&mut deadly)).await.expect("the connection never ended");
+    assert!(read.is_err(), "answered: {read:?}");
+    assert!(reset_from(&rig.app, dns_tcp()).await, "the connection ended without a reset");
+
+    let mut harmless = rig.app.connect(dns_tcp()).await.unwrap();
+    harmless.write_all(&framed_dns(HARMLESS).unwrap()).await.unwrap();
+    let answer = timeout(Duration::from_secs(5), read_framed_dns(&mut harmless)).await.expect("an answer").unwrap();
+    assert_eq!(answer, Bytes::from_static(HARMLESS));
 }
 
 #[tokio::test(start_paused = true)]

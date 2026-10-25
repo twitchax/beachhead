@@ -50,7 +50,7 @@ use tokio::{
     task::{self, AbortHandle, JoinSet},
     time::{Instant, Sleep},
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     base::{Res, Void},
@@ -109,8 +109,9 @@ pub trait Dns: Send + Sync + 'static {
 ///
 /// # Errors
 ///
-/// Fails when the device stops taking packets while it still sends them, or a connection's task
-/// or a flow's open panics.
+/// Fails when the device stops taking packets while it still sends them, or when a dial, a
+/// connection's pump or a flow's open panics: a bug in code every connection shares. A DNS task
+/// that panics ends only its query or connection.
 pub async fn run<T: Tunnel, D: Dns>(packets: Packets, tunnel: T, router: Arc<Router>, dns: Arc<D>) -> Void {
     // Owning the DNS address and answering for every other one (any-IP), the stack sends
     // everything back out through the device.
@@ -355,7 +356,16 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
             self.dialed(flow, generation, opened);
         }
         while let Poll::Ready(Some(answered)) = self.queries.poll_join_next(cx) {
-            if let Some((asker, answer)) = answered.context("a DNS task failed")? {
+            let answered = match answered {
+                Ok(answered) => answered,
+                // A bug answering one query costs only that query, and its asker retries.
+                Err(e) if e.is_panic() => {
+                    warn!("a DNS query's task panicked: {e}");
+                    continue;
+                }
+                Err(e) => return Err(e).context("a DNS task failed"),
+            };
+            if let Some((asker, answer)) = answered {
                 self.engine.send_opt(udp_packet(SocketAddr::new(DNS_ADDR.into(), DNS_PORT), asker, &answer));
             }
         }
@@ -379,13 +389,22 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
     }
 
     /// Reaps the DNS server's connections that ended, freeing their places, and resets each that
-    /// failed.
+    /// failed or panicked.
     fn served(&mut self, cx: &mut Context<'_>) -> Void {
         while let Poll::Ready(Some(served)) = self.dns_conns.poll_join_next_with_id(cx) {
             let (server, (flow, result)) = match served {
                 Ok(served) => served,
                 // The stack aborted it when the app reset the connection.
                 Err(e) if e.is_cancelled() => continue,
+                // A bug answering one connection's queries costs only that connection.
+                Err(e) if e.is_panic() => {
+                    if let Some(flow) = self.reset_pumped_by(e.id()) {
+                        warn!(%flow, "a DNS connection's task panicked; resetting it: {e}");
+                    } else {
+                        warn!("a DNS connection's task panicked: {e}");
+                    }
+                    continue;
+                }
                 Err(e) => return Err(e).context("a DNS connection's task failed"),
             };
             if let Err(e) = result {
@@ -406,6 +425,14 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         {
             self.engine.abort(handle);
         }
+    }
+
+    /// Resets the connection whose pipe `task` serves, for a task that ended without saying which
+    /// connection that was. `None` when no connection's pipe is served by it any longer.
+    fn reset_pumped_by(&mut self, task: task::Id) -> Option<Flow> {
+        let (&flow, &handle) = self.flows.iter().find(|&(_, &handle)| self.engine.pumped_by(handle, task))?;
+        self.engine.abort(handle);
+        Some(flow)
     }
 
     fn dialed(&mut self, flow: Flow, generation: u64, opened: Result<T::Conn, OpenError>) {
