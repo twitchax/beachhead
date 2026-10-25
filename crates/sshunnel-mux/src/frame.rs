@@ -147,7 +147,9 @@ impl TryFrom<u8> for FlowErrKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Transport {
+    /// The relay asks its resolver over UDP.
     Udp = 0,
+    /// The relay asks its resolver over TCP.
     Tcp = 1,
 }
 
@@ -334,10 +336,7 @@ impl Frame {
                 }
             }
             Kind::Resolve => {
-                if payload.len() > MAX_HOST {
-                    bail!("Resolve host is {} bytes, over the {MAX_HOST}-byte limit", payload.len());
-                }
-                let host = std::str::from_utf8(&payload).map_err(|e| anyhow!("Resolve host is not UTF-8: {e}"))?.to_owned();
+                let host = host("Resolve", &payload)?;
                 Self::Resolve { stream, host }
             }
             Kind::Resolved => {
@@ -379,10 +378,7 @@ impl Frame {
                 Self::OpenUdp { stream, host, port }
             }
             Kind::OpenEcho => {
-                if payload.len() > MAX_HOST {
-                    bail!("OpenEcho host is {} bytes, over the {MAX_HOST}-byte limit", payload.len());
-                }
-                let host = std::str::from_utf8(&payload).map_err(|e| anyhow!("OpenEcho host is not UTF-8: {e}"))?.to_owned();
+                let host = host("OpenEcho", &payload)?;
                 Self::OpenEcho { stream, host }
             }
             Kind::Datagram => Self::Datagram { stream, data: payload },
@@ -430,9 +426,7 @@ impl Frame {
                 buf.put_u8(capabilities.to_byte());
             }
             Self::Open { stream, host, port } => {
-                if host.len() > MAX_HOST {
-                    bail!("Open host is {} bytes, over the {MAX_HOST}-byte limit", host.len());
-                }
+                check_host("Open", host.len())?;
                 put_header(buf, *stream, Kind::Open, 2 + host.len());
                 buf.put_u16(*port);
                 buf.put_slice(host.as_bytes());
@@ -440,9 +434,7 @@ impl Frame {
             Self::OpenOk { stream } => put_header(buf, *stream, Kind::OpenOk, 0),
             Self::OpenErr { stream, kind, reason } => put_reason(buf, *stream, Kind::OpenErr, Some(*kind as u8), reason),
             Self::Resolve { stream, host } => {
-                if host.len() > MAX_HOST {
-                    bail!("Resolve host is {} bytes, over the {MAX_HOST}-byte limit", host.len());
-                }
+                check_host("Resolve", host.len())?;
                 put_header(buf, *stream, Kind::Resolve, host.len());
                 buf.put_slice(host.as_bytes());
             }
@@ -462,17 +454,13 @@ impl Frame {
             Self::Fin { stream } => put_header(buf, *stream, Kind::Fin, 0),
             Self::Rst { stream, reason } => put_reason(buf, *stream, Kind::Rst, None, reason),
             Self::OpenUdp { stream, host, port } => {
-                if host.len() > MAX_HOST {
-                    bail!("OpenUdp host is {} bytes, over the {MAX_HOST}-byte limit", host.len());
-                }
+                check_host("OpenUdp", host.len())?;
                 put_header(buf, *stream, Kind::OpenUdp, 2 + host.len());
                 buf.put_u16(*port);
                 buf.put_slice(host.as_bytes());
             }
             Self::OpenEcho { stream, host } => {
-                if host.len() > MAX_HOST {
-                    bail!("OpenEcho host is {} bytes, over the {MAX_HOST}-byte limit", host.len());
-                }
+                check_host("OpenEcho", host.len())?;
                 put_header(buf, *stream, Kind::OpenEcho, host.len());
                 buf.put_slice(host.as_bytes());
             }
@@ -590,6 +578,21 @@ fn split_kind(frame: Kind, payload: &[u8]) -> Res<(u8, String)> {
     Ok((kind, String::from_utf8_lossy(reason).into_owned()))
 }
 
+/// Refuses a host over [`MAX_HOST`] bytes, naming the `kind` of frame that carried it.
+fn check_host(kind: &str, len: usize) -> Void {
+    if len > MAX_HOST {
+        bail!("{kind} host is {len} bytes, over the {MAX_HOST}-byte limit");
+    }
+    Ok(())
+}
+
+/// Reads a frame's host from `bytes`: at most [`MAX_HOST`] bytes of UTF-8, else an error naming
+/// the `kind` of frame.
+fn host(kind: &str, bytes: &[u8]) -> Res<String> {
+    check_host(kind, bytes.len())?;
+    Ok(std::str::from_utf8(bytes).map_err(|e| anyhow!("{kind} host is not UTF-8: {e}"))?.to_owned())
+}
+
 /// Splits an `Open`-shaped payload (`port(2) host`) into its host and port, checking the host.
 fn split_host_port(frame: Kind, payload: &mut Bytes) -> Res<(String, u16)> {
     if payload.len() < 2 {
@@ -597,10 +600,7 @@ fn split_host_port(frame: Kind, payload: &mut Bytes) -> Res<(String, u16)> {
     }
     let port = payload.get_u16_at(0);
     payload.advance(2);
-    if payload.len() > MAX_HOST {
-        bail!("{frame:?} host is {} bytes, over the {MAX_HOST}-byte limit", payload.len());
-    }
-    let host = std::str::from_utf8(payload).map_err(|e| anyhow!("{frame:?} host is not UTF-8: {e}"))?.to_owned();
+    let host = host(&format!("{frame:?}"), payload)?;
     Ok((host, port))
 }
 
@@ -1032,6 +1032,17 @@ mod unit {
         assert_eq!(FlowErrKind::from_io(&Error::from(ErrorKind::HostUnreachable)), Some(FlowErrKind::HostUnreachable));
         assert_eq!(FlowErrKind::from_io(&Error::from(ErrorKind::NetworkUnreachable)), Some(FlowErrKind::NetUnreachable));
         assert_eq!(FlowErrKind::from_io(&Error::from(ErrorKind::PermissionDenied)), None);
+    }
+
+    #[test]
+    fn a_v4_hello_of_the_wrong_length_is_refused() {
+        for len in [10, 12] {
+            let mut bytes = header(0, 0, len);
+            bytes.extend_from_slice(&MAGIC);
+            bytes.extend_from_slice(&VERSION.to_be_bytes());
+            bytes.resize(HEADER_LEN + len as usize, 0);
+            assert!(Frame::decode(&mut BytesMut::from(&bytes[..])).is_err(), "a {len}-byte Hello decoded");
+        }
     }
 
     #[test]

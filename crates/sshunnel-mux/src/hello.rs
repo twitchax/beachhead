@@ -15,7 +15,9 @@ use crate::{
 /// What the peer's `Hello` announced: its receive window, and what it can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerHello {
+    /// The most the peer lets this side have in flight on one stream.
     pub window: u32,
+    /// What the peer can do beyond the basics.
     pub capabilities: Capabilities,
 }
 
