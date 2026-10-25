@@ -22,6 +22,8 @@ why the version moved the way it did.
   the held-dial cap, instead of trying to connect for up to two minutes.
 - `route` runs on a kernel booted with `ipv6.disable=1`, where reading the IPv6 routing tables
   failed every run; IPv6 targets are refused there.
+- A UDP flow whose open is slow no longer idles out while its sender keeps sending, in `forward` and
+  in `route`.
 - Ctrl-C at `route`'s sudo password prompt exits cleanly instead of failing with `sudo exited before
   the root helper started`.
 

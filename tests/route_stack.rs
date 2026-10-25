@@ -491,6 +491,31 @@ async fn udp_an_open_whose_flow_idled_out_is_cancelled() {
     assert_eq!((rig.tunnel.flows().len(), rig.tunnel.flows_opened(), rig.tunnel.live_flows()), (2, 1, 1));
 }
 
+/// A flow still opening stays alive while its sender sends: the 40 s datagram is held on the first
+/// flow rather than opening a second after the entry would have idled out at 30 s.
+#[tokio::test(start_paused = true)]
+async fn udp_datagrams_while_opening_keep_the_flow() {
+    let rig = rig(&["10.99.0.0/16"]);
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let gate = rig.tunnel.udp_gate("10.99.0.5", 9999, target.local_addr().unwrap());
+
+    rig.app.send(datagram(41_000)).await.unwrap();
+    until(|| rig.tunnel.flows().len() == 1).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    rig.app.send(datagram(41_000)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    rig.app.send(datagram(41_000)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    gate.open();
+    let mut buf = [0; 64];
+    for _ in 0..3 {
+        let n = tokio::time::timeout(Duration::from_secs(5), target.recv(&mut buf)).await.expect("a held datagram arrives").unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+    assert_eq!((rig.tunnel.flows().len(), rig.tunnel.flows_opened()), (1, 1));
+}
+
 /// Review Focus 1: an open whose result is in before its entry goes is past aborting, so only the
 /// entry's generation keeps it off the flow the app opened under the same key since.
 #[tokio::test(start_paused = true)]

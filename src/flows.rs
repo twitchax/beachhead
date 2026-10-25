@@ -209,6 +209,8 @@ impl Drop for FlowTask {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     fn secs(n: f64) -> Duration {
@@ -339,5 +341,42 @@ mod tests {
 
         assert_eq!(table.insert(7, 70, t), Some((7, 7)));
         assert_eq!(table.len(), MAX_FLOWS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flow_table_index_matches_its_entries_after_mixed_operations() {
+        let mut table: FlowTable<usize, usize> = FlowTable::new();
+        let mut now = Instant::now();
+        // A fixed-seed generator, so a failure replays.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let keys = u64::try_from(MAX_FLOWS).unwrap() * 3 / 2;
+        // Distinct inserts first, in a few milliseconds: past the cap, so eviction runs.
+        let filling = MAX_FLOWS + 500;
+        for step in 0..filling {
+            let _ = table.insert(step, step, now);
+            now += Duration::from_millis(1);
+            assert_eq!(table.by_deadline.len(), table.entries.len(), "step {step}");
+            assert_eq!(table.by_use.len(), table.entries.len(), "step {step}");
+        }
+        assert_eq!(table.len(), MAX_FLOWS);
+        for step in 0..20_000_usize {
+            let key = usize::try_from(next() % keys).unwrap();
+            match next() % 8 {
+                0..=2 => _ = table.insert(key, step, now),
+                3 => _ = table.sent(&key, now),
+                4 => _ = table.replied(&key, now),
+                5 => _ = table.remove(&key),
+                _ => _ = table.expire(now),
+            }
+            now += Duration::from_millis(next() % 4 * 3);
+            assert_eq!(table.by_deadline.len(), table.entries.len(), "step {step}");
+            assert_eq!(table.by_use.len(), table.entries.len(), "step {step}");
+        }
     }
 }

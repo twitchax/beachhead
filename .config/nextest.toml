@@ -10,6 +10,14 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # land together. Serialize them; they still overlap ordinary unit tests.
 serial-e2e = { max-threads = 1 }
 
+# The UDP flood tests measure loss under load, so a retry would pass a starvation regression as
+# FLAKY. Serial like the rest of `e2e_`, but with no retries. Listed first: nextest takes the first
+# matching override per setting, so the `e2e_` override below can't give these its retries.
+[[profile.default.overrides]]
+filter = 'test(/^e2e_udp_flood/)'
+test-group = 'serial-e2e'
+retries = 0
+
 # `e2e_*` tests spawn the built binary. Process startup on a loaded runner is the one legitimately
 # timing-sensitive thing here, so these (and only these) get a retry.
 [[profile.default.overrides]]

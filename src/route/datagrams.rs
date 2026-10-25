@@ -225,9 +225,10 @@ impl<T: Tunnel> Datagrams<T> {
                     if let Some(datagram) = key.datagram(&packet, ip) {
                         sender.try_send(datagram);
                     }
-                    self.table.sent(&key, now);
                 }
             }
+            // Opening or open, the sender is still sending: a slow open mustn't idle out under it.
+            self.table.sent(&key, now);
             return None;
         }
         let Some(host) = self.router.destination(ip.dst) else {

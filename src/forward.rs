@@ -369,9 +369,10 @@ impl<T: Tunnel> UdpForwards<T> {
                 State::Opening { held, .. } => held.push(datagram),
                 State::Open { sender, .. } => {
                     sender.try_send(datagram);
-                    table.sent(&key, now);
                 }
             }
+            // Opening or open, the sender is still sending: a slow open mustn't idle out under it.
+            table.sent(&key, now);
             return;
         }
         let generation = self.shared.generations.fetch_add(1, Ordering::Relaxed);
@@ -412,7 +413,8 @@ impl<T: Tunnel> UdpForwards<T> {
                     sender.try_send(datagram);
                 }
                 let replies = tokio::spawn(self.clone().replies(flow, socket, key, generation));
-                // Dropping the hold aborts this task, which no longer waits, so it finishes.
+                // Replacing `Opening` drops its `_open`, which would abort this task, but it no longer
+                // waits, so it finishes.
                 entry.state = State::Open {
                     sender,
                     _replies: FlowTask(replies.abort_handle()),
@@ -480,6 +482,8 @@ mod unit {
     };
 
     use super::*;
+    use sshunnel_mux::frame::OpenErrKind;
+
     use crate::tests::{self, FakeTunnel, until};
 
     fn fwd(bind: &str, bind_port: u16, host: &str, port: u16) -> Forward {
@@ -727,5 +731,57 @@ mod unit {
         let n = app.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"two");
         assert_eq!((tunnel.flows().len(), tunnel.flows_opened(), tunnel.live_flows()), (2, 1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_datagrams_while_opening_keep_the_flow() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tunnel = FakeTunnel::new();
+        let gate = tunnel.udp_gate("dns.corp.example", 53, target.local_addr().unwrap());
+        let forwards = UdpForwards::new(tunnel.clone());
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        app.connect(listener.local_addr().unwrap()).await.unwrap();
+        tokio::spawn(forwards.clone().serve(listener, Arc::from("dns.corp.example"), 53));
+        let sweep = tokio::spawn(forwards.clone().sweep());
+
+        // Each lands before the clock moves on: 20 s apart, so only the refresh keeps the entry
+        // past 30 s.
+        app.send(b"one").await.unwrap();
+        until(|| tunnel.flows().len() == 1).await.unwrap();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        app.send(b"two").await.unwrap();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        app.send(b"three").await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        // Past here the test waits on real sockets, and a paused clock jumps to any pending timer.
+        sweep.abort();
+
+        gate.open();
+        let mut got = Vec::new();
+        let mut buf = [0; 64];
+        for _ in 0..3 {
+            let n = timeout(Duration::from_secs(5), target.recv(&mut buf)).await.expect("a held datagram arrives").unwrap();
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+        assert_eq!((tunnel.flows().len(), tunnel.flows_opened()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn udp_a_failed_open_lets_the_next_datagram_open_again() {
+        let tunnel = FakeTunnel::new();
+        tunnel.udp_reject("dns.corp.example", 53, OpenErrKind::Refused);
+        let forwards = UdpForwards::new(tunnel.clone());
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        app.connect(listener.local_addr().unwrap()).await.unwrap();
+        tokio::spawn(forwards.clone().serve(listener, Arc::from("dns.corp.example"), 53));
+
+        app.send(b"one").await.unwrap();
+        eventually(|| tunnel.flows().len() == 1 && forwards.len() == 0).await;
+        // The failed open took its entry with it, so this one opens afresh.
+        app.send(b"two").await.unwrap();
+        eventually(|| tunnel.flows().len() == 2).await;
     }
 }
