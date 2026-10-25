@@ -26,6 +26,10 @@ why the version moved the way it did.
   in `route`.
 - Ctrl-C at `route`'s sudo password prompt exits cleanly instead of failing with `sudo exited before
   the root helper started`.
+- The relay asks at most three nameservers, as libc does, and can use a link-local IPv6 nameserver
+  (it kept dropping the `%scope`).
+- The 64th unreported socket error in a row now ends a relay flow, as the 0.2.0 notes said (the code
+  ended it on the 65th).
 
 ## [0.2.0] - 2026-10-23
 

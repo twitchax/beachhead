@@ -3,7 +3,8 @@
 
 use std::{
     io::ErrorKind,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    path::Path,
     time::Duration,
 };
 
@@ -20,34 +21,38 @@ pub const NAMESERVER_TIMEOUT: Duration = Duration::from_secs(2);
 
 const RESOLV_CONF: &str = "/etc/resolv.conf";
 
+/// The most nameservers asked: glibc's and musl's `MAXNS`, as both ignore the rest.
+const MAXNS: usize = 3;
+
 /// Answers `request` from the nameservers in `/etc/resolv.conf`, read afresh each time since DHCP
 /// rewrites it.
 pub async fn serve(request: QueryRequest) {
-    // Read on the blocking pool: the file may sit on a slow mount, and nothing here may stall the pipe.
-    let conf = tokio::task::spawn_blocking(|| std::fs::read_to_string(RESOLV_CONF)).await;
-    let result = match conf {
-        Ok(Ok(text)) => {
-            let servers = nameservers(&text);
-            if servers.is_empty() {
-                Err(QueryError {
-                    reason: format!("{RESOLV_CONF} names no nameserver"),
-                })
-            } else {
-                ask(&servers, request.message(), request.transport()).await
-            }
-        }
-        Ok(Err(e)) => Err(QueryError {
-            reason: format!("reading {RESOLV_CONF}: {e}"),
-        }),
-        Err(e) => Err(QueryError {
-            reason: format!("reading {RESOLV_CONF}: {e}"),
-        }),
-    };
+    // Read and parse on the blocking pool: the file may sit on a slow mount, a scope's interface is
+    // looked up in sysfs, and nothing here may stall the pipe.
+    let servers = tokio::task::spawn_blocking(|| std::fs::read_to_string(RESOLV_CONF).map(|text| nameservers(&text)))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    let result = answer_from(servers, request.message(), request.transport()).await;
     request.answer(result);
 }
 
-/// The `nameserver` lines of a resolv.conf, on port 53; unparsable ones are skipped (a `%scope`
-/// suffix is dropped).
+/// The answer to `message` from the nameservers reading resolv.conf found, or why there is none.
+async fn answer_from(servers: std::io::Result<Vec<SocketAddr>>, message: &[u8], transport: Transport) -> Result<Bytes, QueryError> {
+    match servers {
+        Err(e) => Err(QueryError {
+            reason: format!("reading {RESOLV_CONF}: {e}"),
+        }),
+        Ok(servers) if servers.is_empty() => Err(QueryError {
+            reason: format!("{RESOLV_CONF} names no nameserver"),
+        }),
+        Ok(servers) => ask(&servers, message, transport).await,
+    }
+}
+
+/// The first [`MAXNS`] `nameserver` lines of a resolv.conf that parse, on port 53. An IPv6 server
+/// keeps its `%scope`, a number or an interface's name; as in libc, a server whose interface isn't
+/// there is skipped, and so is an IPv4 server with a scope. An interface's index is read from
+/// sysfs, so this may block.
 #[must_use]
 pub fn nameservers(resolv_conf: &str) -> Vec<SocketAddr> {
     resolv_conf
@@ -58,10 +63,26 @@ pub fn nameservers(resolv_conf: &str) -> Vec<SocketAddr> {
                 return None;
             }
             let address = words.next()?;
-            let ip: IpAddr = address.split_once('%').map_or(address, |(ip, _scope)| ip).parse().ok()?;
-            Some(SocketAddr::new(ip, 53))
+            match address.split_once('%') {
+                None => Some(SocketAddr::new(address.parse().ok()?, 53)),
+                Some((ip, scope)) => Some(SocketAddr::V6(SocketAddrV6::new(ip.parse().ok()?, 53, 0, scope_id(scope)?))),
+            }
         })
+        .take(MAXNS)
         .collect()
+}
+
+/// A `%scope`'s index: the number it is, or the index of the interface it names, from sysfs (Linux
+/// only: elsewhere a name finds nothing).
+fn scope_id(scope: &str) -> Option<u32> {
+    if let Ok(index) = scope.parse() {
+        return Some(index);
+    }
+    // Linux refuses these as interface names, and each would reach outside an interface's directory.
+    if scope.is_empty() || scope.contains('/') || scope == "." || scope == ".." {
+        return None;
+    }
+    std::fs::read_to_string(Path::new("/sys/class/net").join(scope).join("ifindex")).ok()?.trim().parse().ok()
 }
 
 /// Asks each server in turn, [`NAMESERVER_TIMEOUT`] each, over `transport`, and returns the first
@@ -164,8 +185,53 @@ mod unit {
 
     #[test]
     fn nameservers_come_from_nameserver_lines() {
-        let conf = "# generated\n; also a comment\nsearch corp.example\noptions edns0\nnameserver 192.0.2.53\nnameserver fe80::1%eth0 # link-local\nnameserver not-an-address\nnameserver\n";
-        assert_eq!(nameservers(conf), vec!["192.0.2.53:53".parse::<SocketAddr>().unwrap(), "[fe80::1]:53".parse().unwrap()]);
+        let conf = "# generated\n; also a comment\nsearch corp.example\noptions edns0\nnameserver 192.0.2.53\nnameserver 2001:db8::53 # documentation\nnameserver 192.0.2.54%2\nnameserver not-an-address\nnameserver\n";
+        assert_eq!(nameservers(conf), vec!["192.0.2.53:53".parse::<SocketAddr>().unwrap(), "[2001:db8::53]:53".parse().unwrap()]);
+    }
+
+    #[test]
+    fn nameservers_keeps_at_most_three() {
+        assert_eq!(nameservers("nameserver 192.0.2.1\nnameserver 192.0.2.2\nnameserver 192.0.2.3\nnameserver 192.0.2.4\n").len(), 3);
+        // A line that doesn't parse takes none of the three, as in libc.
+        let first_three: Vec<SocketAddr> = (1..=3).map(|i| SocketAddr::from(([192, 0, 2, i], 53))).collect();
+        assert_eq!(
+            nameservers("nameserver not-an-address\nnameserver 192.0.2.1\nnameserver 192.0.2.2\nnameserver 192.0.2.3\nnameserver 192.0.2.4\n"),
+            first_three
+        );
+    }
+
+    #[test]
+    fn nameservers_keeps_a_numeric_scope() {
+        assert_eq!(nameservers("nameserver fe80::1%2"), [SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 53, 0, 2))]);
+    }
+
+    // Linux only: the interface's index comes from sysfs, which other platforms don't have.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nameservers_keeps_an_interface_scope() {
+        let lo: u32 = std::fs::read_to_string("/sys/class/net/lo/ifindex").unwrap().trim().parse().unwrap();
+        assert_eq!(nameservers("nameserver fe80::1%lo"), [SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 53, 0, lo))]);
+    }
+
+    #[test]
+    fn nameservers_skips_an_unknown_interface() {
+        // `lo/../lo` names lo's own sysfs file by path, but no interface: names can't hold a `/`.
+        for scope in ["nosuchif0", "lo/../lo", ".", "..", ""] {
+            let found = nameservers(&format!("nameserver fe80::1%{scope}"));
+            assert!(found.is_empty(), "{scope:?}: {found:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolv_conf_without_nameservers_is_a_query_error() {
+        let err = answer_from(Ok(vec![]), &[0x12, 0x34], Transport::Udp).await.unwrap_err();
+        assert_eq!(err.reason, "/etc/resolv.conf names no nameserver");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_resolv_conf_is_a_query_error() {
+        let err = answer_from(Err(std::io::Error::from(ErrorKind::PermissionDenied)), &[0x12, 0x34], Transport::Udp).await.unwrap_err();
+        assert!(err.reason.starts_with("reading /etc/resolv.conf"), "{err}");
     }
 
     #[tokio::test]

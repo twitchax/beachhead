@@ -106,6 +106,8 @@ pub async fn serve(mut incoming: Incoming, capabilities: Capabilities) {
                 tokio::spawn(echo(request, Arc::clone(&lookups), capabilities));
             }
             Request::Query(request) => {
+                // Unbounded here: the client bounds the queries in flight (`route::stack`'s
+                // `MAX_QUERIES` and `MAX_DNS_CONNS`).
                 tokio::spawn(query::serve(request));
             }
         }
@@ -295,9 +297,9 @@ where
     }
 }
 
-/// Socket errors in a row, with no send or receive working between them, that a flow outlives
-/// unreported. Linux clears a socket's pending error once a call returns it, so a run this long
-/// means the socket fails every time.
+/// Unreported socket errors in a row, with no send or receive working between them, that end a
+/// flow. Linux clears a socket's pending error once a call returns it, so a run this long means the
+/// socket fails every time.
 const MAX_UNREPORTED: u32 = 64;
 
 /// What a flow does about a socket error.
@@ -333,7 +335,7 @@ impl SocketErrors {
             return OnError::Report(kind);
         }
         self.unreported += 1;
-        if self.unreported > MAX_UNREPORTED { OnError::End } else { OnError::Drop }
+        if self.unreported >= MAX_UNREPORTED { OnError::End } else { OnError::Drop }
     }
 }
 
@@ -447,10 +449,14 @@ fn resolve_all(host: &str) -> Result<Vec<IpAddr>, ResolveError> {
     let code = unsafe { libc::getaddrinfo(name.as_ptr(), ptr::null(), &raw const hints, &raw mut found) };
     match code {
         0 => {
-            let ips = collect_ips(found);
             // SAFETY: `found` is the list the successful call above returned, and `collect_ips`
-            // kept nothing that points into it. It is freed exactly once, here.
-            unsafe { libc::freeaddrinfo(found) };
+            // reads it while it is live and keeps nothing that points into it. It is freed exactly
+            // once, here.
+            let ips = unsafe {
+                let ips = collect_ips(found);
+                libc::freeaddrinfo(found);
+                ips
+            };
             Ok(ips)
         }
         libc::EAI_NONAME | libc::EAI_NODATA => Err(ResolveError {
@@ -462,11 +468,15 @@ fn resolve_all(host: &str) -> Result<Vec<IpAddr>, ResolveError> {
 }
 
 /// Copies the IPv4 and IPv6 addresses out of a `getaddrinfo` list, without repeats.
-fn collect_ips(list: *const libc::addrinfo) -> Vec<IpAddr> {
+///
+/// # Safety
+///
+/// `list` is a list `getaddrinfo` returned, still live: not yet given to `freeaddrinfo`.
+unsafe fn collect_ips(list: *const libc::addrinfo) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     let mut entry = list;
     while !entry.is_null() {
-        // SAFETY: `entry` is non-null and, by the caller's contract, a node of a live list that
+        // SAFETY: `entry` is non-null and, by this function's contract, a node of a live list that
         // `getaddrinfo` returned.
         let info = unsafe { &*entry };
         let ip = match info.ai_family {
@@ -504,11 +514,18 @@ mod unit {
 
     use super::*;
 
+    /// CI has what these tests need, so a missing one there is a failure; a dev box just says what
+    /// it skipped.
+    fn skip(what: &str) {
+        assert!(std::env::var_os("CI").is_none(), "{what} is missing on this CI runner");
+        eprintln!("skipped: {what} is missing");
+    }
+
     #[test]
-    fn a_flow_outlives_a_run_of_unreported_socket_errors_up_to_the_cap() {
+    fn a_run_of_unreported_socket_errors_ends_the_flow_at_the_cap() {
         let mut errors = SocketErrors::default();
         let unreported = || Error::from_raw_os_error(libc::EMSGSIZE);
-        for _ in 0..MAX_UNREPORTED {
+        for _ in 1..MAX_UNREPORTED {
             assert_eq!(errors.failed(&unreported()), OnError::Drop);
         }
         // An error the client is told about neither counts nor breaks the run.
@@ -520,11 +537,11 @@ mod unit {
     fn a_working_send_or_receive_restarts_the_run() {
         let mut errors = SocketErrors::default();
         let unreported = || Error::from_raw_os_error(libc::EPERM);
-        for _ in 0..MAX_UNREPORTED {
+        for _ in 1..MAX_UNREPORTED {
             assert_eq!(errors.failed(&unreported()), OnError::Drop);
         }
         errors.succeeded();
-        for _ in 0..MAX_UNREPORTED {
+        for _ in 1..MAX_UNREPORTED {
             assert_eq!(errors.failed(&unreported()), OnError::Drop);
         }
         assert_eq!(errors.failed(&unreported()), OnError::End);
@@ -681,6 +698,11 @@ mod unit {
     #[test]
     fn lookup_of_an_invalid_name_is_no_such_name() {
         let err = lookup("nonexistent.invalid").unwrap_err();
+        // With no resolver to ask, `getaddrinfo` can't say the name doesn't exist (`EAI_AGAIN`).
+        if err.kind == ResolveErrKind::Failed {
+            skip("a reachable resolver");
+            return;
+        }
         assert_eq!(err.kind, ResolveErrKind::NoSuchName, "{err}");
     }
 

@@ -58,6 +58,13 @@ async fn echo_server() -> u16 {
     port
 }
 
+/// CI has what these tests need, so a missing one there is a failure; a dev box just says what it
+/// skipped.
+fn skip(what: &str) {
+    assert!(std::env::var_os("CI").is_none(), "{what} is missing on this CI runner");
+    eprintln!("skipped: {what} is missing");
+}
+
 #[tokio::test]
 async fn e2e_probe_prints_the_version_and_exits_zero() {
     let out = relay().arg("--probe").output().await.unwrap();
@@ -122,6 +129,11 @@ async fn e2e_stdio_answers_a_resolve() {
     let (mux, _child) = connect().await;
     timeout(Duration::from_secs(30), mux.resolve("localhost")).await.unwrap().unwrap();
     let err = timeout(Duration::from_secs(30), mux.resolve("nonexistent.invalid")).await.unwrap().unwrap_err();
+    // With no resolver to ask, the relay can't say the name doesn't exist.
+    if err.kind == ResolveErrKind::Failed {
+        skip("a reachable resolver");
+        return;
+    }
     assert_eq!(err.kind, ResolveErrKind::NoSuchName, "{err}");
 }
 
@@ -136,7 +148,7 @@ async fn e2e_stdio_hello_reports_ping_capabilities() {
 #[tokio::test]
 async fn e2e_stdio_pings_localhost() {
     if !sshunnel_relay::ping::probe().ping4 {
-        eprintln!("skipped: this machine may not open ping sockets");
+        skip("permission to open ping sockets");
         return;
     }
     let (mux, _child) = connect().await;
@@ -148,14 +160,12 @@ async fn e2e_stdio_pings_localhost() {
 }
 
 #[tokio::test]
-async fn e2e_stdio_answers_a_query_it_cannot_route_with_a_query_error() {
-    // The relay reads the machine's own resolv.conf, so the test can only pin the failure shape:
-    // either an answer or a reason, never the old "not answered".
+async fn e2e_stdio_answers_a_malformed_query_with_a_query_error() {
+    // Too short to hold an id, so no nameserver is asked: the answer doesn't hang on whether the
+    // machine's resolver answers.
     let (mux, _child) = connect().await;
-    let question = Bytes::from_static(&[0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
-    if let Err(e) = timeout(Duration::from_secs(30), mux.query(question, Transport::Tcp)).await.unwrap() {
-        assert_ne!(e.reason, "not answered", "{e}");
-    }
+    let err = timeout(Duration::from_secs(30), mux.query(Bytes::from_static(&[0x12]), Transport::Tcp)).await.unwrap().unwrap_err();
+    assert_eq!(err.reason, "the DNS message is under 2 bytes");
 }
 
 /// A loopback UDP echo; returns its port.
@@ -224,7 +234,7 @@ async fn e2e_stdio_drops_a_udp_datagram_its_socket_refuses_and_the_flow_lives_on
 #[tokio::test]
 async fn e2e_stdio_drops_an_echo_request_its_socket_refuses_and_the_flow_lives_on() {
     if !sshunnel_relay::ping::probe().ping4 {
-        eprintln!("skipped: this machine may not open ping sockets");
+        skip("permission to open ping sockets");
         return;
     }
     let (mux, _child) = connect().await;
