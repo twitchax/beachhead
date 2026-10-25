@@ -105,6 +105,7 @@ pub struct FakeTunnel {
     asked: Arc<Notify>,
     live: Arc<AtomicUsize>,
     opened: Arc<AtomicUsize>,
+    waiting: Arc<AtomicUsize>,
 }
 
 /// Holds the opens of one gated target until [`Gate::open`].
@@ -247,6 +248,13 @@ impl FakeTunnel {
         self.opened.load(Ordering::SeqCst)
     }
 
+    /// How many opens are parked at a gate right now; one dropped while it waits (an aborted dial)
+    /// stops counting.
+    #[must_use]
+    pub fn waiting_opens(&self) -> usize {
+        self.waiting.load(Ordering::SeqCst)
+    }
+
     /// Every lookup asked for so far, in order.
     #[must_use]
     pub fn resolves(&self) -> Vec<String> {
@@ -299,6 +307,8 @@ impl Tunnel for FakeTunnel {
             script.opens.push((host.to_owned(), port));
             script.dials.get(&(host.to_owned(), port)).cloned()
         };
+        // Counted before the open is announced, so whoever waits for it sees it waiting.
+        let _waiting = matches!(dial, Some(Dial::Gated(_))).then(|| Live::new(&self.waiting));
         self.asked.notify_waiters();
         let fail = |kind, reason: String| OpenError { kind, reason };
         match dial {
@@ -435,7 +445,8 @@ impl UdpLink {
     }
 }
 
-/// Counts a flow in [`FakeTunnel::live_flows`] until it drops.
+/// Counts one in a [`FakeTunnel`] tally ([`FakeTunnel::live_flows`], [`FakeTunnel::waiting_opens`])
+/// until it drops.
 struct Live(Arc<AtomicUsize>);
 
 impl Live {

@@ -934,8 +934,36 @@ async fn a_stalled_connection_stalls_only_itself() {
     assert!(!writer.is_finished(), "the stalled connection moved");
 }
 
+/// In real time, since the live target is a real socket: a paused clock jumps while one connects.
+#[tokio::test]
+async fn a_syn_past_the_held_cap_evicts_the_oldest_dial() {
+    let rig = rig(&["10.99.0.0/16"]);
+    let _gate = rig.tunnel.gate("10.99.0.5", 80);
+    rig.tunnel.dial("10.99.0.6", 80, echo_server().await.unwrap());
+
+    let app = Arc::new(rig.app);
+    for _ in 0..MAX_HELD {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move { app.connect(at("10.99.0.5", 80)).await.map(drop) });
+    }
+    rig.tunnel.wait_for_opens(MAX_HELD).await;
+    assert_eq!(rig.tunnel.waiting_opens(), MAX_HELD);
+
+    // Well inside the first SYN retransmit (1 s), so its first SYN got through.
+    let mut conn = timeout(Duration::from_millis(900), app.connect(at("10.99.0.6", 80)))
+        .await
+        .expect("the connect beats the retransmit")
+        .unwrap();
+    conn.write_all(b"ping").await.unwrap();
+    let mut back = [0; 4];
+    conn.read_exact(&mut back).await.unwrap();
+    assert_eq!(&back, b"ping");
+    // The oldest stalled dial was cancelled to make way.
+    assert_eq!(rig.tunnel.waiting_opens(), MAX_HELD - 1);
+}
+
 #[tokio::test(start_paused = true)]
-async fn held_syns_beyond_the_cap_are_dropped() {
+async fn a_storm_past_the_held_cap_still_completes() {
     const STORM: usize = 300;
     let rig = rig(&["10.99.0.0/16"]);
     let gate = rig.tunnel.gate("10.99.0.5", 80);
@@ -948,16 +976,12 @@ async fn held_syns_beyond_the_cap_are_dropped() {
         })
         .collect();
     rig.tunnel.wait_for_opens(MAX_HELD).await;
-    // Well inside the app's first SYN retransmit (1 s), so every SYN has been seen exactly once.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(rig.tunnel.opens().len(), MAX_HELD);
 
-    // The held ones complete; the dropped ones retransmit and complete behind them.
+    // The held ones complete; the evicted ones retransmit, dial again and complete behind them.
     gate.open();
     for connecting in storm {
         assert_eq!(connecting.await.unwrap(), Ok(()));
     }
-    assert_eq!(rig.tunnel.opens().len(), STORM);
 }
 
 #[tokio::test(flavor = "multi_thread")]

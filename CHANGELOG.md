@@ -7,6 +7,12 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Fixed
+
+- `route` no longer stalls new connections behind dials that hang: past 256 dials in flight (a
+  firewall that drops SYNs makes each take about two minutes), the oldest gives way to the new
+  connection instead of the new one being dropped.
+
 ## [0.2.0] - 2026-10-23
 
 UDP through `forward` and `route`, and ping and every DNS record type through `route`. A minor

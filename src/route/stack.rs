@@ -4,11 +4,12 @@
 //! Every packet is classified before smoltcp sees it. A SYN that opens a connection is held while
 //! the relay dials, so the app sees the remote's answer rather than ours: a dial that succeeds
 //! replays the SYN into a fresh listening socket, a refused one becomes an RST, an unreachable host
-//! ICMP host unreachable, and a timed-out one silence (the app's own timeout fires). A SYN to the
-//! DNS server's port has nothing to dial: it is accepted at once, and its connection is served by
-//! [`serve_tcp`]. UDP to the DNS address goes to [`Dns`], other routed UDP and echo requests to
-//! their flows through the relay (`route::datagrams`), and unrouted UDP and every other ICMP query
-//! get ICMP administratively prohibited. smoltcp only ever sees TCP.
+//! ICMP host unreachable, and a timed-out one silence (the app's own timeout fires). Past
+//! [`MAX_HELD`] held SYNs the oldest dial gives way to the new one, and its app hears nothing, as
+//! on a dial timeout. A SYN to the DNS server's port has nothing to dial: it is accepted at once,
+//! and its connection is served by [`serve_tcp`]. UDP to the DNS address goes to [`Dns`], other
+//! routed UDP and echo requests to their flows through the relay (`route::datagrams`), and unrouted
+//! UDP and every other ICMP query get ICMP administratively prohibited. smoltcp only ever sees TCP.
 //!
 //! One task runs it all from one `poll_fn`: the device's packets, the dials, DNS answers and flow
 //! opens in flight, the flows' replies, smoltcp's timer and the flows' idle timer, and every
@@ -18,7 +19,7 @@
 //! while the device keeps up, so a flood waits in its own flow's bounded queue, and drops there.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry},
     future::{Future, poll_fn},
     hash::{BuildHasher as _, RandomState},
     net::{IpAddr, SocketAddr},
@@ -62,8 +63,10 @@ use crate::{
     tunnel::{Conn as _, Tunnel},
 };
 
-/// SYNs held while their dials run. Past this a new connection's SYN is dropped, and the app
-/// retransmits it, so a SYN storm costs bounded memory and relay dials.
+/// SYNs held while their dials run. Past this a new connection's SYN takes the oldest dial's place:
+/// that dial is aborted and its app hears nothing, as on a dial timeout, until its retransmitted
+/// SYN dials again. A SYN storm costs bounded memory and relay dials, and dials that hang (a
+/// firewall that drops SYNs) can't keep new connections out.
 pub const MAX_HELD: usize = 256;
 /// DNS queries answered at once; past this a query is dropped, and the client retries it.
 pub const MAX_QUERIES: usize = 256;
@@ -121,6 +124,8 @@ pub async fn run<T: Tunnel, D: Dns>(packets: Packets, tunnel: T, router: Arc<Rou
         dns,
         datagrams,
         held: HashMap::new(),
+        by_age: BTreeMap::new(),
+        generations: 0,
         flows: HashMap::new(),
         handles: HashMap::new(),
         dials: JoinSet::new(),
@@ -144,7 +149,15 @@ impl std::fmt::Display for Flow {
     }
 }
 
-type Dialed<C> = (Flow, Result<C, OpenError>);
+type Dialed<C> = (Flow, u64, Result<C, OpenError>);
+
+/// A connection's SYN, held while its dial runs.
+struct Held {
+    syn: Bytes,
+    /// Tells this dial's result from an evicted one's for the same flow.
+    generation: u64,
+    dial: AbortHandle,
+}
 
 struct Stack<T: Tunnel, D: Dns> {
     engine: Engine,
@@ -152,8 +165,12 @@ struct Stack<T: Tunnel, D: Dns> {
     tunnel: T,
     router: Arc<Router>,
     dns: Arc<D>,
-    /// The SYN of each connection whose dial is in flight.
-    held: HashMap<Flow, Bytes>,
+    /// The SYN and dial of each connection whose dial is in flight.
+    held: HashMap<Flow, Held>,
+    /// The held connections by generation, so oldest first.
+    by_age: BTreeMap<u64, Flow>,
+    /// The next held dial's generation.
+    generations: u64,
     /// Each connection with a socket, both ways.
     flows: HashMap<Flow, SocketHandle>,
     handles: HashMap<SocketHandle, Flow>,
@@ -268,16 +285,32 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
             // No socket for it: smoltcp answers with an RST.
             return self.engine.inject(packet);
         };
-        if self.held.len() >= MAX_HELD {
-            debug!(%flow, "{MAX_HELD} connections already opening; dropping a SYN");
-            return;
+        if self.held.len() >= MAX_HELD
+            && let Some((&generation, &oldest)) = self.by_age.first_key_value()
+            && let Some(evicted) = self.unhold(oldest, generation)
+        {
+            debug!(flow = %oldest, "{MAX_HELD} connections already opening; aborting the oldest dial");
+            evicted.dial.abort();
         }
-        self.held.insert(flow, packet);
+        let generation = self.generations;
+        self.generations += 1;
         let tunnel = self.tunnel.clone();
-        self.dials.spawn(async move {
+        let dial = self.dials.spawn(async move {
             let opened = tunnel.open(&host, flow.remote.port()).await;
-            (flow, opened)
+            (flow, generation, opened)
         });
+        self.held.insert(flow, Held { syn: packet, generation, dial });
+        self.by_age.insert(generation, flow);
+    }
+
+    /// Stops holding `flow`'s SYN if `generation` is its dial, returning what was held.
+    fn unhold(&mut self, flow: Flow, generation: u64) -> Option<Held> {
+        let Entry::Occupied(held) = self.held.entry(flow) else { return None };
+        if held.get().generation != generation {
+            return None;
+        }
+        self.by_age.remove(&generation);
+        Some(held.remove())
     }
 
     /// Accepts a connection to the DNS server and serves it from a task of its own. Past
@@ -313,8 +346,13 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
     fn finish(&mut self, cx: &mut Context<'_>) -> Void {
         self.datagrams.opened(cx, |packet| self.engine.send_opt(packet))?;
         while let Poll::Ready(Some(dialed)) = self.dials.poll_join_next(cx) {
-            let (flow, opened) = dialed.context("a dial task failed")?;
-            self.dialed(flow, opened);
+            let (flow, generation, opened) = match dialed {
+                Ok(dialed) => dialed,
+                // The stack aborted it to make way for a newer connection's.
+                Err(e) if e.is_cancelled() => continue,
+                Err(e) => return Err(e).context("a dial task failed"),
+            };
+            self.dialed(flow, generation, opened);
         }
         while let Poll::Ready(Some(answered)) = self.queries.poll_join_next(cx) {
             if let Some((asker, answer)) = answered.context("a DNS task failed")? {
@@ -370,8 +408,9 @@ impl<T: Tunnel, D: Dns> Stack<T, D> {
         }
     }
 
-    fn dialed(&mut self, flow: Flow, opened: Result<T::Conn, OpenError>) {
-        let Some(syn) = self.held.remove(&flow) else { return };
+    fn dialed(&mut self, flow: Flow, generation: u64, opened: Result<T::Conn, OpenError>) {
+        // Evicted after its open finished: dropping the stream resets it at the relay.
+        let Some(Held { syn, .. }) = self.unhold(flow, generation) else { return };
         let conn = match opened {
             Ok(conn) => conn,
             Err(e) => {
