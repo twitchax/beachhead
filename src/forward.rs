@@ -478,13 +478,16 @@ mod unit {
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::{TcpSocket, TcpStream},
-        time::timeout,
+        time::{Instant, timeout},
     };
 
     use super::*;
     use sshunnel_mux::frame::OpenErrKind;
 
-    use crate::tests::{self, FakeTunnel, until};
+    use crate::{
+        flows::IDLE,
+        tests::{self, FakeTunnel, until},
+    };
 
     fn fwd(bind: &str, bind_port: u16, host: &str, port: u16) -> Forward {
         Forward {
@@ -745,14 +748,19 @@ mod unit {
         tokio::spawn(forwards.clone().serve(listener, Arc::from("dns.corp.example"), 53));
         let sweep = tokio::spawn(forwards.clone().sweep());
 
-        // Each lands before the clock moves on: 20 s apart, so only the refresh keeps the entry
-        // past 30 s.
+        // A datagram on a real loopback socket isn't something a paused clock waits for: an idle
+        // runtime polls the socket and advances the clock in the same park, so the serve task could
+        // read "two" only after the clock moved. Each send therefore waits until the entry's
+        // deadline shows the refresh (30 s from now), 20 s apart so only that keeps the entry alive.
+        let refreshed = || forwards.table().deadline() == Some(Instant::now() + IDLE);
         app.send(b"one").await.unwrap();
-        until(|| tunnel.flows().len() == 1).await.unwrap();
+        until(|| tunnel.flows().len() == 1 && refreshed()).await.unwrap();
         tokio::time::advance(Duration::from_secs(20)).await;
         app.send(b"two").await.unwrap();
+        until(refreshed).await.unwrap();
         tokio::time::advance(Duration::from_secs(20)).await;
         app.send(b"three").await.unwrap();
+        until(refreshed).await.unwrap();
         tokio::time::advance(Duration::from_secs(5)).await;
         // Past here the test waits on real sockets, and a paused clock jumps to any pending timer.
         sweep.abort();

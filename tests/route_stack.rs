@@ -499,6 +499,10 @@ async fn udp_datagrams_while_opening_keep_the_flow() {
     let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let gate = rig.tunnel.udp_gate("10.99.0.5", 9999, target.local_addr().unwrap());
 
+    // Nothing to wait on between sends, and nothing needed: the app's packets cross an in-memory
+    // channel to a stack task on this same current-thread runtime. A send wakes that task, and a
+    // paused clock advances only once no task is ready, so the stack has taken each packet (and
+    // refreshed its entry) before any sleep below moves the clock.
     rig.app.send(datagram(41_000)).await.unwrap();
     until(|| rig.tunnel.flows().len() == 1).await.unwrap();
     tokio::time::sleep(Duration::from_secs(20)).await;
