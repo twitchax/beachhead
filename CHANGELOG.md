@@ -7,6 +7,12 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-25
+
+Hardening: the follow-ups parked through 0.1.0 and 0.2.0, most of them in `route`. A patch rather
+than a minor version because the public API only gains items, so code built against 0.2.0 builds
+unchanged.
+
 ### Added
 
 - `sshunnel-mux`: `OpenRequest::cancelled`, which completes when the peer gives up on an open, so a
