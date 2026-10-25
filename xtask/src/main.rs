@@ -10,7 +10,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
-use sshunnel::{arch::Arch, relays::Relays};
+use sshunnel::{
+    arch::Arch,
+    relays::{Relays, build_embed::COMMIT_FILE},
+};
 
 const USAGE: &str = "usage: cargo xtask <task>
 
@@ -194,7 +197,7 @@ fn package() -> Result<()> {
     if let Some(arch) = Arch::ALL.into_iter().find(|&arch| relays.get(arch).is_none()) {
         bail!("{} has no {arch} relay", relay_dir.display());
     }
-    write_commit(&relay_dir)?;
+    write_commit(root(), &relay_dir)?;
 
     // Cargo counts the gitignored relays the `include` list names as uncommitted changes. xtask is
     // `publish = false`, so packaging it would only cost a verify build.
@@ -229,12 +232,28 @@ fn package() -> Result<()> {
     Ok(())
 }
 
-/// Records HEAD in `dir`'s COMMIT, which the packaged build compares with the commit cargo packaged.
-fn write_commit(dir: &Path) -> Result<()> {
-    let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(root()).output().context("running `git rev-parse HEAD`")?;
+/// Records `repo`'s HEAD in `dir`'s COMMIT, which the packaged build compares with the commit cargo
+/// packaged.
+fn write_commit(repo: &Path, dir: &Path) -> Result<()> {
+    // A dirty tree would make COMMIT name a commit the packaged files have left. Ignored files
+    // (`relays/`, the PRD plans) don't show.
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .context("running `git status --porcelain`")?;
+    ensure!(status.status.success(), "`git status --porcelain` failed: {}", String::from_utf8_lossy(&status.stderr));
+    let dirty = String::from_utf8_lossy(&status.stdout);
+    ensure!(
+        dirty.trim().is_empty(),
+        "the tree has uncommitted changes, so relays/{COMMIT_FILE} would name a commit it isn't: {}",
+        dirty.trim().replace('\n', ", ")
+    );
+
+    let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repo).output().context("running `git rev-parse HEAD`")?;
     ensure!(out.status.success(), "`git rev-parse HEAD` failed: {}", String::from_utf8_lossy(&out.stderr));
     let head = String::from_utf8(out.stdout).context("`git rev-parse HEAD` printed non-UTF-8")?;
-    let path = dir.join("COMMIT");
+    let path = dir.join(COMMIT_FILE);
     std::fs::write(&path, format!("{}\n", head.trim())).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -514,5 +533,49 @@ mod unit {
         assert_eq!(pkgid_version("path+file:///work/sshunnel#0.1.0"), Some("0.1.0"));
         assert_eq!(pkgid_version("path+file:///work/mux#sshunnel-mux@0.2.0\n"), Some("0.2.0"));
         assert_eq!(pkgid_version("path+file:///work/sshunnel"), None);
+    }
+
+    /// A scratch repo with one commit. The identity is local to it, so the developer's own config
+    /// doesn't matter.
+    fn scratch_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "t"],
+            &["config", "user.email", "t@example.com"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            Command::new("git").args(args).current_dir(repo.path()).status_ok().unwrap();
+        }
+        std::fs::write(repo.path().join("a"), "a").unwrap();
+        for args in [&["add", "a"][..], &["commit", "-q", "-m", "one"]] {
+            Command::new("git").args(args).current_dir(repo.path()).status_ok().unwrap();
+        }
+        repo
+    }
+
+    #[test]
+    fn write_commit_refuses_a_dirty_tree() {
+        let repo = scratch_repo();
+        std::fs::write(repo.path().join("stray.txt"), "x").unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let err = write_commit(repo.path(), out.path()).unwrap_err().to_string();
+
+        assert!(err.contains("uncommitted changes"), "{err}");
+        assert!(err.contains("stray.txt"), "{err}");
+        assert!(!out.path().join(COMMIT_FILE).exists());
+    }
+
+    #[test]
+    fn write_commit_records_head_in_a_clean_tree() {
+        let repo = scratch_repo();
+        let out = tempfile::tempdir().unwrap();
+
+        write_commit(repo.path(), out.path()).unwrap();
+
+        let head = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repo.path()).output().unwrap();
+        let recorded = std::fs::read_to_string(out.path().join(COMMIT_FILE)).unwrap();
+        assert_eq!(recorded, format!("{}\n", String::from_utf8(head.stdout).unwrap().trim()));
     }
 }

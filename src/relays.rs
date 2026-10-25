@@ -172,11 +172,12 @@ mod embedded {
     include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 }
 
-// `build.rs`'s decisions, here so its tests run with the library's. At the top level: a `#[path]`
-// inside an inline module would resolve against that module's directory.
-#[cfg(test)]
+// `build.rs`'s decisions, here so its tests run with the library's, and so xtask (which builds this
+// crate with `testing`) shares `COMMIT_FILE` rather than spelling it again. At the top level: a
+// `#[path]` inside an inline module would resolve against that module's directory.
+#[cfg(any(test, feature = "testing"))]
 #[path = "../build/embed.rs"]
-mod build_embed;
+pub mod build_embed;
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
