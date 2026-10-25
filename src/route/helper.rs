@@ -25,6 +25,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 
 use anyhow::{Context as _, anyhow, bail, ensure};
@@ -39,6 +40,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     process::{Child, Command},
     signal::unix::{Signal, SignalKind, signal},
+    time::timeout,
 };
 
 use crate::{
@@ -320,6 +322,9 @@ async fn connect_client(socket: &Path, uid: u32) -> Res<UnixStream> {
     Ok(conn)
 }
 
+/// How long [`Signals::arrived`] waits for a signal that was sent before the call.
+const SIGNAL_GRACE: Duration = Duration::from_millis(100);
+
 /// SIGINT, SIGTERM and SIGHUP, the ways a terminal or a service manager asks sshunnel to stop. The
 /// helper treats them like its socket closing: a Ctrl-C reaches it through sudo too, and it must
 /// still delete its pins. `sshunnel route` tears down on them, except a SIGHUP it started out
@@ -360,6 +365,12 @@ impl Signals {
             terminate: handle(SignalKind::terminate(), "SIGTERM")?,
             hangup: hangup.then(|| handle(SignalKind::hangup(), "SIGHUP")).transpose()?,
         })
+    }
+
+    /// Whether a signal arrives within [`SIGNAL_GRACE`]: a bound for one already delivered to reach
+    /// tokio's driver, as when Ctrl-C ended the process that just failed.
+    pub(crate) async fn arrived(&mut self) -> bool {
+        timeout(SIGNAL_GRACE, self.recv()).await.is_ok()
     }
 
     /// Resolves at the next signal, or at once for one that arrived since the last call.

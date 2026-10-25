@@ -76,8 +76,12 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
     let (include, exclude) = targets.args();
     let setup = Setup { include, exclude, pins: pins.addrs };
     // Uncancellable: sudo handles a Ctrl-C itself, and the helper, which sees it too, tears down
-    // right after it answers. A signal meanwhile waits for the select below.
-    let mut helper = Helper::start(&setup).await?;
+    // right after it answers. A Ctrl-C at sudo's password prompt ends sudo, and that failure is the
+    // user's stop, so the run exits cleanly.
+    let mut helper = match Helper::start(&setup).await {
+        Ok(helper) => helper,
+        Err(e) => return startup_failed(&mut signals, e).await,
+    };
     warned.warn(helper.warnings());
     let probes = probes(&targets.routes(), targets.has_names(), helper.fake_v6(), &setup.pins, &connected);
 
@@ -182,6 +186,12 @@ async fn unless_signalled(signal: impl Future<Output = ()>, ended: Void) -> Void
         return Ok(());
     }
     ended
+}
+
+/// The error from starting the helper, unless a signal arrived meanwhile: a Ctrl-C at sudo's password
+/// prompt ends sudo, and that failure is the user's stop.
+async fn startup_failed(signals: &mut Signals, error: anyhow::Error) -> Void {
+    if signals.arrived().await { Ok(()) } else { Err(error) }
 }
 
 /// An address to look up once the routes are in, and how a warning names it.
@@ -289,6 +299,7 @@ mod tests {
 
     use anyhow::anyhow;
     use pretty_assertions::assert_eq;
+    use rustix::process::{Signal, getpid, kill_process};
 
     use super::*;
 
@@ -450,6 +461,26 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert!(unless_signalled(std::future::pending(), Ok(())).await.is_ok());
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_signal_during_startup_is_a_clean_exit() {
+        // nextest runs each test in its own process, so the signal reaches this one alone.
+        let mut signals = Signals::new().unwrap();
+        kill_process(getpid(), Signal::TERM).unwrap();
+
+        let exit = startup_failed(&mut signals, anyhow!("sudo exited before the root helper started")).await;
+
+        assert!(exit.is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_signal_during_startup_keeps_the_error() {
+        let mut signals = Signals::new().unwrap();
+
+        let error = startup_failed(&mut signals, anyhow!("sudo exited before the root helper started")).await.unwrap_err();
+
+        assert!(error.to_string().contains("sudo exited"), "{error}");
     }
 
     #[test]
