@@ -234,14 +234,18 @@ fn package() -> Result<()> {
     Ok(())
 }
 
+/// A `git` run against `repo` itself: a `GIT_DIR`, `GIT_WORK_TREE` or `GIT_INDEX_FILE` in the
+/// environment (a git hook exports them) would otherwise override the repo it is given.
+fn git(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(repo).env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE");
+    command
+}
+
 /// Refuses a tree with uncommitted changes, which would make COMMIT name a commit the packaged
 /// files have left. Ignored files (`relays/`, the PRD plans) don't show.
 fn ensure_clean(repo: &Path) -> Result<()> {
-    let status = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo)
-        .output()
-        .context("running `git status --porcelain`")?;
+    let status = git(repo).args(["status", "--porcelain"]).output().context("running `git status --porcelain`")?;
     ensure!(status.status.success(), "`git status --porcelain` failed: {}", String::from_utf8_lossy(&status.stderr));
     let dirty = String::from_utf8_lossy(&status.stdout);
     ensure!(
@@ -256,7 +260,7 @@ fn ensure_clean(repo: &Path) -> Result<()> {
 /// packaged.
 fn write_commit(repo: &Path, dir: &Path) -> Result<()> {
     ensure_clean(repo)?;
-    let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repo).output().context("running `git rev-parse HEAD`")?;
+    let out = git(repo).args(["rev-parse", "HEAD"]).output().context("running `git rev-parse HEAD`")?;
     ensure!(out.status.success(), "`git rev-parse HEAD` failed: {}", String::from_utf8_lossy(&out.stderr));
     let head = String::from_utf8(out.stdout).context("`git rev-parse HEAD` printed non-UTF-8")?;
     let path = dir.join(COMMIT_FILE);
@@ -541,6 +545,15 @@ mod unit {
         assert_eq!(pkgid_version("path+file:///work/sshunnel"), None);
     }
 
+    /// A `git` in `repo` that ignores the caller's git environment: under a hook, `GIT_DIR` and
+    /// friends would point it at the real repo, and a global config (`core.hooksPath`,
+    /// `core.excludesFile`) could change the outcome.
+    fn isolated_git(repo: &Path) -> Command {
+        let mut command = git(repo);
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+        command
+    }
+
     /// A scratch repo with one commit. The identity is local to it, so the developer's own config
     /// doesn't matter.
     fn scratch_repo() -> tempfile::TempDir {
@@ -551,11 +564,11 @@ mod unit {
             &["config", "user.email", "t@example.com"],
             &["config", "commit.gpgsign", "false"],
         ] {
-            Command::new("git").args(args).current_dir(repo.path()).status_ok().unwrap();
+            isolated_git(repo.path()).args(args).status_ok().unwrap();
         }
         std::fs::write(repo.path().join("a"), "a").unwrap();
         for args in [&["add", "a"][..], &["commit", "-q", "-m", "one"]] {
-            Command::new("git").args(args).current_dir(repo.path()).status_ok().unwrap();
+            isolated_git(repo.path()).args(args).status_ok().unwrap();
         }
         repo
     }
@@ -590,7 +603,7 @@ mod unit {
 
         write_commit(repo.path(), out.path()).unwrap();
 
-        let head = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repo.path()).output().unwrap();
+        let head = isolated_git(repo.path()).args(["rev-parse", "HEAD"]).output().unwrap();
         let recorded = std::fs::read_to_string(out.path().join(COMMIT_FILE)).unwrap();
         assert_eq!(recorded, format!("{}\n", String::from_utf8(head.stdout).unwrap().trim()));
     }
