@@ -452,7 +452,7 @@ fn apply(setup: &Setup) -> Res<(Applied, Ready)> {
     let fake_v6 = decide_fake_v6(&targets, &mut run_step);
     // Holding the device means no other session is running, so any pinned route left is a dead one's.
     let proto = PIN_PROTO.to_string();
-    for family in system::families(ipv6) {
+    for &family in system::families(ipv6) {
         system::run("ip", &[family, "route", "flush", "proto", &proto])?;
     }
     // Each pin copies the route its address has before the device has any.
