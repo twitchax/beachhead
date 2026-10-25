@@ -963,6 +963,33 @@ async fn a_syn_past_the_held_cap_evicts_the_oldest_dial() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_held_cap_evicts_the_oldest_dial_first() {
+    let rig = rig(&["10.99.0.0/16"]);
+    let oldest = rig.tunnel.gate("10.99.0.5", 80);
+    let _rest = rig.tunnel.gate("10.99.0.7", 80);
+    rig.tunnel.reject("10.99.0.6", 80, OpenErrKind::Refused);
+
+    let app = Arc::new(rig.app);
+    let first = tokio::spawn({
+        let app = Arc::clone(&app);
+        async move { app.connect(at("10.99.0.5", 80)).await.map(drop) }
+    });
+    rig.tunnel.wait_for_opens(1).await;
+    for _ in 1..MAX_HELD {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move { app.connect(at("10.99.0.7", 80)).await.map(drop) });
+    }
+    rig.tunnel.wait_for_opens(MAX_HELD).await;
+    assert_eq!(app.connect(at("10.99.0.6", 80)).await.err(), Some(Connect::Refused));
+
+    // The first connection's dial made way, so it completes only through its retransmit's new dial.
+    oldest.open();
+    assert_eq!(first.await.unwrap(), Ok(()));
+    let dialed = rig.tunnel.opens().into_iter().filter(|open| *open == ("10.99.0.5".to_owned(), 80)).count();
+    assert_eq!(dialed, 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_storm_past_the_held_cap_still_completes() {
     const STORM: usize = 300;
     let rig = rig(&["10.99.0.0/16"]);
