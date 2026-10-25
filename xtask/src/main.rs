@@ -191,6 +191,8 @@ fn check_embedded(client: &Path, relays: &Relays) -> Result<String> {
 /// client as `cargo install` would (on stable, offline, from the .crate files alone) and checks it
 /// embeds them. `relays/` stays afterwards: the publish packages it again.
 fn package() -> Result<()> {
+    // Before the slow build: a dirty tree fails `write_commit` at the end anyway.
+    ensure_clean(root())?;
     let relay_dir = root().join("relays");
     remove_dir_if_present(&relay_dir)?;
     let relays = install_relays(&Arch::ALL, &relay_dir)?;
@@ -232,11 +234,9 @@ fn package() -> Result<()> {
     Ok(())
 }
 
-/// Records `repo`'s HEAD in `dir`'s COMMIT, which the packaged build compares with the commit cargo
-/// packaged.
-fn write_commit(repo: &Path, dir: &Path) -> Result<()> {
-    // A dirty tree would make COMMIT name a commit the packaged files have left. Ignored files
-    // (`relays/`, the PRD plans) don't show.
+/// Refuses a tree with uncommitted changes, which would make COMMIT name a commit the packaged
+/// files have left. Ignored files (`relays/`, the PRD plans) don't show.
+fn ensure_clean(repo: &Path) -> Result<()> {
     let status = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(repo)
@@ -249,7 +249,13 @@ fn write_commit(repo: &Path, dir: &Path) -> Result<()> {
         "the tree has uncommitted changes, so relays/{COMMIT_FILE} would name a commit it isn't: {}",
         dirty.trim().replace('\n', ", ")
     );
+    Ok(())
+}
 
+/// Records `repo`'s HEAD in `dir`'s COMMIT, which the packaged build compares with the commit cargo
+/// packaged.
+fn write_commit(repo: &Path, dir: &Path) -> Result<()> {
+    ensure_clean(repo)?;
     let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repo).output().context("running `git rev-parse HEAD`")?;
     ensure!(out.status.success(), "`git rev-parse HEAD` failed: {}", String::from_utf8_lossy(&out.stderr));
     let head = String::from_utf8(out.stdout).context("`git rev-parse HEAD` printed non-UTF-8")?;
@@ -565,6 +571,16 @@ mod unit {
         assert!(err.contains("uncommitted changes"), "{err}");
         assert!(err.contains("stray.txt"), "{err}");
         assert!(!out.path().join(COMMIT_FILE).exists());
+    }
+
+    #[test]
+    fn ensure_clean_passes_a_clean_tree_and_refuses_a_dirty_one() {
+        let repo = scratch_repo();
+        ensure_clean(repo.path()).unwrap();
+
+        std::fs::write(repo.path().join("stray.txt"), "x").unwrap();
+        let err = ensure_clean(repo.path()).unwrap_err().to_string();
+        assert!(err.contains("stray.txt"), "{err}");
     }
 
     #[test]
