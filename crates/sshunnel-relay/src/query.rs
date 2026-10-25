@@ -37,7 +37,9 @@ pub async fn serve(request: QueryRequest) {
 }
 
 /// The answer to `message` from the nameservers reading resolv.conf found, or why there is none.
+/// A malformed message is the client's error, whatever resolv.conf says, so it is refused first.
 async fn answer_from(servers: std::io::Result<Vec<SocketAddr>>, message: &[u8], transport: Transport) -> Result<Bytes, QueryError> {
+    question_id(message)?;
     match servers {
         Err(e) => Err(QueryError {
             reason: format!("reading {RESOLV_CONF}: {e}"),
@@ -93,11 +95,7 @@ fn scope_id(scope: &str) -> Option<u32> {
 ///
 /// A [`QueryError`] naming each server's failure when none answers.
 pub async fn ask(servers: &[SocketAddr], message: &[u8], transport: Transport) -> Result<Bytes, QueryError> {
-    let Some(id) = message.get(..2) else {
-        return Err(QueryError {
-            reason: "the DNS message is under 2 bytes".to_owned(),
-        });
-    };
+    let id = question_id(message)?;
     let mut failures = Vec::new();
     for &server in servers {
         let attempt = async {
@@ -114,6 +112,13 @@ pub async fn ask(servers: &[SocketAddr], message: &[u8], transport: Transport) -
     }
     let reason = if failures.is_empty() { "no nameserver to ask".to_owned() } else { failures.join("; ") };
     Err(QueryError { reason })
+}
+
+/// The id that opens a DNS message, which its answer must repeat.
+fn question_id(message: &[u8]) -> Result<&[u8], QueryError> {
+    message.get(..2).ok_or_else(|| QueryError {
+        reason: "the DNS message is under 2 bytes".to_owned(),
+    })
 }
 
 async fn ask_udp(server: SocketAddr, message: &[u8], id: &[u8]) -> std::io::Result<Bytes> {
@@ -232,6 +237,14 @@ mod unit {
     async fn an_unreadable_resolv_conf_is_a_query_error() {
         let err = answer_from(Err(std::io::Error::from(ErrorKind::PermissionDenied)), &[0x12, 0x34], Transport::Udp).await.unwrap_err();
         assert!(err.reason.starts_with("reading /etc/resolv.conf"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_message_under_2_bytes_is_refused_whatever_resolv_conf_says() {
+        for servers in [Err(std::io::Error::from(ErrorKind::NotFound)), Ok(vec![])] {
+            let err = answer_from(servers, &[0x12], Transport::Udp).await.unwrap_err();
+            assert_eq!(err.reason, "the DNS message is under 2 bytes");
+        }
     }
 
     #[tokio::test]
