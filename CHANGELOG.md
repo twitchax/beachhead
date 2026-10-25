@@ -14,6 +14,8 @@ why the version moved the way it did.
   connection instead of the new one being dropped.
 - The relay stops dialing when the client gives up on an open, such as a `route` dial evicted past
   the held-dial cap, instead of trying to connect for up to two minutes.
+- `route` runs on a kernel booted with `ipv6.disable=1`, where reading the IPv6 routing tables
+  failed every run; IPv6 targets are refused there.
 
 ## [0.2.0] - 2026-10-23
 

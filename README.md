@@ -288,6 +288,8 @@ in the [PRD log](.prds/PRD-0004.log.md).
 - A target containing `198.18.0.0/15` (such as `128.0.0.0/1`) or `2001:2::/96` (such as
   `2000::/3`) leaves that range to sshunnel's fake addresses, with a warning, whether or not the
   machine has IPv6.
+- On a kernel booted with `ipv6.disable=1`, `route` takes IPv4 targets only (an IPv6 target is
+  refused), and names get v4 fakes only.
 
 ## Install
 

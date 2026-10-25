@@ -421,6 +421,10 @@ impl<R: FnMut(&Step) -> Void> Drop for Applied<R> {
 /// first and drops the fd, which takes the device and everything on it along.
 fn apply(setup: &Setup) -> Res<(Applied, Ready)> {
     let targets = Targets::parse(&setup.include, &setup.exclude)?;
+    let ipv6 = system::has_ipv6();
+    if let Some(refusal) = targets.ipv6_refusal(ipv6) {
+        bail!("refused:\n  {refusal}");
+    }
     let snapshot = system::snapshot()?;
     let mut warnings = targets.check(&snapshot)?;
     // resolvectl names the link by index, and resolved serves pid 1's namespace: from another one,
@@ -437,7 +441,7 @@ fn apply(setup: &Setup) -> Res<(Applied, Ready)> {
     let fake_v6 = decide_fake_v6(&targets, &mut run_step);
     // Holding the device means no other session is running, so any pinned route left is a dead one's.
     let proto = PIN_PROTO.to_string();
-    for family in ["-4", "-6"] {
+    for family in system::families(ipv6) {
         system::run("ip", &[family, "route", "flush", "proto", &proto])?;
     }
     // Each pin copies the route its address has before the device has any.

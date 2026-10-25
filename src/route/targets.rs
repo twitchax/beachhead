@@ -290,6 +290,27 @@ impl Targets {
         patterns(&self.include).next().is_some()
     }
 
+    /// The refusal for IPv6 targets on a kernel without IPv6 (`ipv6` false), naming every one. Only
+    /// includes count: excludes and names don't need the stack, since the fake v6 range turns
+    /// itself off there.
+    #[must_use]
+    pub fn ipv6_refusal(&self, ipv6: bool) -> Option<String> {
+        if ipv6 {
+            return None;
+        }
+        let v6: Vec<String> = self
+            .include
+            .iter()
+            .filter(|entry| matches!(entry.target, Target::Net(IpNet::V6(_))))
+            .map(|entry| format!("'{}'", entry.raw))
+            .collect();
+        if v6.is_empty() {
+            return None;
+        }
+        let what = if v6.len() == 1 { "is an IPv6 target" } else { "are IPv6 targets" };
+        Some(format!("{} {what}, and this kernel has no IPv6 (booted with ipv6.disable=1?)", v6.join(", ")))
+    }
+
     /// Applies the refusals that need the machine's connected subnets.
     ///
     /// # Errors
@@ -473,6 +494,22 @@ mod tests {
             connected: connected.iter().map(|s| net(s)).collect(),
             ..Snapshot::default()
         }
+    }
+
+    #[test]
+    fn an_ipv6_target_without_ipv6_is_refused() {
+        let t = targets(&["fd99::/64", "10.99.0.0/16"], &[]);
+
+        let refusal = t.ipv6_refusal(false).unwrap();
+
+        assert!(refusal.contains("fd99::/64") && refusal.contains("IPv6"), "{refusal}");
+        assert!(!refusal.contains("10.99.0.0/16"), "{refusal}");
+        assert_eq!(t.ipv6_refusal(true), None);
+    }
+
+    #[test]
+    fn v4_targets_without_ipv6_are_fine() {
+        assert_eq!(targets(&["10.99.0.0/16", "*.corp.example"], &["fd99::/64"]).ipv6_refusal(false), None);
     }
 
     #[test]

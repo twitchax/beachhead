@@ -18,6 +18,7 @@ use std::{
         raw::{c_char, c_int, c_short},
         unix::{fs::MetadataExt as _, process::CommandExt as _},
     },
+    path::Path,
     process::{Command, Output, Stdio},
 };
 
@@ -50,14 +51,29 @@ const TUNSETPERSIST: Opcode = opcode::write::<c_int>(b'T', 203);
 
 const _: () = assert!(DEVICE.len() < libc::IFNAMSIZ, "the device name must fit an ifreq with its NUL");
 
-/// The directly connected subnets, v4 and v6, from every routing table a rule consults.
+/// Whether the kernel has an IPv6 stack. `/proc/net/if_inet6` is absent only when the stack never
+/// initialized (booted with `ipv6.disable=1`), and that is when `ip -6` fails; the `disable_ipv6`
+/// sysctl leaves the file in place and `ip -6` works, so that case needs no special handling.
+#[must_use]
+pub fn has_ipv6() -> bool {
+    Path::new("/proc/net/if_inet6").exists()
+}
+
+/// The `ip` family flags to read and flush: v4 always, v6 only when `ipv6`.
+#[must_use]
+pub fn families(ipv6: bool) -> &'static [&'static str] {
+    if ipv6 { &["-4", "-6"] } else { &["-4"] }
+}
+
+/// The directly connected subnets, v4 and v6 (v4 only without an IPv6 stack), from every routing
+/// table a rule consults.
 ///
 /// # Errors
 ///
 /// Fails when `ip` can't run or prints something unexpected.
 pub fn snapshot() -> Res<Snapshot> {
     let mut snapshot = Snapshot::default();
-    for family in ["-4", "-6"] {
+    for family in families(has_ipv6()) {
         let rules = output("ip", &["-j", family, "rule", "show"])?;
         let routes = output("ip", &["-j", family, "route", "show", "table", "all"])?;
         let Snapshot { connected, taken, hosts } = parse_snapshot(&rules, &routes)?;
@@ -481,6 +497,12 @@ mod tests {
         {"type":"local","dst":"2001:db8:1::10","dev":"eth0","table":"local","protocol":"kernel","metric":0,"flags":[],"pref":"medium"},
         {"type":"multicast","dst":"ff00::/8","dev":"eth0","table":"local","protocol":"kernel","metric":256,"flags":[],"pref":"medium"}
     ]"#;
+
+    #[test]
+    fn families_without_ipv6_are_v4_only() {
+        assert_eq!(families(false), ["-4"]);
+        assert_eq!(families(true), ["-4", "-6"]);
+    }
 
     #[test]
     fn snapshot_parses_ip_json() {

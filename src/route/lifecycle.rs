@@ -108,14 +108,15 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
 fn preflight(options: &Options) -> Res<(Targets, Vec<String>, Vec<IpNet>)> {
     let targets = Targets::parse(&options.include, &options.exclude)?;
     let snapshot = system::snapshot().context("reading the routing tables")?;
-    let warnings = checked(&targets, &snapshot, system::resolved_usable)?;
+    let warnings = checked(&targets, &snapshot, system::has_ipv6(), system::resolved_usable)?;
     Ok((targets, warnings, snapshot.connected))
 }
 
 /// The refusals that need the machine, all in one error: `targets` against its connected subnets,
-/// and patterns against its resolver (`resolved_usable`, asked only when there are patterns).
-fn checked(targets: &Targets, snapshot: &Snapshot, resolved_usable: impl FnOnce() -> Res<bool>) -> Res<Vec<String>> {
+/// its IPv6 targets against its kernel (`ipv6`), and patterns against its resolver (`resolved_usable`, asked only when there are patterns).
+fn checked(targets: &Targets, snapshot: &Snapshot, ipv6: bool, resolved_usable: impl FnOnce() -> Res<bool>) -> Res<Vec<String>> {
     let mut found = targets.findings(snapshot);
+    found.refusals.extend(targets.ipv6_refusal(ipv6));
     if targets.has_names() && !resolved_usable()? {
         found.refusals.push(
             "domain patterns need systemd-resolved, and the system resolver doesn't go through it here \
@@ -330,19 +331,30 @@ mod tests {
         };
         let both = targets(&["10.99.7.0/24", "*.corp.example"], &[]);
 
-        let error = checked(&both, &connected, || Ok(false)).unwrap_err().to_string();
+        let error = checked(&both, &connected, true, || Ok(false)).unwrap_err().to_string();
 
         assert!(error.contains("'10.99.7.0/24' is inside the connected subnet 10.99.0.0/16"), "{error}");
         assert!(error.contains("systemd-resolved"), "{error}");
     }
 
     #[test]
+    fn checked_without_ipv6_refuses_an_ipv6_target() {
+        let v6 = targets(&["fd99::/64"], &[]);
+        let none = Snapshot::default();
+
+        let error = checked(&v6, &none, false, || Ok(true)).unwrap_err().to_string();
+
+        assert!(error.contains("'fd99::/64' is an IPv6 target"), "{error}");
+        assert!(checked(&v6, &none, true, || Ok(true)).is_ok());
+    }
+
+    #[test]
     fn the_resolver_matters_only_to_patterns() {
         let none = Snapshot::default();
 
-        assert!(checked(&targets(&["10.99.0.0/16"], &[]), &none, || panic!("asked about the resolver")).is_ok());
-        assert!(checked(&targets(&["*.corp.example"], &[]), &none, || Ok(true)).is_ok());
-        assert!(checked(&targets(&["*.corp.example"], &[]), &none, || Ok(false)).is_err());
+        assert!(checked(&targets(&["10.99.0.0/16"], &[]), &none, true, || panic!("asked about the resolver")).is_ok());
+        assert!(checked(&targets(&["*.corp.example"], &[]), &none, true, || Ok(true)).is_ok());
+        assert!(checked(&targets(&["*.corp.example"], &[]), &none, true, || Ok(false)).is_err());
     }
 
     #[test]
