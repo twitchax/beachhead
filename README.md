@@ -376,7 +376,9 @@ machine's routes on its own prefix.
 helper hands the device back to `route` and trusts nothing it is sent: it re-checks every target as
 root and does a fixed set of things to its own device. `route --check` learns whether sudo would
 prompt from sudo itself: it starts the helper through `sudo -n -k` and hangs up before the helper
-does anything.
+does anything. When sudo would prompt for the copy you ran but not for a root-only
+`/usr/local/bin/sshunnel`, as after the setup below when `~/.cargo/bin` comes first on `PATH`, both
+`route --check` and `sshunnel sudoers` say to run `route` as `/usr/local/bin/sshunnel`.
 
 ```text
 $ sshunnel sudoers --help

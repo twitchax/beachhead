@@ -7,7 +7,13 @@
 //! name or path with a character sudoers or the shell could misread, and a user name sudoers reads
 //! as something other than that user: `ALL`, a `+netgroup` or a `User_Alias`.
 
-use std::{fmt::Write as _, os::unix::fs::MetadataExt as _, path::Path, process::Stdio};
+use std::{
+    borrow::Cow,
+    fmt::Write as _,
+    os::unix::fs::MetadataExt as _,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context as _, bail, ensure};
 
@@ -27,8 +33,17 @@ const HEADER: &str = "# route starts a root helper through sudo. Run this once, 
 # password. Read it first: sudo runs whatever is at the path the sudoers line names.
 ";
 
-/// The setup for the user running this, and for this binary: [`script`] with what it finds, sudo's
-/// answer from [`helper::probe_sudo`].
+/// What sudo does with the helper, as [`ask`] found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Answers {
+    /// For the helper as this binary starts it.
+    pub this: Sudo,
+    /// For the helper as the copy in [`INSTALL_DIR`] starts it, when [`ask`] asked about that one too.
+    pub installed: Option<Sudo>,
+}
+
+/// The setup for the user running this, and for this binary: [`script`] with what it finds, and
+/// sudo's answers from [`ask`].
 ///
 /// # Errors
 ///
@@ -44,7 +59,49 @@ pub async fn run() -> Res<String> {
         "{INSTALL_DIR} can be written by users other than root, so a sudoers line can't safely name a binary in it; \
          install sshunnel in a directory only root can write, and run `sshunnel sudoers` from that copy"
     );
-    script(&user_name()?, &exe, exe_root_only, helper::probe_sudo().await?)
+    let answers = ask(&exe, exe_root_only, installed_root_only()?.as_deref(), helper::probe_sudo_for).await?;
+    script(&user_name()?, &exe, exe_root_only, answers)
+}
+
+/// [`ask`] about this binary, with the copy in [`INSTALL_DIR`] as this machine has it.
+///
+/// # Errors
+///
+/// Fails as [`ask`] does, and when this binary or that copy can't be located or read.
+pub(crate) async fn ask_sudo() -> Res<Answers> {
+    let exe = std::env::current_exe().context("locating sshunnel's own executable")?;
+    ask(&exe, root_only(&exe)?, installed_root_only()?.as_deref(), helper::probe_sudo_for).await
+}
+
+/// Asks sudo, through `probe`, about the helper as the binary at `exe` starts it. When sudo asks
+/// for a password, no sudoers line can name `exe` (it isn't [`root_only`]), and `installed` is a
+/// root-only copy in [`INSTALL_DIR`] other than `exe`, it asks about that copy too: an earlier
+/// setup may have allowed it, and then `route` started from it needs no password. A failure there
+/// only leaves that answer out, since this binary's answer stands either way.
+///
+/// # Errors
+///
+/// Fails when `probe` does for `exe`.
+pub(crate) async fn ask(exe: &Path, exe_root_only: bool, installed: Option<&Path>, probe: impl AsyncFn(&Path) -> Res<Sudo>) -> Res<Answers> {
+    let this = probe(exe).await?;
+    let installed = match installed {
+        Some(installed) if this == Sudo::Prompts && !exe_root_only && installed != exe => {
+            probe(installed).await.inspect_err(|e| tracing::warn!("asking sudo about {}'s helper: {e:#}", installed.display())).ok()
+        }
+        _ => None,
+    };
+    Ok(Answers { this, installed })
+}
+
+/// Where the script installs a binary others can write: `sshunnel` in [`INSTALL_DIR`].
+pub(crate) fn installed_path() -> String {
+    format!("{INSTALL_DIR}/sshunnel")
+}
+
+/// The copy in [`INSTALL_DIR`], when there is one and it is [`root_only`].
+fn installed_root_only() -> Res<Option<PathBuf>> {
+    let installed = PathBuf::from(installed_path());
+    Ok((installed.exists() && root_only(&installed)?).then_some(installed))
 }
 
 /// Whether root alone can write `path`: it and every directory above it are owned by root and have
@@ -96,11 +153,16 @@ pub fn user_name() -> Res<String> {
 /// relative `exe`, for a `user` or `exe` with anything but `[A-Za-z0-9._/+-]`, all of which mean
 /// only themselves to sudoers and to the shell, and for a `user` sudoers reads as someone else:
 /// `ALL`, a `+netgroup` or a `User_Alias`.
-pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Sudo) -> Res<String> {
-    let now = match sudo {
-        Sudo::AlreadyRoot => bail!(AS_ROOT),
-        Sudo::NoPrompt => "sudo starts the helper without a password: this is already set up",
-        Sudo::Prompts => "sudo asks for a password to start the helper",
+pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Answers) -> Res<String> {
+    let installed = installed_path();
+    let now: Cow<str> = match sudo {
+        Answers { this: Sudo::AlreadyRoot, .. } => bail!(AS_ROOT),
+        Answers { this: Sudo::NoPrompt, .. } => "sudo starts the helper without a password: this is already set up".into(),
+        Answers {
+            this: Sudo::Prompts,
+            installed: Some(Sudo::NoPrompt),
+        } => format!("sudo starts {installed}'s helper without a password: run route as it").into(),
+        Answers { this: Sudo::Prompts, .. } => "sudo asks for a password to start the helper".into(),
     };
     let user = plain("the user name", user)?;
     if let Some(read_as) = misread_as(user) {
@@ -108,7 +170,6 @@ pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Sudo) -> Res<St
     }
     ensure!(exe.is_absolute(), "sudoers needs a full path, and {} is relative", exe.display());
     let exe = plain("the path", exe.to_str().with_context(|| format!("{} isn't UTF-8", exe.display()))?)?;
-    let installed = format!("{INSTALL_DIR}/sshunnel");
     let named = if exe_root_only { exe } else { &installed };
 
     let mut steps = Vec::with_capacity(3);
@@ -165,17 +226,50 @@ fn plain<'a>(what: &str, text: &'a str) -> Res<&'a str> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt as _};
+    use std::{cell::RefCell, fs::Permissions, os::unix::fs::PermissionsExt as _};
 
+    use anyhow::anyhow;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
     use super::*;
     use crate::tests::netns;
 
+    const EXE: &str = "/home/me/.cargo/bin/sshunnel";
+    const INSTALLED: &str = "/usr/local/bin/sshunnel";
+    const PROMPTS: &str = "# Right now, sudo asks for a password to start the helper.";
+
+    /// sudo's answer for this binary, and none for the installed copy.
+    fn only_this(this: Sudo) -> Answers {
+        Answers { this, installed: None }
+    }
+
+    /// [`ask`] about [`EXE`], with `installed` as the copy in [`INSTALL_DIR`] and sudo answering
+    /// each path as `answers` has it (a path it lacks fails); returns what it found and the paths
+    /// it asked sudo about.
+    async fn asking(exe_root_only: bool, installed: Option<&str>, answers: &[(&str, Sudo)]) -> (Res<Answers>, Vec<PathBuf>) {
+        let asked = RefCell::new(Vec::new());
+        let probe = async |exe: &Path| {
+            asked.borrow_mut().push(exe.to_owned());
+            answers.iter().find(|(at, _)| Path::new(at) == exe).map(|(_, sudo)| *sudo).ok_or_else(|| anyhow!("sudo didn't answer"))
+        };
+        let found = ask(Path::new(EXE), exe_root_only, installed.map(Path::new), probe).await;
+        (found, asked.into_inner())
+    }
+
+    fn paths(items: &[&str]) -> Vec<PathBuf> {
+        items.iter().map(PathBuf::from).collect()
+    }
+
+    /// The last line of the script for [`EXE`], which others can write, with these answers.
+    fn last_line(answers: Answers) -> String {
+        let script = script("me", Path::new(EXE), false, answers).unwrap();
+        script.lines().last().unwrap().to_owned()
+    }
+
     #[test]
     fn sudoers_script_installs_a_binary_others_can_write() {
-        let script = script("me", Path::new("/home/me/.cargo/bin/sshunnel"), false, Sudo::Prompts).unwrap();
+        let script = script("me", Path::new("/home/me/.cargo/bin/sshunnel"), false, only_this(Sudo::Prompts)).unwrap();
 
         assert_eq!(
             script,
@@ -200,7 +294,7 @@ rm -f "$f"
 
     #[test]
     fn sudoers_script_names_a_root_only_binary_as_is() {
-        let script = script("me", Path::new("/usr/bin/sshunnel"), true, Sudo::NoPrompt).unwrap();
+        let script = script("me", Path::new("/usr/bin/sshunnel"), true, only_this(Sudo::NoPrompt)).unwrap();
 
         assert!(!script.contains("install -o root -g root -m 0755"), "{script}");
         assert!(script.contains("\n# 1. Allow the helper"), "the steps renumber: {script}");
@@ -213,33 +307,114 @@ rm -f "$f"
     fn sudoers_script_refuses_characters_sudoers_would_misread() {
         let exe = Path::new("/home/me/.cargo/bin/sshunnel");
         for user in ["a b", "", "me,root", "%sudo", "me\nroot", "me'", "me#"] {
-            let error = script(user, exe, false, Sudo::Prompts).unwrap_err().to_string();
+            let error = script(user, exe, false, only_this(Sudo::Prompts)).unwrap_err().to_string();
             assert!(error.contains("user name"), "{user:?}: {error}");
         }
         // Plain characters, but sudoers reads them as every user, a netgroup and a User_Alias.
         for (user, read_as) in [("ALL", "every user"), ("+admins", "a netgroup"), ("ADMINS", "a User_Alias"), ("OPS_2", "a User_Alias")] {
-            let error = script(user, exe, false, Sudo::Prompts).unwrap_err().to_string();
+            let error = script(user, exe, false, only_this(Sudo::Prompts)).unwrap_err().to_string();
             assert!(error.contains("user name") && error.contains(read_as), "{user:?}: {error}");
         }
         // Each rule's edge: only a whole name of that shape is something else.
         for user in ["All", "me+x", "Admins", "A1b", "_ALL"] {
-            assert!(script(user, exe, false, Sudo::Prompts).is_ok(), "{user:?}");
+            assert!(script(user, exe, false, only_this(Sudo::Prompts)).is_ok(), "{user:?}");
         }
         for path in ["/opt/my tools/sshunnel", "/opt/*/sshunnel", "/opt/it's/sshunnel", "/opt/a,b/sshunnel", "/opt/a\\b/sshunnel"] {
             for root_only in [false, true] {
-                let error = script("me", Path::new(path), root_only, Sudo::Prompts).unwrap_err().to_string();
+                let error = script("me", Path::new(path), root_only, only_this(Sudo::Prompts)).unwrap_err().to_string();
                 assert!(error.contains("path"), "{path:?}: {error}");
             }
         }
         // sudoers takes a command by its full path only.
-        assert!(script("me", Path::new("sshunnel"), true, Sudo::Prompts).is_err());
+        assert!(script("me", Path::new("sshunnel"), true, only_this(Sudo::Prompts)).is_err());
     }
 
     #[test]
     fn sudoers_script_is_not_for_root() {
-        let error = script("root", Path::new("/usr/bin/sshunnel"), true, Sudo::AlreadyRoot).unwrap_err();
+        let error = script("root", Path::new("/usr/bin/sshunnel"), true, only_this(Sudo::AlreadyRoot)).unwrap_err();
 
         assert_eq!(error.to_string(), "run `sshunnel sudoers` as the user who will run route, not as root");
+    }
+
+    #[tokio::test]
+    async fn sudoers_asks_sudo_about_the_installed_copy_when_this_one_prompts() {
+        let (found, asked) = asking(false, Some(INSTALLED), &[(EXE, Sudo::Prompts), (INSTALLED, Sudo::NoPrompt)]).await;
+
+        assert_eq!(
+            found.unwrap(),
+            Answers {
+                this: Sudo::Prompts,
+                installed: Some(Sudo::NoPrompt)
+            }
+        );
+        assert_eq!(asked, paths(&[EXE, INSTALLED]));
+    }
+
+    #[test]
+    fn sudoers_script_says_to_run_route_as_the_installed_copy_sudo_allows() {
+        let allowed = Answers {
+            this: Sudo::Prompts,
+            installed: Some(Sudo::NoPrompt),
+        };
+
+        let after = script("me", Path::new(EXE), false, allowed).unwrap();
+
+        // The steps stay; only what sudo does right now changes.
+        let before = script("me", Path::new(EXE), false, only_this(Sudo::Prompts)).unwrap();
+        let steps = |script: &str| script.lines().count() - 1;
+        assert_eq!(after.lines().take(steps(&after)).collect::<Vec<_>>(), before.lines().take(steps(&before)).collect::<Vec<_>>());
+        assert_eq!(
+            after.lines().last(),
+            Some("# Right now, sudo starts /usr/local/bin/sshunnel's helper without a password: run route as it.")
+        );
+    }
+
+    #[tokio::test]
+    async fn sudoers_script_keeps_its_last_line_without_an_installed_copy() {
+        let (found, asked) = asking(false, None, &[(EXE, Sudo::Prompts)]).await;
+
+        assert_eq!(asked, paths(&[EXE]));
+        assert_eq!(last_line(found.unwrap()), PROMPTS);
+    }
+
+    #[tokio::test]
+    async fn sudoers_script_keeps_its_last_line_when_the_installed_copy_is_this_binary() {
+        let (found, asked) = asking(false, Some(EXE), &[(EXE, Sudo::Prompts)]).await;
+
+        assert_eq!(asked, paths(&[EXE]));
+        assert_eq!(last_line(found.unwrap()), PROMPTS);
+    }
+
+    #[tokio::test]
+    async fn sudoers_script_keeps_its_last_line_when_the_installed_copy_prompts_too() {
+        let (found, asked) = asking(false, Some(INSTALLED), &[(EXE, Sudo::Prompts), (INSTALLED, Sudo::Prompts)]).await;
+
+        assert_eq!(asked, paths(&[EXE, INSTALLED]));
+        assert_eq!(last_line(found.unwrap()), PROMPTS);
+    }
+
+    #[tokio::test]
+    async fn sudoers_script_keeps_its_last_line_when_asking_about_the_installed_copy_fails() {
+        // This binary's answer stands: the installed copy's is only ever good news.
+        let (found, asked) = asking(false, Some(INSTALLED), &[(EXE, Sudo::Prompts)]).await;
+
+        assert_eq!(asked, paths(&[EXE, INSTALLED]));
+        assert_eq!(last_line(found.unwrap()), PROMPTS);
+    }
+
+    #[tokio::test]
+    async fn sudoers_asks_about_the_installed_copy_only_for_a_binary_that_prompts_and_no_line_can_name() {
+        let installed_allowed = (INSTALLED, Sudo::NoPrompt);
+        for this in [Sudo::AlreadyRoot, Sudo::NoPrompt] {
+            let (found, asked) = asking(false, Some(INSTALLED), &[(EXE, this), installed_allowed]).await;
+            assert_eq!((found.unwrap(), asked), (only_this(this), paths(&[EXE])), "{this:?}");
+        }
+        // A root-only binary gets a line of its own.
+        let (found, asked) = asking(true, Some(INSTALLED), &[(EXE, Sudo::Prompts), installed_allowed]).await;
+        assert_eq!((found.unwrap(), asked), (only_this(Sudo::Prompts), paths(&[EXE])));
+        // No answer for this binary is no answer at all.
+        let (found, asked) = asking(false, Some(INSTALLED), &[installed_allowed]).await;
+        assert_eq!((found.unwrap_err().to_string(), asked), ("sudo didn't answer".to_owned(), paths(&[EXE])));
     }
 
     #[test]

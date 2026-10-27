@@ -19,6 +19,9 @@ why the version moved the way it did.
 - `sshunnel sudoers` (Linux) prints the one-time setup that lets `route` start without a sudo
   password, for this user and binary, and whether sudo prompts right now. It never names a binary
   anyone but root can write.
+- When sudo prompts for the copy that runs but not for a root-only `/usr/local/bin/sshunnel`,
+  `route --check` and `sshunnel sudoers` say to run `route` as that one, rather than print the
+  setup it already has.
 - `sshunnel completions <shell>`: completion scripts for bash, elvish, fish, PowerShell and zsh.
 - `sshunnel help` (and `--help`) is a guide: examples, what `route` needs, running it from a script
   or an agent, exit statuses, files and environment. Each command's `--help` has examples of its

@@ -215,11 +215,16 @@ pub(crate) const PROBE_WITHIN: Duration = Duration::from_secs(10);
 /// Fails when sudo can't be started or doesn't answer within 10 s, or when what connects isn't
 /// root.
 pub async fn probe_sudo() -> Res<Sudo> {
+    let exe = std::env::current_exe().context("locating sshunnel's own executable")?;
+    probe_sudo_for(&exe).await
+}
+
+/// [`probe_sudo`] for the helper as the binary at `exe` would start it.
+pub(crate) async fn probe_sudo_for(exe: &Path) -> Res<Sudo> {
     if rustix::process::geteuid().is_root() {
         return Ok(Sudo::AlreadyRoot);
     }
-    let exe = std::env::current_exe().context("locating sshunnel's own executable")?;
-    probe_with(&runtime_dir(), |socket| probe_command(&exe, socket), PROBE_WITHIN).await
+    probe_with(&runtime_dir(), |socket| probe_command(exe, socket), PROBE_WITHIN).await
 }
 
 /// [`probe_sudo`] with the socket's parent dir, the command line and the wait chosen by the caller.

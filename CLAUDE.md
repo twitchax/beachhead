@@ -38,7 +38,9 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   netstack's thread and then stops the helper, `check` (the dry run, `route --check`: the
   lifecycle's preflight, the device, a `sudo -n -k` probe of the helper, ssh and ping, changing
   nothing), and `sudoers` (`sshunnel sudoers`: the `NOPASSWD` setup as a script for a person to
-  run, naming only a binary that it and every directory above it leave to root alone).
+  run, naming only a binary that it and every directory above it leave to root alone). When sudo
+  prompts for this binary, both also probe the root-only copy in `/usr/local/bin` (`sudoers::ask`),
+  so neither sends someone back to a setup that's already done for that copy.
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.
 - `crates/sshunnel-relay`: the remote binary, pushed over SSH as a static musl build. Every

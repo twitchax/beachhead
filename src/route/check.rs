@@ -1,10 +1,11 @@
 //! `sshunnel route --check`: whether `route` can start, changing nothing. It runs every check
 //! `route` makes before it changes anything (`preflight`), then the ones `route` only meets on the
 //! way: whether [`DEVICE`] is free, whether sudo starts the root helper without asking (the
-//! [`helper::probe_sudo`] probe, which hangs up before the helper changes anything), ssh and the
-//! relay, and whether the relay may ping. Every check runs whatever the others found, and each
-//! finding is written as soon as it is known, so the local ones show before ssh, which may take
-//! minutes to give up on a host that never answers.
+//! [`probe_sudo`](crate::route::helper::probe_sudo) probe, which hangs up before the helper changes
+//! anything, and when sudo asks, the same for the copy [`sudoers`] installs), ssh and the relay, and
+//! whether the relay may ping. Every check runs whatever the others found, and each finding is
+//! written as soon as it is known, so the local ones show before ssh, which may take minutes to give
+//! up on a host that never answers.
 
 use std::{
     fmt::{self, Display},
@@ -20,8 +21,9 @@ use crate::{
     relays::Relays,
     route::{
         DEVICE, PING_WARNING,
-        helper::{self, Signals, Sudo},
+        helper::{Signals, Sudo},
         lifecycle::{Options, preflight, routed},
+        sudoers::{self, Answers},
         targets::Targets,
     },
     session::{Session, SshCommand},
@@ -97,11 +99,11 @@ impl Report {
 /// Fails when a signal (SIGINT, SIGTERM, or SIGHUP unless ignored at startup) stops it, or `out`
 /// can't be written. A check that fails is a [`Status::Fail`] finding, not an error.
 pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays: &Relays, out: &mut impl Write) -> Res<Report> {
-    run_with(options, ssh, destination, relays, helper::probe_sudo(), out).await
+    run_with(options, ssh, destination, relays, sudoers::ask_sudo(), out).await
 }
 
-/// [`run`] with the sudo probe chosen by the caller.
-pub(crate) async fn run_with(options: &Options, ssh: &SshCommand, destination: &str, relays: &Relays, sudo: impl Future<Output = Res<Sudo>>, out: &mut impl Write) -> Res<Report> {
+/// [`run`] with sudo's answers chosen by the caller.
+pub(crate) async fn run_with(options: &Options, ssh: &SshCommand, destination: &str, relays: &Relays, sudo: impl Future<Output = Res<Answers>>, out: &mut impl Write) -> Res<Report> {
     // First, so a Ctrl-C at any point drops the checks, the probe's socket dir and ssh with them.
     let mut signals = Signals::respecting_nohup()?;
     tokio::select! {
@@ -112,7 +114,7 @@ pub(crate) async fn run_with(options: &Options, ssh: &SshCommand, destination: &
 }
 
 /// The checks in order: the local ones first, then ssh.
-async fn checks(options: &Options, ssh: &SshCommand, destination: &str, relays: &Relays, sudo: impl Future<Output = Res<Sudo>>, out: &mut impl Write) -> Res<Report> {
+async fn checks(options: &Options, ssh: &SshCommand, destination: &str, relays: &Relays, sudo: impl Future<Output = Res<Answers>>, out: &mut impl Write) -> Res<Report> {
     let mut report = Report { findings: Vec::new() };
     let checked = preflight(options).map(|(targets, warnings, _)| (targets, warnings));
     report.add(out, targets_findings(checked))?;
@@ -143,11 +145,20 @@ fn device_finding(exists: bool) -> Finding {
 }
 
 /// `sudo`: a prompt only means `route` asks for a password, so it warns.
-fn sudo_finding(sudo: Res<Sudo>) -> Finding {
+fn sudo_finding(sudo: Res<Answers>) -> Finding {
     match sudo {
-        Ok(Sudo::AlreadyRoot) => finding("sudo", Status::Ok, "running as root, so route needs no sudo"),
-        Ok(Sudo::NoPrompt) => finding("sudo", Status::Ok, "sudo starts the helper without a password"),
-        Ok(Sudo::Prompts) => finding("sudo", Status::Warn, "sudo asks for a password; `sshunnel sudoers` prints the setup that skips it"),
+        Ok(Answers { this: Sudo::AlreadyRoot, .. }) => finding("sudo", Status::Ok, "running as root, so route needs no sudo"),
+        Ok(Answers { this: Sudo::NoPrompt, .. }) => finding("sudo", Status::Ok, "sudo starts the helper without a password"),
+        // An earlier setup allowed the installed copy, and this one isn't it.
+        Ok(Answers {
+            this: Sudo::Prompts,
+            installed: Some(Sudo::NoPrompt),
+        }) => finding(
+            "sudo",
+            Status::Warn,
+            format!("sudo asks for a password for this copy, but not for {}: run route as that one", sudoers::installed_path()),
+        ),
+        Ok(Answers { this: Sudo::Prompts, .. }) => finding("sudo", Status::Warn, "sudo asks for a password; `sshunnel sudoers` prints the setup that skips it"),
         Err(e) => finding("sudo", Status::Fail, format!("{e:#}")),
     }
 }
@@ -188,6 +199,7 @@ mod tests {
     use super::*;
     use crate::{
         relays::{Relay, Source},
+        route::helper,
         tests::{host_arch, shim_dir},
     };
 
@@ -256,21 +268,53 @@ mod tests {
         );
     }
 
+    /// sudo's answer for this binary, and none for the installed copy.
+    fn only_this(this: Sudo) -> Answers {
+        Answers { this, installed: None }
+    }
+
+    const PROMPTS: &str = "sudo asks for a password; `sshunnel sudoers` prints the setup that skips it";
+
     #[test]
     fn route_check_sudo_as_root_ok() {
-        assert_eq!(sudo_finding(Ok(Sudo::AlreadyRoot)), finding("sudo", Status::Ok, "running as root, so route needs no sudo"));
+        assert_eq!(sudo_finding(Ok(only_this(Sudo::AlreadyRoot))), finding("sudo", Status::Ok, "running as root, so route needs no sudo"));
     }
 
     #[test]
     fn route_check_sudo_without_a_password_ok() {
-        assert_eq!(sudo_finding(Ok(Sudo::NoPrompt)), finding("sudo", Status::Ok, "sudo starts the helper without a password"));
+        assert_eq!(sudo_finding(Ok(only_this(Sudo::NoPrompt))), finding("sudo", Status::Ok, "sudo starts the helper without a password"));
     }
 
     #[test]
     fn route_check_sudo_that_prompts_warns() {
+        // No installed copy was asked about: there is none, or it is this binary.
+        assert_eq!(sudo_finding(Ok(only_this(Sudo::Prompts))), finding("sudo", Status::Warn, PROMPTS));
+    }
+
+    #[test]
+    fn route_check_sudo_that_prompts_for_the_installed_copy_too_warns_as_before() {
+        let both = Ok(Answers {
+            this: Sudo::Prompts,
+            installed: Some(Sudo::Prompts),
+        });
+
+        assert_eq!(sudo_finding(both), finding("sudo", Status::Warn, PROMPTS));
+    }
+
+    #[test]
+    fn route_check_sudo_that_prompts_only_for_this_copy_names_the_installed_one() {
+        let installed_allowed = Ok(Answers {
+            this: Sudo::Prompts,
+            installed: Some(Sudo::NoPrompt),
+        });
+
         assert_eq!(
-            sudo_finding(Ok(Sudo::Prompts)),
-            finding("sudo", Status::Warn, "sudo asks for a password; `sshunnel sudoers` prints the setup that skips it")
+            sudo_finding(installed_allowed),
+            finding(
+                "sudo",
+                Status::Warn,
+                "sudo asks for a password for this copy, but not for /usr/local/bin/sshunnel: run route as that one"
+            )
         );
     }
 
@@ -355,7 +399,10 @@ mod tests {
         std::fs::create_dir(&runtime).unwrap();
         let started = root.path().join("started");
         let sudo = shim_dir(root.path(), &[("sudo", &format!(": > '{}'\nexec sleep 30", started.display()))]).unwrap().join("sudo");
-        let probe = helper::probe_with(&runtime, |_| vec![sudo.clone().into_os_string()], Duration::from_secs(30));
+        let probe = async {
+            let this = helper::probe_with(&runtime, |_| vec![sudo.clone().into_os_string()], Duration::from_secs(30)).await?;
+            Ok(Answers { this, installed: None })
+        };
         let options = Options {
             include: strings(&["192.0.2.0/24"]),
             exclude: Vec::new(),
