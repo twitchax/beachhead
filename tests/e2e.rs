@@ -152,6 +152,8 @@ async fn e2e_forward_prints_a_ready_line() {
     assert!(at > last_forwarding, "the ready line follows the forwarding lines: {lines:?}");
 }
 
+// Linux only, as rustix is a Linux dev-dependency.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn e2e_forward_stopped_by_a_signal_exits_0() {
     for signal in [rustix::process::Signal::TERM, rustix::process::Signal::INT] {
