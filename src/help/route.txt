@@ -34,11 +34,11 @@ Privileges:
   routes and DNS settings, and removes all of them when route exits. `sshunnel sudoers` prints the
   one-time setup that skips the password prompt.
 
-Refused before ssh runs, every problem at once:
-  0.0.0.0/0 and ::/0 (0.0.0.0/1 plus 128.0.0.0/1 is a full tunnel), a bare *, a target inside a
-  directly connected subnet or inside 198.18.0.0/15 or 2001:2::/96, more than 4096 routes, a
-  route the main table already has, IPv6 targets on a kernel without IPv6, and domain patterns
-  without systemd-resolved.
+Refused before ssh runs:
+  0.0.0.0/0 and ::/0 (0.0.0.0/1 plus 128.0.0.0/1, a deliberate full tunnel, is allowed), a bare *,
+  a target inside a directly connected subnet or inside 198.18.0.0/15 or 2001:2::/96, more than
+  4096 routes, a route the main table already has, IPv6 targets on a kernel without IPv6, and
+  domain patterns without systemd-resolved.
 
 Troubleshooting:
   "domain patterns need systemd-resolved"

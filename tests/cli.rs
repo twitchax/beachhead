@@ -11,9 +11,11 @@ use std::{
 use pretty_assertions::assert_eq;
 
 /// The binary with the env vars it reads cleared, so the host environment can't leak in.
+/// `NO_COLOR` outranks `CLICOLOR_FORCE` and `CLICOLOR` in clap's color choice, so the help stays
+/// plain text whatever the host sets.
 fn sshunnel() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sshunnel"));
-    cmd.env_remove("SSHUNNEL_RELAY_DIR").env_remove("SSHUNNEL_SSH").env_remove("RUST_LOG");
+    cmd.env_remove("SSHUNNEL_RELAY_DIR").env_remove("SSHUNNEL_SSH").env_remove("RUST_LOG").env("NO_COLOR", "1");
     cmd
 }
 
@@ -120,6 +122,14 @@ fn e2e_help_screens_fit_100_columns() {
     }
 }
 
+/// The README's copies come from this helper, so a host forcing color mustn't put escapes in them.
+#[test]
+fn e2e_help_stays_plain_when_color_is_forced() {
+    let out = sshunnel().arg("--help").env("CLICOLOR_FORCE", "1").output().unwrap();
+    assert!(out.status.success());
+    assert!(!out.stdout.contains(&0x1b), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
 /// Troubleshooting quotes error messages, so each quote has to be one the code can print.
 #[test]
 fn help_troubleshooting_quotes_messages_the_code_prints() {
@@ -156,6 +166,16 @@ fn rust_sources(dir: &Path, skip: &Path, out: &mut Vec<String>) {
     }
 }
 
+/// The first lines of the help blocks the README embeds.
+#[cfg(target_os = "linux")]
+const README_HELP: [&str; 5] = [
+    "$ sshunnel --help",
+    "$ sshunnel forward --help",
+    "$ sshunnel route --help",
+    "$ sshunnel sudoers --help",
+    "$ sshunnel completions --help",
+];
+
 /// The help arguments of a README block's first line, `$ sshunnel <args>`: `--help` or `-h`
 /// anywhere, or `help` first. Any other block is an example, not a copy of the help.
 #[cfg(target_os = "linux")]
@@ -164,18 +184,19 @@ fn help_args(first: &str) -> Option<Vec<&str>> {
     (args.iter().any(|arg| *arg == "--help" || *arg == "-h") || args.first() == Some(&"help")).then_some(args)
 }
 
-/// The README shows the help as the binary prints it, byte for byte. `UPDATE_README=1` rewrites
-/// its blocks from the binary instead of comparing them.
+/// The README shows the help as the binary prints it, byte for byte, in every block of
+/// [`README_HELP`]. `UPDATE_README=1` rewrites those blocks from the binary instead of comparing
+/// them.
 #[cfg(target_os = "linux")]
 #[test]
 fn e2e_readme_help_blocks_are_the_binarys_output() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
     let readme = std::fs::read_to_string(&path).unwrap();
-    let update = std::env::var_os("UPDATE_README").is_some();
+    let update = std::env::var("UPDATE_README").is_ok_and(|value| value == "1");
 
     let mut lines = readme.lines();
     let mut rewritten = String::with_capacity(readme.len());
-    let mut blocks = 0;
+    let mut found = Vec::with_capacity(README_HELP.len());
     while let Some(line) = lines.next() {
         rewritten.extend([line, "\n"]);
         if line != "```text" {
@@ -192,9 +213,11 @@ fn e2e_readme_help_blocks_are_the_binarys_output() {
             assert_eq!(shown, printed, "README's `{first}` block differs from the binary's output (UPDATE_README=1 rewrites it)");
         }
         rewritten.extend([printed.as_str(), "```\n"]);
-        blocks += 1;
+        found.push(first);
     }
-    assert!(blocks > 0, "README has no `$ sshunnel ... --help` block");
+    for want in README_HELP {
+        assert!(found.contains(&want), "README has no ```text block that opens with `{want}`");
+    }
 
     if update && rewritten != readme {
         std::fs::write(&path, rewritten).unwrap();

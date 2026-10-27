@@ -102,7 +102,7 @@ Before route:
   - `ssh DESTINATION` works on its own: your keys, agent and ~/.ssh/config all apply.
   - The remote is Linux on x86_64 or aarch64, with a POSIX sh.
   - This machine is Linux. Domain patterns need systemd-resolved as its resolver:
-    /etc/resolv.conf points at 127.0.0.53, or nss-resolve is in /etc/nsswitch.conf.
+    /etc/resolv.conf points at 127.0.0.53, or the hosts: line in /etc/nsswitch.conf has resolve.
   - route starts a root helper through sudo, which asks for your password as sudo usually does,
     or never after the one-time setup that `sshunnel sudoers` prints.
   `sshunnel route --check` checks all of this and the targets, and changes nothing.
@@ -111,9 +111,11 @@ From a script or an agent:
   route and forward run in the foreground until they are stopped. Start one in the background
   and wait for the stderr line that starts with `sshunnel: ready`. If the process exits before
   it, the `error:` message on stderr says why.
-  Nobody can answer a sudo password prompt from a script. When `sshunnel route --check` says sudo
-  asks for a password, have a person either start route in a terminal or run, once, the setup
-  that `sshunnel sudoers` prints.
+  Nobody can answer a prompt from a script. ssh must connect without one: a known host key, and a
+  key or an agent rather than a password (--ssh-cmd 'ssh -o BatchMode=yes' fails instead of
+  asking). When `sshunnel route --check` says sudo asks for a password, have a person either start
+  route in a terminal or run, once, the setup that `sshunnel sudoers` prints. From then on, run
+  route as the binary its sudoers line names: sudo still prompts for any other copy.
   SIGINT or SIGTERM stops either command; route first removes its device, routes and DNS settings.
   Exit status: 0 when a signal stops it once ready, 1 on an error, 2 on a usage error.
   RUST_LOG=info (or debug) logs more to stderr.
@@ -121,7 +123,7 @@ From a script or an agent:
 Files and environment:
   ~/.local/state/sshunnel/names  route's fake address for each name (under $XDG_STATE_HOME if set)
   ~/.cache/sshunnel              on the remote: the cached relays (under $XDG_CACHE_HOME if set)
-  SSHUNNEL_SSH                   the ssh program and its arguments, as --ssh-cmd takes them
+  SSHUNNEL_SSH                   the ssh command, split like a shell would, as --ssh-cmd takes it
   SSHUNNEL_RELAY_DIR             relays to push instead of the built-in ones, as --relay-dir does
   RUST_LOG                       what to log to stderr (default: warn)
 
@@ -289,11 +291,11 @@ Privileges:
   routes and DNS settings, and removes all of them when route exits. `sshunnel sudoers` prints the
   one-time setup that skips the password prompt.
 
-Refused before ssh runs, every problem at once:
-  0.0.0.0/0 and ::/0 (0.0.0.0/1 plus 128.0.0.0/1 is a full tunnel), a bare *, a target inside a
-  directly connected subnet or inside 198.18.0.0/15 or 2001:2::/96, more than 4096 routes, a
-  route the main table already has, IPv6 targets on a kernel without IPv6, and domain patterns
-  without systemd-resolved.
+Refused before ssh runs:
+  0.0.0.0/0 and ::/0 (0.0.0.0/1 plus 128.0.0.0/1, a deliberate full tunnel, is allowed), a bare *,
+  a target inside a directly connected subnet or inside 198.18.0.0/15 or 2001:2::/96, more than
+  4096 routes, a route the main table already has, IPv6 targets on a kernel without IPv6, and
+  domain patterns without systemd-resolved.
 
 Troubleshooting:
   "domain patterns need systemd-resolved"
@@ -364,7 +366,9 @@ connected subnet overlapping `198.18.0.0/15` (whatever the targets) or `2001:2::
 pattern, the only time that range is used), targets that come to more than 4096 routes (an
 exclude carves its target into pieces, each a route), and a route the main table already has at the
 metric sshunnel's own would get (0 for IPv4, 1 for IPv6, so either wins a tie with a route at the
-kernel's default; the kernel won't hold two at the same metric), reporting every problem at once.
+kernel's default; the kernel won't hold two at the same metric). The targets' own problems (their
+syntax, the `/0`s, `*`, a target in a fake range, the route count) are reported together, and once
+they pass, so are the machine's (connected subnets, existing routes, IPv6, systemd-resolved).
 Each target gets a route of its own, never merged with its neighbors, so each competes with the
 machine's routes on its own prefix.
 
