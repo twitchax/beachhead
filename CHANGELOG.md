@@ -7,6 +7,12 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-27
+
+Docs and usability: `sshunnel help` is a guide a person or an agent can connect from, with
+`route --check`, `sshunnel sudoers`, ready lines and completions to back it. A patch rather than a
+minor version because the public API only gains items, so code built against 0.2.1 builds unchanged.
+
 ### Added
 
 - `route` and `forward` print `sshunnel: ready (pid N); Ctrl-C or SIGTERM stops it` once they
