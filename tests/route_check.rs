@@ -225,9 +225,12 @@ async fn e2e_sudoers_prints_the_setup() {
             let exe = Path::new(env!("CARGO_BIN_EXE_sshunnel")).canonicalize().unwrap();
             let install = format!("`sudo install -D -o root -g root -m 0755 {} /opt/sshunnel/bin/sshunnel`", exe.display());
             assert!(last.contains(&install), "{output}");
-            assert!(last.ends_with("then run `/opt/sshunnel/bin/sshunnel sudoers`, which names that copy"), "{output}");
+            assert!(last.ends_with("then run both sudoers and route as that copy: `/opt/sshunnel/bin/sshunnel sudoers`"), "{output}");
         } else {
-            assert!(last.contains(" can be too, so install sshunnel in another directory only root can write"), "{output}");
+            assert!(
+                last.ends_with(" can be too, so install sshunnel in another directory only root can write, and run both sudoers and route as that copy"),
+                "{output}"
+            );
         }
         assert!(stdout.is_empty(), "{output}");
     }

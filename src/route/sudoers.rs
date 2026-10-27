@@ -37,17 +37,17 @@ const HEADER: &str = "# route starts a root helper through sudo. Run this once, 
 # password. Read it first: sudo runs whatever is at the path the sudoers line names.
 ";
 
-/// What sudo does with the helper, as [`ask`] found it.
+/// What sudo does with the helper, as `ask` found it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Answers {
     /// For the helper as this binary starts it.
     pub this: Sudo,
-    /// For the helper as the copy in [`INSTALL_DIR`] starts it, when [`ask`] asked about that one too.
+    /// For the helper as the copy in [`INSTALL_DIR`] starts it, when `ask` asked about that one too.
     pub installed: Option<Sudo>,
 }
 
 /// The setup for the user running this, and for this binary: [`script`] with what it finds, and
-/// sudo's answers from [`ask`].
+/// sudo's answers from `ask`.
 ///
 /// # Errors
 ///
@@ -107,21 +107,22 @@ fn installed_root_only() -> Res<Option<PathBuf>> {
 }
 
 /// Why `sudoers` refuses when neither this binary nor [`INSTALL_DIR`] is [`root_only`], and the way
-/// forward: a root-owned copy at [`ELSEWHERE`], whose own `sudoers` then names it. When `writable`,
-/// a directory on the way there that others can write, rules that out, it says so instead; and it
+/// forward: a root-owned copy at [`ELSEWHERE`], run as both `sudoers` and `route`, since its line
+/// names that copy and only a copy in [`INSTALL_DIR`] gets pointed back at. When `writable`, a
+/// directory on the way there that others can write, rules that out, it says so instead; and it
 /// prints the command only for an `exe` the shell reads as written ([`plain`]).
 fn unsafe_install_dir(exe: &Path, writable: Option<&Path>) -> String {
     let refused = format!("{INSTALL_DIR} can be written by users other than root, so a sudoers line can't safely name a binary in it");
     match (writable, exe.to_str().and_then(|exe| plain("the path", exe).ok())) {
         (Some(dir), _) => format!(
-            "{refused}; {} can be too, so install sshunnel in another directory only root can write, and run `sshunnel sudoers` from that copy",
+            "{refused}; {} can be too, so install sshunnel in another directory only root can write, and run both sudoers and route as that copy",
             dir.display()
         ),
         (None, Some(exe)) => format!(
             "{refused}; install a root-owned copy where only root can write, as `sudo install -D -o root -g root -m 0755 {exe} {ELSEWHERE}` does, \
-             then run `{ELSEWHERE} sudoers`, which names that copy"
+             then run both sudoers and route as that copy: `{ELSEWHERE} sudoers`"
         ),
-        (None, None) => format!("{refused}; install sshunnel in a directory only root can write, and run `sshunnel sudoers` from that copy"),
+        (None, None) => format!("{refused}; install sshunnel in a directory only root can write, and run both sudoers and route as that copy"),
     }
 }
 
@@ -455,7 +456,7 @@ rm -f "$f"
             format!(
                 "{REFUSED}; install a root-owned copy where only root can write, as \
                  `sudo install -D -o root -g root -m 0755 /home/me/.cargo/bin/sshunnel /opt/sshunnel/bin/sshunnel` does, \
-                 then run `/opt/sshunnel/bin/sshunnel sudoers`, which names that copy"
+                 then run both sudoers and route as that copy: `/opt/sshunnel/bin/sshunnel sudoers`"
             )
         );
     }
@@ -465,7 +466,7 @@ rm -f "$f"
         for exe in ["/home/me/my tools/sshunnel", "/home/me/$(id)/sshunnel", "/home/me/it's/sshunnel"] {
             assert_eq!(
                 unsafe_install_dir(Path::new(exe), None),
-                format!("{REFUSED}; install sshunnel in a directory only root can write, and run `sshunnel sudoers` from that copy"),
+                format!("{REFUSED}; install sshunnel in a directory only root can write, and run both sudoers and route as that copy"),
                 "{exe:?}"
             );
         }
@@ -475,7 +476,7 @@ rm -f "$f"
     fn sudoers_refusal_says_when_opt_is_no_better() {
         assert_eq!(
             unsafe_install_dir(Path::new(EXE), Some(Path::new("/opt"))),
-            format!("{REFUSED}; /opt can be too, so install sshunnel in another directory only root can write, and run `sshunnel sudoers` from that copy")
+            format!("{REFUSED}; /opt can be too, so install sshunnel in another directory only root can write, and run both sudoers and route as that copy")
         );
     }
 

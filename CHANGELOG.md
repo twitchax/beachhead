@@ -22,8 +22,8 @@ why the version moved the way it did.
   anyone but root can write; where `/usr/local/bin` isn't root's alone, it shows how to install a
   root-owned copy under `/opt` instead.
 - When sudo prompts for the copy that runs but not for a root-only `/usr/local/bin/sshunnel`,
-  `route --check` and `sshunnel sudoers` say to run `route` as that one, rather than print the
-  setup it already has.
+  `route --check` and `sshunnel sudoers` say to run `route` as that one, rather than point back at
+  the setup.
 - `sshunnel completions <shell>`: completion scripts for bash, elvish, fish, PowerShell and zsh.
 - `sshunnel help` (and `--help`) is a guide: examples, what `route` needs, running it from a script
   or an agent, exit statuses, files and environment. Each command's `--help` has examples of its
