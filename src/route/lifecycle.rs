@@ -30,7 +30,7 @@ use crate::{
         targets::{Snapshot, Targets},
         thread::Netstack,
     },
-    session::{Session, SshCommand},
+    session::{Session, SshCommand, ready_line},
 };
 
 /// An address in the fake range past its reserved `/24`: where the kernel sends it, it sends
@@ -72,6 +72,7 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
     };
     warned.warn(&pins.warnings);
     let status = status_line(&targets, destination);
+    let hint = check_hint(&targets);
 
     let (include, exclude) = targets.args();
     let setup = Setup { include, exclude, pins: pins.addrs };
@@ -92,6 +93,8 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
             warned.warn(&check_routes(probes).await);
             warned.warn(&ping_warnings(session.mux().capabilities()));
             eprintln!("{status}");
+            eprintln!("{hint}");
+            eprintln!("{}", ready_line(std::process::id()));
             wait(&mut signals, session, &mut helper, netstack.insert(started)).await
         }
         Err(e) => Err(e),
@@ -266,6 +269,21 @@ fn status_line(targets: &Targets, destination: &str) -> String {
     format!("sshunnel: routing {}{except} through {destination} on {DEVICE}", include.join(", "))
 }
 
+/// A command that checks the first include target is routed: `resolvectl query` for a name,
+/// `ip route get` for a CIDR's network address.
+fn check_hint(targets: &Targets) -> String {
+    let (include, _) = targets.args();
+    let first = include.first().map_or("", String::as_str);
+    let command = if let Some(domain) = first.strip_prefix("*.") {
+        format!("resolvectl query <name>.{domain}")
+    } else if let Some((network, _)) = first.split_once('/') {
+        format!("ip route get {network}")
+    } else {
+        format!("resolvectl query {first}")
+    };
+    format!("sshunnel: check it with `{command}`")
+}
+
 /// The warnings printed so far. The client and the helper run the same checks, so the helper's
 /// copy of a warning is skipped.
 #[derive(Default)]
@@ -380,6 +398,16 @@ mod tests {
             status_line(&targets(&["10.99.0.0/16", "fd99::/64"], &["10.99.7.0/24", "wiki.corp.example"]), "jump"),
             "sshunnel: routing 10.99.0.0/16, fd99::/64 (except 10.99.7.0/24, wiki.corp.example) through jump on sshunnel0"
         );
+    }
+
+    #[test]
+    fn check_hint_for_a_pattern_a_name_and_a_cidr() {
+        let hint = |target: &str| check_hint(&targets(&[target], &[]));
+
+        assert_eq!(hint("*.corp.example"), "sshunnel: check it with `resolvectl query <name>.corp.example`");
+        assert_eq!(hint("wiki.corp.example"), "sshunnel: check it with `resolvectl query wiki.corp.example`");
+        assert_eq!(hint("10.99.0.0/16"), "sshunnel: check it with `ip route get 10.99.0.0`");
+        assert_eq!(hint("fd99::/64"), "sshunnel: check it with `ip route get fd99::`");
     }
 
     #[test]

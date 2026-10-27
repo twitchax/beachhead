@@ -22,7 +22,7 @@ use sshunnel::{
     base::{Res, Void},
     forward::{self, Forward, Proto, UdpForwards},
     relays::Relays,
-    session::{Session, SshCommand},
+    session::{Session, SshCommand, ready_line},
 };
 
 /// A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
@@ -210,11 +210,32 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
             }
         }
     }
+    eprintln!("{}", ready_line(std::process::id()));
     tokio::select! {
         closed = session.closed() => {
             closed?;
             bail!("the ssh session ended")
         }
         Some(failed) = serving.join_next() => failed.context("a listener task panicked")?,
+        () = stop_signal() => Ok(()),
     }
+}
+
+/// Resolves on Ctrl-C or, on unix, SIGTERM. If a handler can't be installed, it never resolves,
+/// and the signal keeps its default effect.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }

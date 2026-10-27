@@ -207,6 +207,19 @@ async fn e2e_route_carries_tcp_to_a_cidr_target() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_route_prints_a_ready_line() {
+    if !netns("e2e_route_prints_a_ready_line").unwrap() {
+        return;
+    }
+    let world = World::new();
+    let mut route = world.start(&["10.99.0.0/16"]).await;
+
+    route.line("sshunnel: check it with ", WITHIN).await.unwrap();
+    route.line("sshunnel: ready (pid ", WITHIN).await.unwrap();
+    stop(route).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_route_a_closed_port_is_refused() {
     if !netns("e2e_route_a_closed_port_is_refused").unwrap() {
         return;

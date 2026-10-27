@@ -7,6 +7,16 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Added
+
+- `route` and `forward` print `sshunnel: ready (pid N); Ctrl-C or SIGTERM stops it` once they
+  serve, the line a script or an agent waits for. Before it, `route` prints a command that checks
+  it: `resolvectl query` for a name, `ip route get` for a CIDR.
+
+### Changed
+
+- `forward` exits 0 on SIGINT or SIGTERM, as `route` does, instead of dying by the signal.
+
 ## [0.2.1] - 2026-10-25
 
 Hardening: the follow-ups parked through 0.1.0 and 0.2.0, most of them in `route`. A patch rather

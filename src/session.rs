@@ -24,6 +24,12 @@ use crate::{
     relays::{Relay, Relays},
 };
 
+/// The line `route` and `forward` print once they serve, which a script or an agent waits for.
+#[must_use]
+pub fn ready_line(pid: u32) -> String {
+    format!("sshunnel: ready (pid {pid}); Ctrl-C or SIGTERM stops it")
+}
+
 /// How to run ssh: a program and leading arguments, split like a shell would (`--ssh-cmd`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshCommand {

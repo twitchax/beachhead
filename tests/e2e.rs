@@ -18,6 +18,7 @@ use sshunnel::{
     arch::Arch,
     forward::Forward,
     relays::Relays,
+    session::ready_line,
     tests::{FakeRemote, echo_server, host_arch, pattern, relay_dir, resetting_server, udp_echo_server, udp_peer_server},
 };
 use tempfile::TempDir;
@@ -132,6 +133,43 @@ async fn echo_through(addr: &str, data: &[u8]) -> Vec<u8> {
     timeout(Duration::from_secs(30), r.read_to_end(&mut reply)).await.expect("the echo finishes").unwrap();
     writer.await.unwrap();
     reply
+}
+
+#[tokio::test]
+async fn e2e_forward_prints_a_ready_line() {
+    let dir = TempDir::new().unwrap();
+    let echo = echo_server().await.unwrap();
+    let (child, _, mut stderr) = start_forward(sshunnel(&dir), &dir, &format!("127.0.0.1:{}", echo.port())).await;
+
+    let ready = ready_line(child.id().unwrap());
+    timeout(Duration::from_secs(10), stderr.wait_for(|lines| lines.contains(&ready)))
+        .await
+        .expect("the ready line arrives")
+        .unwrap();
+    let lines = stderr.borrow();
+    let last_forwarding = lines.iter().rposition(|line| line.starts_with("sshunnel: forwarding ")).unwrap();
+    let at = lines.iter().position(|line| *line == ready).unwrap();
+    assert!(at > last_forwarding, "the ready line follows the forwarding lines: {lines:?}");
+}
+
+#[tokio::test]
+async fn e2e_forward_stopped_by_a_signal_exits_0() {
+    for signal in [rustix::process::Signal::TERM, rustix::process::Signal::INT] {
+        let dir = TempDir::new().unwrap();
+        let echo = echo_server().await.unwrap();
+        let (mut child, _, mut stderr) = start_forward(sshunnel(&dir), &dir, &format!("127.0.0.1:{}", echo.port())).await;
+        let pid = child.id().unwrap();
+        let ready = ready_line(pid);
+        timeout(Duration::from_secs(10), stderr.wait_for(|lines| lines.contains(&ready)))
+            .await
+            .expect("the ready line arrives")
+            .unwrap();
+
+        rustix::process::kill_process(rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(), signal).unwrap();
+
+        let status = timeout(Duration::from_secs(10), child.wait()).await.expect("sshunnel stops").unwrap();
+        assert_eq!(status.code(), Some(0), "{signal:?}: {status}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

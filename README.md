@@ -65,6 +65,7 @@ $ sshunnel forward -L 8080:server.lan:80 server
 sshunnel: relay x86_64 61bf6514b25c pushed to /home/me/.cache/sshunnel
 sshunnel: forwarding 127.0.0.1:8080 -> server.lan:80
 sshunnel: forwarding [::1]:8080 -> server.lan:80
+sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
 ```
 
 The relay resolves and dials `server.lan` on the remote, so names that only exist inside that
@@ -80,6 +81,7 @@ $ sshunnel forward -L 5353:dns.corp.example:53/udp server
 sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
 sshunnel: forwarding 127.0.0.1:5353 -> dns.corp.example:53/udp
 sshunnel: forwarding [::1]:5353 -> dns.corp.example:53/udp
+sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
 ```
 
 Each local sender (an address and port) gets a flow of its own: its first datagram opens a UDP
@@ -115,6 +117,8 @@ $ sshunnel route jump.corp.example 10.99.0.0/16 '*.corp.example' -x 10.99.7.0/24
 sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
 [sudo] password for me:
 sshunnel: routing 10.99.0.0/16, *.corp.example (except 10.99.7.0/24) through jump.corp.example on sshunnel0
+sshunnel: check it with `ip route get 10.99.0.0`
+sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
 ```
 
 TCP, UDP and ping to every address in a CIDR target, and to every name a domain pattern matches,
