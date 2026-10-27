@@ -10,3 +10,8 @@ indent_size = 4
 
 [*.{yml,yaml,json,md}]
 indent_size = 2
+
+# README.md embeds the binary's help byte for byte (tests/cli.rs), and clap indents the blank line
+# inside a long argument's help.
+[README.md]
+trim_trailing_whitespace = false

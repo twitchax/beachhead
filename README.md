@@ -60,39 +60,84 @@ relays (embedded):
 
 ## Usage
 
+`sshunnel help` prints the whole guide, and each command's `--help` prints its part of it. The
+`--help` blocks below are that output, and a test keeps them equal.
+
 ```text
-$ sshunnel forward -L 8080:server.lan:80 server
+$ sshunnel --help
+A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
+
+Usage: sshunnel <COMMAND>
+
+Commands:
+  forward      Forward local TCP and UDP ports through a relay on DESTINATION, like `ssh -L`
+  route        Route CIDRs and domain patterns through a relay on DESTINATION (Linux)
+  completions  Print a shell completion script
+  sudoers      Print the one-time setup that lets route start without a sudo password (Linux)
+  relays       Show the relays this client would push: arch, sha256 and size
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  Route every name under two domains, and a subnet, through a host you can ssh to (Linux):
+    sshunnel route --check jump.corp.example '*.corp.example' '*.lab.example' 10.99.0.0/16
+    sshunnel route jump.corp.example '*.corp.example' '*.lab.example' 10.99.0.0/16
+
+  Forward a local port to a host only the remote can reach, as ssh -L does:
+    sshunnel forward -L 8080:wiki.corp.example:80 jump.corp.example
+
+How it works:
+  sshunnel runs your own ssh to DESTINATION and pushes a small static relay over it, cached on
+  the remote by sha256 so later runs reuse it. Every connection then rides that one session.
+  Nothing is installed system-wide, and nothing on the remote needs root. Names resolve on the
+  remote, so names that exist only inside its network work.
+
+Before route:
+  - `ssh DESTINATION` works on its own: your keys, agent and ~/.ssh/config all apply.
+  - The remote is Linux on x86_64 or aarch64, with a POSIX sh.
+  - This machine is Linux. Domain patterns need systemd-resolved as its resolver:
+    /etc/resolv.conf points at 127.0.0.53, or nss-resolve is in /etc/nsswitch.conf.
+  - route starts a root helper through sudo, which asks for your password as sudo usually does,
+    or never after the one-time setup that `sshunnel sudoers` prints.
+  `sshunnel route --check` checks all of this and the targets, and changes nothing.
+
+From a script or an agent:
+  route and forward run in the foreground until they are stopped. Start one in the background
+  and wait for the stderr line that starts with `sshunnel: ready`. If the process exits before
+  it, the `error:` message on stderr says why.
+  Nobody can answer a sudo password prompt from a script. When `sshunnel route --check` says sudo
+  asks for a password, have a person either start route in a terminal or run, once, the setup
+  that `sshunnel sudoers` prints.
+  SIGINT or SIGTERM stops either command; route first removes its device, routes and DNS settings.
+  Exit status: 0 when a signal stops it once ready, 1 on an error, 2 on a usage error.
+  RUST_LOG=info (or debug) logs more to stderr.
+
+Files and environment:
+  ~/.local/state/sshunnel/names  route's fake address for each name (under $XDG_STATE_HOME if set)
+  ~/.cache/sshunnel              on the remote: the cached relays (under $XDG_CACHE_HOME if set)
+  SSHUNNEL_SSH                   the ssh program and its arguments, as --ssh-cmd takes them
+  SSHUNNEL_RELAY_DIR             relays to push instead of the built-in ones, as --relay-dir does
+  RUST_LOG                       what to log to stderr (default: warn)
+
+More: `sshunnel help <command>` for route, forward, sudoers and completions, and the README at
+https://github.com/twitchax/sshunnel
+```
+
+### Forwarding ports
+
+```text
+$ sshunnel forward -L 8080:wiki.corp.example:80 jump.corp.example
 sshunnel: relay x86_64 61bf6514b25c pushed to /home/me/.cache/sshunnel
-sshunnel: forwarding 127.0.0.1:8080 -> server.lan:80
-sshunnel: forwarding [::1]:8080 -> server.lan:80
+sshunnel: forwarding 127.0.0.1:8080 -> wiki.corp.example:80
+sshunnel: forwarding [::1]:8080 -> wiki.corp.example:80
 sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
 ```
-
-The relay resolves and dials `server.lan` on the remote, so names that only exist inside that
-network work. `-L` repeats, and every connection rides the one SSH session.
-
-When the remote resets a connection, `forward` resets the app's too, where `ssh -L` closes it
-cleanly, so an app reading to EOF can't take a cut-short stream for a whole one.
-
-A `/udp` suffix forwards UDP instead (`/tcp`, the default, may be written too):
-
-```text
-$ sshunnel forward -L 5353:dns.corp.example:53/udp server
-sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
-sshunnel: forwarding 127.0.0.1:5353 -> dns.corp.example:53/udp
-sshunnel: forwarding [::1]:5353 -> dns.corp.example:53/udp
-sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
-```
-
-Each local sender (an address and port) gets a flow of its own: its first datagram opens a UDP
-socket on the remote, connected to `dns.corp.example:53`, and replies come back to it from the port
-it sent to. A flow idles out after 30 s without traffic, or 120 s once it has carried more than one
-reply (conntrack's timeouts), and a session holds at most 4096 flows across its UDP forwards,
-closing the least recently used to open another. Each flow queues at most 32 datagrams (64 KiB)
-each way and drops what doesn't fit, so a flood on one flow stalls neither another flow nor TCP on
-the same session. Senders on one local port do share that port's socket buffer, which is the
-kernel's: a sender flooding a forward faster than it can carry fills it, and the others' datagrams
-are dropped there too. Give a busy flow a forward of its own.
 
 ```text
 $ sshunnel forward --help
@@ -101,14 +146,67 @@ Forward local TCP and UDP ports through a relay on DESTINATION, like `ssh -L`
 Usage: sshunnel forward [OPTIONS] --local <SPEC> <DESTINATION>
 
 Arguments:
-  <DESTINATION>  Where to run the relay, exactly as you'd pass it to ssh (config aliases work)
+  <DESTINATION>
+          Where to run the relay, as you'd pass it to ssh (config aliases work)
 
 Options:
-  -L, --local <SPEC>       `[bind_address:]port:host:hostport[/udp]`. The relay resolves and dials host; the bind address defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port. With `/udp`, each local sender gets a flow of its own
-      --ssh-cmd <COMMAND>  The ssh program and its leading arguments, split like a shell would [env: SSHUNNEL_SSH=] [default: ssh]
-      --relay-dir <DIR>    Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay) [env: SSHUNNEL_RELAY_DIR=]
-  -h, --help               Print help
+  -L, --local <SPEC>
+          [bind_address:]port:host:hostport[/udp] (repeatable)
+
+      --ssh-cmd <COMMAND>
+          The ssh program and its arguments
+          
+          [env: SSHUNNEL_SSH=]
+          [default: ssh]
+
+      --relay-dir <DIR>
+          Relays to push instead of the built-in ones
+          
+          [env: SSHUNNEL_RELAY_DIR=]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+SPEC is [bind_address:]port:host:hostport[/udp]:
+  8080:wiki.corp.example:80          localhost port 8080, IPv4 and IPv6, to wiki.corp.example:80
+  0.0.0.0:8080:wiki.corp.example:80  port 8080 on every IPv4 interface
+  0:wiki.corp.example:80             a free local port, which the forwarding line names
+  5353:dns.corp.example:53/udp       UDP: each local sender gets a flow of its own
+  The relay resolves and dials host on the remote. -L repeats, and every forward shares the one
+  session. A UDP flow idles out after 30 s, or 120 s once it has carried more than one reply, and
+  a session holds at most 4096, closing the least recently used to open another.
+
+Examples:
+  sshunnel forward -L 8080:wiki.corp.example:80 jump.corp.example
+  sshunnel forward -L 8080:wiki.corp.example:80 -L 5353:dns.corp.example:53/udp jump.corp.example
+
+  Once the relay is up, forward prints to stderr:
+    sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
+    sshunnel: forwarding 127.0.0.1:8080 -> wiki.corp.example:80
+    sshunnel: forwarding [::1]:8080 -> wiki.corp.example:80
+    sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
 ```
+
+When the remote resets a connection, `forward` resets the app's too, where `ssh -L` closes it
+cleanly, so an app reading to EOF can't take a cut-short stream for a whole one.
+
+A `/udp` suffix forwards UDP instead (`/tcp`, the default, may be written too):
+
+```text
+$ sshunnel forward -L 5353:dns.corp.example:53/udp jump.corp.example
+sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
+sshunnel: forwarding 127.0.0.1:5353 -> dns.corp.example:53/udp
+sshunnel: forwarding [::1]:5353 -> dns.corp.example:53/udp
+sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
+```
+
+A sender's first datagram opens its flow: a UDP socket on the remote, connected to
+`dns.corp.example:53`, whose replies come back to the sender from the port it sent to. The idle
+timeouts above are conntrack's. Each flow queues at most 32 datagrams (64 KiB) each way and drops
+what doesn't fit, so a flood on one flow stalls neither another flow nor TCP on the same session.
+Senders on one local port do share that port's socket buffer, which is the kernel's: a sender
+flooding a forward faster than it can carry fills it, and the others' datagrams are dropped there
+too. Give a busy flow a forward of its own.
 
 ### Routing subnets and names (Linux)
 
@@ -121,45 +219,123 @@ sshunnel: check it with `ip route get 10.99.0.0`
 sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
 ```
 
-`route --check` runs every check `route` makes before it changes anything, plus ssh and the relay,
-ping, sudo and whether `sshunnel0` is free. It reports them all at once, changes nothing on this
-machine, and exits 1 on any problem. Whether sudo asks for a password comes from sudo itself: the
-check starts the root helper through `sudo -n -k` and hangs up before the helper does anything.
-
 ```text
-$ sshunnel route --check jump.corp.example 10.99.0.0/16 '*.corp.example' -x 10.99.7.0/24
-targets  ok: 10.99.0.0/16, *.corp.example (except 10.99.7.0/24)
-device   ok: no sshunnel0 yet
-sudo     warn: sudo asks for a password; `sshunnel sudoers` prints the setup that skips it
-ssh      ok: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
-ping     ok: the remote allows unprivileged ping over IPv4 and IPv6
-sshunnel: route can start
+$ sshunnel route --help
+Route CIDRs and domain patterns through a relay on DESTINATION (Linux)
+
+Usage: sshunnel route [OPTIONS] <DESTINATION> <TARGET>...
+
+Arguments:
+  <DESTINATION>
+          Where to run the relay, as you'd pass it to ssh (config aliases work)
+
+  <TARGET>...
+          CIDRs (10.99.0.0/16, fd99::/64) and domain patterns ('*.corp.example')
+
+Options:
+  -x, --exclude <TARGET>
+          Carve a CIDR or a name out of the targets (repeatable)
+
+      --check
+          Check whether route can start, changing nothing
+
+      --ssh-cmd <COMMAND>
+          The ssh program and its arguments
+          
+          [env: SSHUNNEL_SSH=]
+          [default: ssh]
+
+      --relay-dir <DIR>
+          Relays to push instead of the built-in ones
+          
+          [env: SSHUNNEL_RELAY_DIR=]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Targets:
+  10.99.0.0/16, fd99::/64  a CIDR: every address in it
+  '*.corp.example'         a domain pattern: corp.example and every name under it
+  wiki.corp.example        that name alone
+  -x TARGET                carves a CIDR out of the CIDR targets, or a name out of the patterns
+  Quote patterns, so the shell leaves the * alone. The most specific target wins, and an exclude
+  wins a tie. TCP, UDP and ping to a routed address go through the relay, which dials it on the
+  remote; everything else keeps this machine's routes and DNS.
+
+  A routed name resolves with the remote's resolver and gets a stable fake address from
+  198.18.0.0/15, and from 2001:2::/96 too where this machine has IPv6. Apps connect to the fake,
+  and the relay dials the real address. The fakes mean nothing once route exits.
+
+Examples:
+  sshunnel route jump.corp.example '*.corp.example'
+  sshunnel route jump.corp.example 10.99.0.0/16 '*.corp.example' -x 10.99.7.0/24
+  sshunnel route --check jump.corp.example '*.corp.example'
+
+  Once its routes are up, route prints to stderr:
+    sshunnel: routing *.corp.example through jump.corp.example on sshunnel0
+    sshunnel: check it with `resolvectl query <name>.corp.example`
+    sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
+
+  --check prints one line per check, and changes nothing:
+    targets  ok: *.corp.example
+    device   ok: no sshunnel0 yet
+    sudo     warn: sudo asks for a password; `sshunnel sudoers` prints the setup that skips it
+    ssh      ok: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
+    ping     ok: the remote allows unprivileged ping over IPv4 and IPv6
+    sshunnel: route can start
+
+Privileges:
+  ssh runs as you. route then starts a root helper through sudo, which creates sshunnel0 with its
+  routes and DNS settings, and removes all of them when route exits. `sshunnel sudoers` prints the
+  one-time setup that skips the password prompt.
+
+Refused before ssh runs, every problem at once:
+  0.0.0.0/0 and ::/0 (0.0.0.0/1 plus 128.0.0.0/1 is a full tunnel), a bare *, a target inside a
+  directly connected subnet or inside 198.18.0.0/15 or 2001:2::/96, more than 4096 routes, a
+  route the main table already has, IPv6 targets on a kernel without IPv6, and domain patterns
+  without systemd-resolved.
+
+Troubleshooting:
+  "domain patterns need systemd-resolved"
+      The system's lookups don't go through systemd-resolved. Route CIDRs only, or switch to it.
+  "exited before the root helper started"
+      sudo asked for a password nobody could type, or refused. See `sshunnel sudoers`.
+  "ssh exited before the relay started"
+      ssh itself failed, and its own message is above. Try `ssh DESTINATION` on its own.
+  "a more specific route or another tool's policy routing wins it"
+      Another route, or another VPN's policy routing, takes that target. route leaves it be.
+  "the remote doesn't allow unprivileged ping"
+      Ping through the tunnel is refused. TCP and UDP still work.
+  "the ssh session ended", "the root helper exited"
+      The connection or the helper went away, and route has cleaned up. Start it again.
+  "another sshunnel route is running"
+      One route runs at a time. With none running, `sudo ip link del sshunnel0` removes a leftover.
+  A route left behind after a kill -9 of the root helper:
+      sudo ip route flush proto 222; sudo ip -6 route flush proto 222
+  An app ignores a pattern:
+      It resolves names itself (DNS over HTTPS, say). CIDR targets still catch its traffic.
 ```
 
-TCP, UDP and ping to every address in a CIDR target, and to every name a domain pattern matches,
-now go through the relay, which dials them on the remote; everything else keeps the machine's
-normal routes and DNS. `*.corp.example` matches `corp.example` and every name under it, and
-`wiki.corp.example` matches that name only. The most specific target wins, and an exclude (`-x`)
-wins a tie. CIDR excludes carve CIDR targets and name excludes carve patterns; they never cross, so
+`route --check` exits 1 when any check fails and 0 when `route` can start, warnings or not, so a
+script can gate `route` on it.
+
+Excludes never cross: a CIDR exclude carves only CIDR targets, and a name exclude only patterns, so
 a pattern routes a name whatever address it has on the remote.
 
-Names resolve on the remote. The relay looks each one up with the remote's own resolver, and a name
-that exists there gets a stable fake address from `198.18.0.0/15`, remembered in
-`$XDG_STATE_HOME/sshunnel/names` (by default `~/.local/state/sshunnel/names`); one that doesn't is
-NXDOMAIN here too. Where the machine has IPv6, the name gets a fake IPv6 address as well, its AAAA
-answer: the v4 fake in the low 32 bits of `2001:2::/96` (`198.18.1.2` is `2001:2::c612:102`), so
-the two always pair. Without IPv6, AAAA is empty (NODATA) and apps use the v4 fake. Connections
+A name that doesn't exist on the remote is NXDOMAIN here too. A name's fake IPv6 address, its AAAA
+answer, is its v4 fake in the low 32 bits of `2001:2::/96` (`198.18.1.2` is `2001:2::c612:102`),
+so the two always pair. Without IPv6, AAAA is empty (NODATA) and apps use the v4 fake. Connections
 refused or unreachable on the remote look the same to the app.
 
 Every other record type for those names comes from the remote's resolver: the relay asks its own
 nameservers the query as it was asked, and the answer comes back with every A, AAAA, HTTPS and SVCB
 record taken out, so neither the glue in an SRV or MX answer nor an ANY answer can hand out a real
-address; the app asks for the target's A and gets its fake. A name only the remote's `/etc/hosts` knows is NXDOMAIN to its
-nameservers, so for a name the relay finds, that answer becomes NODATA, and the name's fake address
-stays visible. HTTPS and SVCB are always empty (NODATA): their address hints would send browsers to
-real addresses, and browsers fall back to A and AAAA. A reverse lookup of a fake address
-(`getent hosts 198.18.1.2`, or its v6 fake) answers the name it was handed out for, and one no name
-holds is NXDOMAIN.
+address; the app asks for the target's A and gets its fake. A name only the remote's `/etc/hosts`
+knows is NXDOMAIN to its nameservers, so for a name the relay finds, that answer becomes NODATA,
+and the name's fake address stays visible. HTTPS and SVCB are always empty (NODATA): their address
+hints would send browsers to real addresses, and browsers fall back to A and AAAA. A reverse lookup
+of a fake address (`getent hosts 198.18.1.2`, or its v6 fake) answers the name it was handed out
+for, and one no name holds is NXDOMAIN.
 
 sshunnel's DNS server answers over TCP as well as UDP, and passes a query on (to the remote's
 resolver, or to your normal DNS servers for a name it doesn't route) over the transport it came by.
@@ -192,29 +368,36 @@ kernel's default; the kernel won't hold two at the same metric), reporting every
 Each target gets a route of its own, never merged with its neighbors, so each competes with the
 machine's routes on its own prefix.
 
+**Privileges.** `route` starts its root helper through `sudo`, or directly when already root. The
+helper hands the device back to `route` and trusts nothing it is sent: it re-checks every target as
+root and does a fixed set of things to its own device. `route --check` learns whether sudo would
+prompt from sudo itself: it starts the helper through `sudo -n -k` and hangs up before the helper
+does anything.
+
 ```text
-$ sshunnel route --help
-Route CIDRs and domain patterns through a relay on DESTINATION, over a TUN device (Linux)
+$ sshunnel sudoers --help
+Print the one-time setup that lets route start without a sudo password (Linux)
 
-Usage: sshunnel route [OPTIONS] <DESTINATION> <TARGET>...
-
-Arguments:
-  <DESTINATION>  Where to run the relay, exactly as you'd pass it to ssh (config aliases work)
-  <TARGET>...    What to route: CIDRs (`10.99.0.0/16`, `fd99::/64`) and domain patterns (`*.corp.example`, `host.corp.example`)
+Usage: sshunnel sudoers
 
 Options:
-  -x, --exclude <TARGET>   Carve a CIDR or a name out of the targets (repeatable)
-      --check              Check whether route can start, changing nothing
-      --ssh-cmd <COMMAND>  The ssh program and its leading arguments, split like a shell would [env: SSHUNNEL_SSH=] [default: ssh]
-      --relay-dir <DIR>    Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay) [env: SSHUNNEL_RELAY_DIR=]
-  -h, --help               Print help
+  -h, --help
+          Print help (see a summary with '-h')
+
+The output is a short shell script for a person to read and then run: sshunnel itself changes
+nothing. It installs sshunnel where only root can write (a step it skips when this binary already
+is), then adds a sudoers line that lets you start route's root helper, and nothing else, without
+a password. Its last line says whether sudo asks for that password right now.
+
+Whoever can write the binary a NOPASSWD line names is root, so sshunnel never prints a line for a
+binary anyone but root can write. The line lets anything running as you start the helper, so it
+grants exactly what route can do: route any range but the default route through sshunnel0, keep
+addresses inside those ranges on their current route, and send the patterns' DNS queries to
+sshunnel while the device exists. That applies to every user's traffic and lookups on this
+machine, and the traffic goes to a process running as you.
 ```
 
-**Privileges.** ssh runs as you. Once the session is up, `route` starts a small root helper through
-`sudo` (or directly, when already root) that creates `sshunnel0`, adds its addresses and routes, and
-configures systemd-resolved for it, then hands the device back and waits for `route` to exit. The
-helper trusts nothing it is sent: it re-checks every target as root and does a fixed set of things
-to its own device. To skip the password prompt, run `sshunnel sudoers` and follow what it prints:
+For the user `me`, with sshunnel installed by `cargo install`, it prints:
 
 ```text
 $ sshunnel sudoers
@@ -236,24 +419,14 @@ rm -f "$f"
 ```
 
 `route` asks sudo for the helper by its own real path (symlinks resolved), so that is the path the
-line names, and the copy to run `route` from: a copy earlier on your `PATH` (`~/.cargo/bin`, say)
-still prompts. **Never point a `NOPASSWD` line at a binary you can write:** whoever can write it is
-root, since sudo runs whatever they put there. The line lets anything running as you start the
-helper, so it grants exactly what `route` allows: route any range except the default route
-(`0.0.0.0/0`, `::/0`) through `sshunnel0`, keep addresses inside those ranges on their current
-route, and send the matching domains' queries to sshunnel while the device exists. That grant is
-machine-wide: the routes and the `~domain` resolver routing apply to every user's traffic and
-lookups on the host, and that traffic goes to a process running as you. `0.0.0.0/1` plus
-`128.0.0.0/1` is a deliberate full tunnel; the `/0` refusal guards against accidents and is not a
-security boundary.
+line names. `0.0.0.0/1` plus `128.0.0.0/1` is a deliberate full tunnel; the `/0` refusal guards
+against accidents and is not a security boundary.
 
-**systemd-resolved.** Domain patterns need systemd-resolved, and the system has to actually ask it:
-`/etc/resolv.conf` points at its stub (`127.0.0.53`), or `nss-resolve` is on the `hosts:` line of
-`/etc/nsswitch.conf`. Otherwise a run with any pattern fails, CIDR targets included, rather than
-half-working. sshunnel sets only its own link's DNS: a `~domain` routing domain per pattern and per
-reverse zone of the fake ranges (`18.198.in-addr.arpa`, `19.198.in-addr.arpa`, and with IPv6
-`2001:2::/96`'s), and no default route, so resolved hands it the queries under those domains and
-nothing else.
+**systemd-resolved.** Without it (the guide's "Before route" says what counts), a run with any
+domain pattern fails, CIDR targets included, rather than half-working. sshunnel sets only its own
+link's DNS: a `~domain` routing domain per pattern and per reverse zone of the fake ranges
+(`18.198.in-addr.arpa`, `19.198.in-addr.arpa`, and with IPv6 `2001:2::/96`'s), and no default
+route, so resolved hands it the queries under those domains and nothing else.
 
 **What it leaves behind: nothing.** Ctrl-C, SIGTERM, a closed terminal (unless started under
 `nohup`), the session ending and the helper dying all end the run. Before `route` returns, the
@@ -261,8 +434,8 @@ helper deletes its pinned routes (the host routes that keep ssh's peer and your 
 device when a target covers them; an address with a host route of its own already stays off it)
 and then the device itself, which takes its addresses, routes and resolver config with it. Only the
 helper dying without its teardown (a SIGKILL, say) can leave a pinned route, and the device still
-goes when `route` closes its own fd on it. The next start sweeps the pin, or
-`sudo ip route flush proto 222` and `sudo ip -6 route flush proto 222` remove it by hand.
+goes when `route` closes its own fd on it. The next start sweeps the pin, and `route --help`'s
+Troubleshooting has the commands that remove it by hand.
 
 ## Performance
 
@@ -335,8 +508,6 @@ cargo install sshunnel --locked
 This builds on stable Rust, with the dependency versions the crate was published with, and fetches
 nothing beyond the crates: the relays come inside the crate, built when it was published, so their
 hashes can differ from the GitHub release's. `sshunnel relays` shows what this client pushes.
-`sshunnel completions <shell>` prints a completion script, and `sshunnel help completions` shows
-where each shell loads it from.
 
 ```bash
 cargo binstall sshunnel
@@ -358,6 +529,30 @@ cargo xtask dist    # target/dist/sshunnel, with those relays inside
 The relays link with the toolchain's own `rust-lld`, so the musl targets that `rust-toolchain.toml`
 already lists are all the setup required. A plain `cargo build` produces a client without embedded
 relays, which then needs `--relay-dir target/relay`.
+
+Shell completions come from the binary:
+
+```text
+$ sshunnel completions --help
+Print a shell completion script
+
+Usage: sshunnel completions <SHELL>
+
+Arguments:
+  <SHELL>
+          The shell to complete for
+          
+          [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Examples:
+  sshunnel completions bash > ~/.local/share/bash-completion/completions/sshunnel
+  sshunnel completions zsh > ~/.zfunc/_sshunnel    # with fpath+=(~/.zfunc) before compinit
+  sshunnel completions fish > ~/.config/fish/completions/sshunnel.fish
+```
 
 ## Development
 

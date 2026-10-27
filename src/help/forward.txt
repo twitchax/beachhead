@@ -1,0 +1,18 @@
+SPEC is [bind_address:]port:host:hostport[/udp]:
+  8080:wiki.corp.example:80          localhost port 8080, IPv4 and IPv6, to wiki.corp.example:80
+  0.0.0.0:8080:wiki.corp.example:80  port 8080 on every IPv4 interface
+  0:wiki.corp.example:80             a free local port, which the forwarding line names
+  5353:dns.corp.example:53/udp       UDP: each local sender gets a flow of its own
+  The relay resolves and dials host on the remote. -L repeats, and every forward shares the one
+  session. A UDP flow idles out after 30 s, or 120 s once it has carried more than one reply, and
+  a session holds at most 4096, closing the least recently used to open another.
+
+Examples:
+  sshunnel forward -L 8080:wiki.corp.example:80 jump.corp.example
+  sshunnel forward -L 8080:wiki.corp.example:80 -L 5353:dns.corp.example:53/udp jump.corp.example
+
+  Once the relay is up, forward prints to stderr:
+    sshunnel: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
+    sshunnel: forwarding 127.0.0.1:8080 -> wiki.corp.example:80
+    sshunnel: forwarding [::1]:8080 -> wiki.corp.example:80
+    sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it

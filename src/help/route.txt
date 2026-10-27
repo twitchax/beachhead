@@ -1,0 +1,61 @@
+Targets:
+  10.99.0.0/16, fd99::/64  a CIDR: every address in it
+  '*.corp.example'         a domain pattern: corp.example and every name under it
+  wiki.corp.example        that name alone
+  -x TARGET                carves a CIDR out of the CIDR targets, or a name out of the patterns
+  Quote patterns, so the shell leaves the * alone. The most specific target wins, and an exclude
+  wins a tie. TCP, UDP and ping to a routed address go through the relay, which dials it on the
+  remote; everything else keeps this machine's routes and DNS.
+
+  A routed name resolves with the remote's resolver and gets a stable fake address from
+  198.18.0.0/15, and from 2001:2::/96 too where this machine has IPv6. Apps connect to the fake,
+  and the relay dials the real address. The fakes mean nothing once route exits.
+
+Examples:
+  sshunnel route jump.corp.example '*.corp.example'
+  sshunnel route jump.corp.example 10.99.0.0/16 '*.corp.example' -x 10.99.7.0/24
+  sshunnel route --check jump.corp.example '*.corp.example'
+
+  Once its routes are up, route prints to stderr:
+    sshunnel: routing *.corp.example through jump.corp.example on sshunnel0
+    sshunnel: check it with `resolvectl query <name>.corp.example`
+    sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
+
+  --check prints one line per check, and changes nothing:
+    targets  ok: *.corp.example
+    device   ok: no sshunnel0 yet
+    sudo     warn: sudo asks for a password; `sshunnel sudoers` prints the setup that skips it
+    ssh      ok: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
+    ping     ok: the remote allows unprivileged ping over IPv4 and IPv6
+    sshunnel: route can start
+
+Privileges:
+  ssh runs as you. route then starts a root helper through sudo, which creates sshunnel0 with its
+  routes and DNS settings, and removes all of them when route exits. `sshunnel sudoers` prints the
+  one-time setup that skips the password prompt.
+
+Refused before ssh runs, every problem at once:
+  0.0.0.0/0 and ::/0 (0.0.0.0/1 plus 128.0.0.0/1 is a full tunnel), a bare *, a target inside a
+  directly connected subnet or inside 198.18.0.0/15 or 2001:2::/96, more than 4096 routes, a
+  route the main table already has, IPv6 targets on a kernel without IPv6, and domain patterns
+  without systemd-resolved.
+
+Troubleshooting:
+  "domain patterns need systemd-resolved"
+      The system's lookups don't go through systemd-resolved. Route CIDRs only, or switch to it.
+  "exited before the root helper started"
+      sudo asked for a password nobody could type, or refused. See `sshunnel sudoers`.
+  "ssh exited before the relay started"
+      ssh itself failed, and its own message is above. Try `ssh DESTINATION` on its own.
+  "a more specific route or another tool's policy routing wins it"
+      Another route, or another VPN's policy routing, takes that target. route leaves it be.
+  "the remote doesn't allow unprivileged ping"
+      Ping through the tunnel is refused. TCP and UDP still work.
+  "the ssh session ended", "the root helper exited"
+      The connection or the helper went away, and route has cleaned up. Start it again.
+  "another sshunnel route is running"
+      One route runs at a time. With none running, `sudo ip link del sshunnel0` removes a leftover.
+  A route left behind after a kill -9 of the root helper:
+      sudo ip route flush proto 222; sudo ip -6 route flush proto 222
+  An app ignores a pattern:
+      It resolves names itself (DNS over HTTPS, say). CIDR targets still catch its traffic.

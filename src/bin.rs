@@ -27,7 +27,13 @@ use sshunnel::{
 
 /// A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 #[derive(Debug, Parser)]
-#[command(version, about, arg_required_else_help = true)]
+#[command(
+    version,
+    about,
+    arg_required_else_help = true,
+    after_help = "Run `sshunnel help` for the guide: examples, setup, and running it from a script or an agent.",
+    after_long_help = include_str!("help/guide.txt")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,21 +42,22 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Forward local TCP and UDP ports through a relay on DESTINATION, like `ssh -L`.
+    #[command(after_long_help = include_str!("help/forward.txt"))]
     Forward {
-        /// `[bind_address:]port:host:hostport[/udp]`. The relay resolves and dials host; the bind
-        /// address defaults to localhost (IPv4 and IPv6), and port 0 picks a free local port. With
-        /// `/udp`, each local sender gets a flow of its own.
-        #[arg(short = 'L', long = "local", value_name = "SPEC", required = true)]
+        // A `help` string, not a doc comment: clippy wants `bind_address` in backticks there, and
+        // clap would print them.
+        #[arg(short = 'L', long = "local", value_name = "SPEC", required = true, help = "[bind_address:]port:host:hostport[/udp] (repeatable)")]
         forwards: Vec<Forward>,
         #[command(flatten)]
         ssh: SshArgs,
         #[command(flatten)]
         relays: RelayArgs,
-        /// Where to run the relay, exactly as you'd pass it to ssh (config aliases work).
+        /// Where to run the relay, as you'd pass it to ssh (config aliases work).
         destination: String,
     },
-    /// Route CIDRs and domain patterns through a relay on DESTINATION, over a TUN device (Linux).
+    /// Route CIDRs and domain patterns through a relay on DESTINATION (Linux).
     #[cfg(target_os = "linux")]
+    #[command(after_long_help = include_str!("help/route.txt"))]
     Route {
         /// Carve a CIDR or a name out of the targets (repeatable).
         #[arg(short = 'x', long = "exclude", value_name = "TARGET")]
@@ -62,10 +69,10 @@ enum Command {
         ssh: SshArgs,
         #[command(flatten)]
         relays: RelayArgs,
-        /// Where to run the relay, exactly as you'd pass it to ssh (config aliases work).
+        /// Where to run the relay, as you'd pass it to ssh (config aliases work).
         destination: String,
-        /// What to route: CIDRs (`10.99.0.0/16`, `fd99::/64`) and domain patterns (`*.corp.example`, `host.corp.example`).
-        #[arg(value_name = "TARGET", required = true)]
+        // A `help` string, as for `-L`: clippy reads `fd99::/64` as a path to put in backticks.
+        #[arg(value_name = "TARGET", required = true, help = "CIDRs (10.99.0.0/16, fd99::/64) and domain patterns ('*.corp.example')")]
         targets: Vec<String>,
     },
     /// Print a shell completion script.
@@ -86,7 +93,7 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         socket: PathBuf,
     },
-    /// Show the relays this client would push: arch, sha256 and size of exactly what it executes.
+    /// Show the relays this client would push: arch, sha256 and size.
     Relays {
         #[command(flatten)]
         relays: RelayArgs,
@@ -95,14 +102,14 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct SshArgs {
-    /// The ssh program and its leading arguments, split like a shell would.
+    /// The ssh program and its arguments.
     #[arg(long, env = "SSHUNNEL_SSH", default_value = "ssh", value_name = "COMMAND")]
     ssh_cmd: String,
 }
 
 #[derive(Debug, Args)]
 struct RelayArgs {
-    /// Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay).
+    /// Relays to push instead of the built-in ones.
     #[arg(long, env = "SSHUNNEL_RELAY_DIR", value_name = "DIR")]
     relay_dir: Option<PathBuf>,
 }

@@ -20,6 +20,9 @@ why the version moved the way it did.
   password, for this user and binary, and whether sudo prompts right now. It never names a binary
   anyone but root can write.
 - `sshunnel completions <shell>`: completion scripts for bash, elvish, fish, PowerShell and zsh.
+- `sshunnel help` (and `--help`) is a guide: examples, what `route` needs, running it from a script
+  or an agent, exit statuses, files and environment. Each command's `--help` has examples of its
+  own, and `route`'s has troubleshooting. `-h` stays a summary.
 - `sshunnel`: `route::check`, `route::sudoers` and `route::helper::{probe_sudo, Sudo}`.
 
 ### Changed
@@ -27,6 +30,7 @@ why the version moved the way it did.
 - Bare `sshunnel` prints the short help instead of a usage error.
 - `forward` exits 0 on SIGINT or SIGTERM, as `route` does, instead of dying by the signal.
 - When sudo exits before the root helper starts, `route`'s error points at `sshunnel sudoers`.
+- The README's help blocks are the binary's output, checked by a test.
 
 ## [0.2.1] - 2026-10-25
 

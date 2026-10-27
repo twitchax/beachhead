@@ -121,6 +121,11 @@ publish at the time. In order (`.prds/PRD-0005.md`'s Shipping section has the re
   `if !netns("<its name>").unwrap() { return; }`: `tests::netns` runs it again as root over
   throwaway namespaces, in a privileged Docker container where Ubuntu restricts user namespaces
   (`SSHUNNEL_NETNS=docker` forces that), and `RemoteNs` is the remote's network.
+- **Help and README:** usage docs live in the binary: the clap definitions in `src/bin.rs` and the
+  long help in `src/help/*.txt` (ASCII, hand-wrapped at 100 columns; no `wrap_help`, so a pipe and
+  a terminal print the same). The README embeds that output, `tests/cli.rs` fails when they differ,
+  and `UPDATE_README=1 cargo nextest run -E 'test(e2e_readme_help)'` rewrites the README's blocks.
+  `.editorconfig` keeps the README's trailing whitespace, which clap prints inside a long help.
 - **PRDs** live in `.prds/`; reference task IDs in commits, and never mark a UAT verified without a
   real, passing test.
 - **No AI attribution** anywhere: no `Co-Authored-By` trailers, session links or "generated with"
