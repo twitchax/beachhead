@@ -6,6 +6,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use ipnet::{Ipv4Net, Ipv6Net};
 
+#[cfg(target_os = "linux")]
+pub mod check;
 mod datagrams;
 #[cfg(target_os = "linux")]
 mod device;

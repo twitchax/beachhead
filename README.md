@@ -121,6 +121,21 @@ sshunnel: check it with `ip route get 10.99.0.0`
 sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
 ```
 
+`route --check` runs every check `route` makes before it changes anything, plus ssh and the relay,
+ping, sudo and whether `sshunnel0` is free. It reports them all at once, changes nothing on this
+machine, and exits 1 on any problem. Whether sudo asks for a password comes from sudo itself: the
+check starts the root helper through `sudo -n` and hangs up before the helper does anything.
+
+```text
+$ sshunnel route --check jump.corp.example 10.99.0.0/16 '*.corp.example' -x 10.99.7.0/24
+targets  ok: 10.99.0.0/16, *.corp.example (except 10.99.7.0/24)
+device   ok: no sshunnel0 yet
+sudo     warn: sudo asks for a password; `sshunnel sudoers` prints the setup that skips it
+ssh      ok: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
+ping     ok: the remote allows unprivileged ping over IPv4 and IPv6
+sshunnel: route can start
+```
+
 TCP, UDP and ping to every address in a CIDR target, and to every name a domain pattern matches,
 now go through the relay, which dials them on the remote; everything else keeps the machine's
 normal routes and DNS. `*.corp.example` matches `corp.example` and every name under it, and
@@ -189,6 +204,7 @@ Arguments:
 
 Options:
   -x, --exclude <TARGET>   Carve a CIDR or a name out of the targets (repeatable)
+      --check              Check whether route can start, changing nothing
       --ssh-cmd <COMMAND>  The ssh program and its leading arguments, split like a shell would [env: SSHUNNEL_SSH=] [default: ssh]
       --relay-dir <DIR>    Read relays from DIR instead of the ones built in (`cargo xtask relay` writes target/relay) [env: SSHUNNEL_RELAY_DIR=]
   -h, --help               Print help

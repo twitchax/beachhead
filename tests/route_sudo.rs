@@ -1,7 +1,7 @@
 //! `sshunnel route` as a user runs it: not root, through the real sudo, on a terminal. What neither
 //! the namespace suite nor the root tests can show: sudo starting the helper for another uid, the
-//! device's fd crossing to an unprivileged client, and a Ctrl-C typed at the terminal. The remote
-//! is this machine with an `/etc/hosts` of its own (`FakeRemote::with_hosts`). `#[ignore]`d: CI's
+//! device's fd crossing to an unprivileged client, a Ctrl-C typed at the terminal, and the
+//! `route --check` probe telling a passwordless sudo apart. The remote is this machine with an `/etc/hosts` of its own (`FakeRemote::with_hosts`). `#[ignore]`d: CI's
 //! route-sudo step runs them as the runner's own user, which has passwordless sudo; anywhere else
 //! they skip.
 
@@ -12,6 +12,7 @@ use std::{
     fs::File,
     io::Read as _,
     os::fd::OwnedFd,
+    path::Path,
     process::{Command as StdCommand, Stdio},
     time::Duration,
 };
@@ -23,7 +24,10 @@ use rustix::{
     pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt},
     termios::{LocalModes, tcgetattr},
 };
-use sshunnel::tests::{FakeRemote, leftovers, relay_dir, resolved_leftovers, route_command};
+use sshunnel::{
+    route::helper::Sudo,
+    tests::{FakeRemote, leftovers, probe_sudo_with, relay_dir, resolved_leftovers, route_command},
+};
 use tempfile::TempDir;
 use tokio::{
     process::{Child, Command},
@@ -180,4 +184,21 @@ async fn e2e_sudo_ctrl_c_at_the_terminal_ends_the_run_cleanly() {
     assert_eq!(leftovers().unwrap(), Vec::<String>::new(), "the terminal showed:\n{shown}");
     // The link's resolver config went with the device.
     assert_eq!(resolved_leftovers().unwrap(), Vec::<String>::new());
+}
+
+#[tokio::test]
+#[ignore = "needs a user other than root with passwordless sudo; CI's route-sudo step runs it"]
+async fn sudo_probe_starts_the_helper_without_a_password() {
+    if !sudo_user() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+
+    let sudo = probe_sudo_with(Path::new(env!("CARGO_BIN_EXE_sshunnel")), dir.path()).await.unwrap();
+
+    assert_eq!(sudo, Sudo::NoPrompt);
+    // The helper the probe hung up on, and the sudo above it, are gone by the time it returns.
+    // Matched by this probe's socket dir, since the other tests here run helpers of their own.
+    let left = StdCommand::new("pgrep").arg("-af").arg(format!("sshunnel helper --socket {}", dir.path().display())).output().unwrap();
+    assert!(!left.status.success(), "a helper is left:\n{}", String::from_utf8_lossy(&left.stdout));
 }

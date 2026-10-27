@@ -55,6 +55,9 @@ enum Command {
         /// Carve a CIDR or a name out of the targets (repeatable).
         #[arg(short = 'x', long = "exclude", value_name = "TARGET")]
         exclude: Vec<String>,
+        /// Check whether route can start, changing nothing.
+        #[arg(long)]
+        check: bool,
         #[command(flatten)]
         ssh: SshArgs,
         #[command(flatten)]
@@ -132,6 +135,7 @@ fn run(cli: Cli) -> Void {
         #[cfg(target_os = "linux")]
         Command::Route {
             exclude,
+            check,
             ssh,
             relays,
             destination,
@@ -140,6 +144,9 @@ fn run(cli: Cli) -> Void {
             let relays = Relays::load(relays.relay_dir.as_deref())?;
             let ssh = SshCommand::parse(&ssh.ssh_cmd)?;
             let options = route::Options { include: targets, exclude };
+            if check {
+                return check_route(&options, &ssh, &destination, &relays);
+            }
             runtime()?.block_on(route::run(&options, &ssh, &destination, &relays))
         }
         #[cfg(target_os = "linux")]
@@ -148,6 +155,20 @@ fn run(cli: Cli) -> Void {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().context("starting the runtime")?;
             runtime.block_on(route::helper::serve(&socket))
         }
+    }
+}
+
+/// `route --check`: the findings on stdout, then the verdict, as the last line or as the error.
+#[cfg(target_os = "linux")]
+fn check_route(options: &route::Options, ssh: &SshCommand, destination: &str, relays: &Relays) -> Void {
+    let report = runtime()?.block_on(route::check::run(options, ssh, destination, relays, &mut std::io::stdout()))?;
+    match report.problems() {
+        0 => {
+            println!("sshunnel: route can start");
+            Ok(())
+        }
+        1 => bail!("route would not start: 1 problem"),
+        n => bail!("route would not start: {n} problems"),
     }
 }
 

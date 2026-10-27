@@ -33,8 +33,10 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   as the stack's packets), `peers` and `system` (what the machine depends on, and the commands and
   syscalls behind it), `helper` (the root side, run as the hidden `sshunnel helper` through
   sudo), `thread` (the netstack's own thread: `device`, `stack` and `dns` on a runtime of their
-  own), and `lifecycle`, which runs them in the spec's order and, on every exit path, joins the
-  netstack's thread and then stops the helper.
+  own), `lifecycle`, which runs them in the spec's order and, on every exit path, joins the
+  netstack's thread and then stops the helper, and `check` (the dry run, `route --check`: the
+  lifecycle's preflight, the device, a `sudo -n` probe of the helper, ssh and ping, changing
+  nothing).
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.
 - `crates/sshunnel-relay`: the remote binary, pushed over SSH as a static musl build. Every

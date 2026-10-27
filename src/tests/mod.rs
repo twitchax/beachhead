@@ -32,7 +32,7 @@ use crate::{
 use {
     crate::route::{
         DEVICE, PIN_PROTO,
-        helper::{self, Helper, Setup},
+        helper::{self, Helper, Setup, Sudo},
     },
     anyhow::ensure,
     rustix::net::{AddressFamily, SocketFlags, SocketType, ipproto, socket_with, socketpair},
@@ -636,6 +636,17 @@ pub fn route_command(exe: impl AsRef<OsStr>, dir: &Path, ssh: &Path, relays: &Pa
 pub async fn start_helper(exe: &Path, dir: &Path, setup: &Setup) -> Res<Helper> {
     let euid = rustix::process::geteuid().as_raw();
     Helper::start_with(setup, dir, |socket| helper::command(exe, socket, euid)).await
+}
+
+/// `route --check`'s sudo probe, run as [`helper::probe_sudo`] runs it (`sudo -n`, even as root)
+/// but on `exe` (a test's own executable isn't sshunnel) with its socket in `dir`.
+///
+/// # Errors
+///
+/// Fails as [`helper::probe_sudo`] does.
+#[cfg(target_os = "linux")]
+pub async fn probe_sudo_with(exe: &Path, dir: &Path) -> Res<Sudo> {
+    helper::probe_with(dir, |socket| helper::probe_command(exe, socket), helper::PROBE_WITHIN).await
 }
 
 /// What `sshunnel route` has in this network namespace, one line of `ip` each: its device, any route

@@ -112,7 +112,7 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
 /// Everything that can refuse the run without privileges or ssh: the targets themselves, the
 /// machine's connected subnets, and resolved for domain patterns. Returns the targets, the checks'
 /// warnings and the connected subnets.
-fn preflight(options: &Options) -> Res<(Targets, Vec<String>, Vec<IpNet>)> {
+pub(crate) fn preflight(options: &Options) -> Res<(Targets, Vec<String>, Vec<IpNet>)> {
     let targets = Targets::parse(&options.include, &options.exclude)?;
     let snapshot = system::snapshot().context("reading the routing tables")?;
     let warnings = checked(&targets, &snapshot, system::has_ipv6(), system::resolved_usable)?;
@@ -264,9 +264,15 @@ fn ping_warnings(can: Capabilities) -> Vec<String> {
 
 /// The one status line: what is routed, through where, on which device.
 fn status_line(targets: &Targets, destination: &str) -> String {
+    format!("sshunnel: routing {} through {destination} on {DEVICE}", routed(targets))
+}
+
+/// What is routed, as the status line and `route --check` word it: the includes, then any
+/// excludes in parentheses.
+pub(crate) fn routed(targets: &Targets) -> String {
     let (include, exclude) = targets.args();
     let except = if exclude.is_empty() { String::new() } else { format!(" (except {})", exclude.join(", ")) };
-    format!("sshunnel: routing {}{except} through {destination} on {DEVICE}", include.join(", "))
+    format!("{}{except}", include.join(", "))
 }
 
 /// A command that checks the first include target is routed: `resolvectl query` for a name,

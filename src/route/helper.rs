@@ -181,8 +181,83 @@ pub fn command(exe: &Path, socket: &Path, euid: u32) -> Vec<OsString> {
 
 fn command_with(sudo: &OsStr, exe: &Path, socket: &Path, euid: u32) -> Vec<OsString> {
     let sudo = (euid != 0).then_some([sudo, OsStr::new("--")]);
-    let helper = [exe.as_os_str(), OsStr::new("helper"), OsStr::new("--socket"), socket.as_os_str()];
-    sudo.into_iter().flatten().chain(helper).map(OsStr::to_owned).collect()
+    sudo.into_iter().flatten().chain(helper_args(exe, socket)).map(OsStr::to_owned).collect()
+}
+
+/// `sshunnel helper` on `socket`, as `exe`.
+fn helper_args<'a>(exe: &'a Path, socket: &'a Path) -> [&'a OsStr; 4] {
+    [exe.as_os_str(), OsStr::new("helper"), OsStr::new("--socket"), socket.as_os_str()]
+}
+
+/// What sudo does with the helper when it may not ask for a password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sudo {
+    /// Already root: `route` starts the helper without sudo.
+    AlreadyRoot,
+    /// sudo starts the helper without asking.
+    NoPrompt,
+    /// sudo wouldn't start the helper without asking: for a password, or by refusing.
+    Prompts,
+}
+
+/// How long the probe waits for sudo to answer, and then for it to exit.
+pub(crate) const PROBE_WITHIN: Duration = Duration::from_secs(10);
+
+/// Whether `route` would start the helper without asking, found by asking sudo itself: it starts
+/// the helper as `route` does but through `sudo -n`, and hangs up as soon as the helper connects,
+/// before the helper has changed anything. Listing the rules instead (`sudo -n -l`) succeeds for a
+/// password rule beside an unrelated `NOPASSWD` one.
+///
+/// # Errors
+///
+/// Fails when sudo can't be started or doesn't answer within 10 s, or when what connects isn't
+/// root.
+pub async fn probe_sudo() -> Res<Sudo> {
+    if rustix::process::geteuid().is_root() {
+        return Ok(Sudo::AlreadyRoot);
+    }
+    let exe = std::env::current_exe().context("locating sshunnel's own executable")?;
+    probe_with(&runtime_dir(), |socket| probe_command(&exe, socket), PROBE_WITHIN).await
+}
+
+/// [`probe_sudo`] with the socket's parent dir, the command line and the wait chosen by the caller.
+pub(crate) async fn probe_with(base: &Path, command_line: impl FnOnce(&Path) -> Vec<OsString>, within: Duration) -> Res<Sudo> {
+    let dir = SocketDir::create(base)?;
+    let socket = dir.0.join("helper.sock");
+    let listener = UnixListener::bind(&socket).with_context(|| format!("listening on {}", socket.display()))?;
+
+    let line = command_line(&socket);
+    let (program, args) = line.split_first().context("the probe's command is empty")?;
+    let program = Path::new(program);
+    // Nothing of sudo's reaches the terminal: a refusal is the answer, not an error to show.
+    let mut child = helper_process(program, args).stderr(Stdio::null()).spawn().with_context(|| format!("starting {}", program.display()))?;
+
+    let answer = timeout(within, async {
+        tokio::select! {
+            biased;
+            accepted = listener.accept() => Ok(Some(accepted.context("accepting the helper's connection")?.0)),
+            status = child.wait() => status.map(|_| None).with_context(|| format!("waiting for {}", program.display())),
+        }
+    })
+    .await;
+    let Some(conn) = answer.map_err(|_| anyhow!("{} didn't answer within {} s", program.display(), within.as_secs_f64()))?? else {
+        return Ok(Sudo::Prompts);
+    };
+
+    let root = root_peer(&conn);
+    // A helper hung up on before its setup arrives exits having changed nothing, and sudo follows
+    // it out. Waited for, so no root helper outlives the probe.
+    drop((conn, listener, dir));
+    if timeout(within, child.wait()).await.is_err() {
+        tracing::warn!("{} is still running {} s after the probe hung up on the root helper", program.display(), within.as_secs_f64());
+    }
+    root.map(|()| Sudo::NoPrompt)
+}
+
+/// The command line that probes sudo with the helper on `socket`: [`command`]'s, through `sudo -n`,
+/// which fails rather than ask for a password.
+pub(crate) fn probe_command(exe: &Path, socket: &Path) -> Vec<OsString> {
+    ["sudo", "-n", "--"].map(OsStr::new).into_iter().chain(helper_args(exe, socket)).map(OsStr::to_owned).collect()
 }
 
 /// The process that becomes the helper. It never inherits `SUDO_UID`: sudo sets its own, and a
@@ -216,8 +291,7 @@ async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, s
         }
     };
 
-    let peer = socket_peercred(&conn).context("reading the helper's credentials")?.uid;
-    ensure!(peer.is_root(), "the helper's end of the socket is not root (uid {})", peer.as_raw());
+    root_peer(&conn)?;
 
     conn.write_all(&encode(setup)?).await.context("sending the setup to the helper")?;
     match receive(&conn).await? {
@@ -225,6 +299,13 @@ async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, s
         (Reply::Ready { .. }, None) => bail!("the root helper sent no TUN device"),
         (Reply::Failed { error }, _) => bail!("the root helper failed: {error}"),
     }
+}
+
+/// Refuses a helper whose end of the socket isn't root: anything the user runs could connect.
+fn root_peer(conn: &UnixStream) -> Void {
+    let peer = socket_peercred(conn).context("reading the helper's credentials")?.uid;
+    ensure!(peer.is_root(), "the helper's end of the socket is not root (uid {})", peer.as_raw());
+    Ok(())
 }
 
 /// `sshunnel helper --socket <path>`, run as root: connect to the client, set the device up as it
@@ -880,6 +961,88 @@ mod tests {
             command(exe, socket, 0),
             ["/usr/local/bin/sshunnel", "helper", "--socket", "/run/user/1000/sshunnel-7-0/helper.sock"].map(OsString::from)
         );
+    }
+
+    /// [`probe_command`]'s line, with `sudo` in place of the real one.
+    fn probing(sudo: &Path) -> impl FnOnce(&Path) -> Vec<OsString> + '_ {
+        move |socket| {
+            let mut line = probe_command(Path::new("sshunnel"), socket);
+            line[0] = sudo.into();
+            line
+        }
+    }
+
+    #[test]
+    fn sudo_probe_command_is_non_interactive() {
+        let exe = Path::new("/usr/local/bin/sshunnel");
+        let socket = Path::new("/run/user/1000/sshunnel-7-0/helper.sock");
+
+        assert_eq!(
+            probe_command(exe, socket),
+            ["sudo", "-n", "--", "/usr/local/bin/sshunnel", "helper", "--socket", "/run/user/1000/sshunnel-7-0/helper.sock"].map(OsString::from)
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_probe_reads_a_sudo_that_exits_as_prompts() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        let sudo = shim_dir(root.path(), &[("sudo", "exit 1")]).unwrap().join("sudo");
+
+        let probed = probe_with(&runtime, probing(&sudo), PROBE_WITHIN).await;
+
+        assert_eq!(probed.unwrap(), Sudo::Prompts);
+        assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0, "the socket dir is left behind");
+    }
+
+    #[tokio::test]
+    async fn sudo_probe_fails_on_a_missing_sudo() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+
+        let error = probe_with(&runtime, probing(&root.path().join("no-such-sudo")), PROBE_WITHIN).await.unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("no-such-sudo"), "{error}");
+        assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0, "the socket dir is left behind");
+    }
+
+    #[tokio::test]
+    async fn sudo_probe_times_out_on_a_sudo_that_hangs() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        let sudo = shim_dir(root.path(), &[("sudo", "exec sleep 30")]).unwrap().join("sudo");
+
+        let error = probe_with(&runtime, probing(&sudo), Duration::from_millis(200)).await.unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("didn't answer within 0.2 s"), "{error}");
+        assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0, "the socket dir is left behind");
+    }
+
+    #[tokio::test]
+    async fn sudo_probe_refuses_a_helper_that_is_not_root() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        // Stands in for a helper still starting: it gives up once the socket is gone.
+        let sudo = shim_dir(root.path(), &[("sudo", "for socket do :; done\nwhile [ -e \"$socket\" ]; do sleep 0.05; done")])
+            .unwrap()
+            .join("sudo");
+
+        // The test answers the socket itself, as the unprivileged user running it.
+        let probed = probe_with(
+            &runtime,
+            |socket| {
+                let path = socket.to_owned();
+                tokio::spawn(async move { UnixStream::connect(path).await });
+                probing(&sudo)(socket)
+            },
+            PROBE_WITHIN,
+        );
+        let error = format!("{:#}", probed.await.unwrap_err());
+
+        assert!(error.contains("not root"), "{error}");
+        assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0, "the socket dir is left behind");
     }
 
     #[test]

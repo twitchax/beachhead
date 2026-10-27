@@ -12,6 +12,10 @@ why the version moved the way it did.
 - `route` and `forward` print `sshunnel: ready (pid N); Ctrl-C or SIGTERM stops it` once they
   serve, the line a script or an agent waits for. Before it, `route` prints a command that checks
   it: `resolvectl query` for a name, `ip route get` for a CIDR.
+- `route --check`: the targets, the device, sudo, ssh and the relay, and ping, all checked and
+  reported at once, without changing anything, with exit 1 on any problem. Whether sudo prompts
+  comes from running the root helper through `sudo -n`, which exits as soon as the check hangs up.
+- `sshunnel`: `route::check` and `route::helper::{probe_sudo, Sudo}`.
 
 ### Changed
 
