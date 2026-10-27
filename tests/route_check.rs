@@ -16,7 +16,10 @@ use std::{
 use pretty_assertions::assert_eq;
 use rustix::process::{Pid, Signal, geteuid, kill_process};
 use sshunnel::{
-    route::sudoers::{INSTALL_DIR, root_only},
+    route::{
+        DEVICE,
+        sudoers::{INSTALL_DIR, root_only},
+    },
     tests::{FakeRemote, relay_dir, route_command, shim_dir},
 };
 use tempfile::TempDir;
@@ -109,20 +112,35 @@ fn sudo_status() -> &'static str {
     if geteuid().is_root() { "ok" } else { "warn" }
 }
 
+/// Whether a real route, up when the test starts, holds the device: the check then fails it.
+fn device_taken() -> bool {
+    Path::new("/sys/class/net").join(DEVICE).exists()
+}
+
+fn device_status(taken: bool) -> &'static str {
+    if taken { "fail" } else { "ok" }
+}
+
 #[tokio::test]
 async fn e2e_route_check_reports_every_check_and_exits_0() {
     let world = World::new();
+    let taken = device_taken();
 
     let (code, stdout, stderr) = world.run(world.remote.ssh_path(), &["192.0.2.0/24"]).await;
 
-    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert_eq!(stdout.lines().count(), 6, "{stdout}");
+    assert_eq!(code, Some(i32::from(taken)), "stdout:\n{stdout}\nstderr:\n{stderr}");
     let mut found = findings(&stdout);
     let (ping, status) = found.pop().unwrap();
-    assert_eq!(found, pairs(&[("targets", "ok"), ("device", "ok"), ("sudo", sudo_status()), ("ssh", "ok")]), "{stdout}");
+    assert_eq!(found, pairs(&[("targets", "ok"), ("device", device_status(taken)), ("sudo", sudo_status()), ("ssh", "ok")]), "{stdout}");
     // The remote's ping range decides.
     assert!(ping == "ping" && (status == "ok" || status == "warn"), "{stdout}");
-    assert_eq!(stdout.lines().last(), Some("sshunnel: route can start"));
+    if taken {
+        assert_eq!(stdout.lines().count(), 5, "{stdout}");
+        assert_eq!(stderr.lines().last(), Some("error: route would not start: 1 problem"), "{stderr}");
+    } else {
+        assert_eq!(stdout.lines().count(), 6, "{stdout}");
+        assert_eq!(stdout.lines().last(), Some("sshunnel: route can start"));
+    }
 
     // Changes nothing here: no fake-address map, and the probe's socket dir is gone.
     assert!(!world.dir.path().join("sshunnel/names").exists());
@@ -132,12 +150,18 @@ async fn e2e_route_check_reports_every_check_and_exits_0() {
 #[tokio::test]
 async fn e2e_route_check_reports_every_problem_and_exits_1() {
     let world = World::new();
+    let taken = device_taken();
 
     let (code, stdout, stderr) = world.run(Path::new("false"), &["0.0.0.0/0"]).await;
 
     assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert_eq!(findings(&stdout), pairs(&[("targets", "fail"), ("device", "ok"), ("sudo", sudo_status()), ("ssh", "fail")]), "{stdout}");
-    assert_eq!(stderr.lines().last(), Some("error: route would not start: 2 problems"), "{stderr}");
+    assert_eq!(
+        findings(&stdout),
+        pairs(&[("targets", "fail"), ("device", device_status(taken)), ("sudo", sudo_status()), ("ssh", "fail")]),
+        "{stdout}"
+    );
+    let problems = if taken { 3 } else { 2 };
+    assert_eq!(stderr.lines().last(), Some(format!("error: route would not start: {problems} problems").as_str()), "{stderr}");
 }
 
 #[tokio::test]
@@ -192,11 +216,19 @@ async fn e2e_sudoers_prints_the_setup() {
     } else {
         // Here the binary can only be installed somewhere others can write, so no line can name it.
         assert_eq!(code, Some(1), "{output}");
-        let refusal = format!(
-            "error: {INSTALL_DIR} can be written by users other than root, so a sudoers line can't safely name a binary in it; \
-             install sshunnel in a directory only root can write, and run `sshunnel sudoers` from that copy"
-        );
-        assert_eq!(stderr.lines().last(), Some(refusal.as_str()), "{output}");
+        let last = stderr.lines().last().unwrap_or_default();
+        let refused = format!("error: {INSTALL_DIR} can be written by users other than root, so a sudoers line can't safely name a binary in it; ");
+        assert!(last.starts_with(&refused), "{output}");
+        // The way forward is a root-owned copy under /opt, unless what's there is open to others too.
+        let opt = Path::new("/opt/sshunnel/bin").ancestors().find(|dir| dir.exists()).unwrap().canonicalize().unwrap();
+        if root_only(&opt).unwrap() {
+            let exe = Path::new(env!("CARGO_BIN_EXE_sshunnel")).canonicalize().unwrap();
+            let install = format!("`sudo install -D -o root -g root -m 0755 {} /opt/sshunnel/bin/sshunnel`", exe.display());
+            assert!(last.contains(&install), "{output}");
+            assert!(last.ends_with("then run `/opt/sshunnel/bin/sshunnel sudoers`, which names that copy"), "{output}");
+        } else {
+            assert!(last.contains(" can be too, so install sshunnel in another directory only root can write"), "{output}");
+        }
         assert!(stdout.is_empty(), "{output}");
     }
 }

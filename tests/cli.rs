@@ -98,6 +98,19 @@ fn e2e_help_route_covers_targets_privileges_and_troubleshooting() {
     }
 }
 
+/// A script gates route on `--check`'s exit status, so the help states it beside the sample.
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_help_route_states_the_check_exit_status() {
+    let help = stdout(&["help", "route"]);
+    let after_sample = help.lines().skip_while(|line| *line != "    sshunnel: route can start").nth(1);
+    assert_eq!(
+        after_sample,
+        Some("  --check exits 1 if a check fails, 0 otherwise. A sudo warn means route will ask for a password."),
+        "{help}"
+    );
+}
+
 #[test]
 fn e2e_help_shows_the_ready_line_the_code_prints() {
     let ready = sshunnel::session::ready_line(4242);

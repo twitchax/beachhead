@@ -25,6 +25,10 @@ use crate::{
 /// Where the script installs a binary that users other than root can write.
 pub const INSTALL_DIR: &str = "/usr/local/bin";
 
+/// Where `sudoers` suggests a root-owned copy when [`INSTALL_DIR`] isn't root's alone. `install -D`
+/// makes the directories it lacks, as root.
+const ELSEWHERE: &str = "/opt/sshunnel/bin/sshunnel";
+
 /// What `sudoers` says as root: the sudoers line names the user who runs `route`.
 const AS_ROOT: &str = "run `sshunnel sudoers` as the user who will run route, not as root";
 
@@ -54,11 +58,9 @@ pub async fn run() -> Res<String> {
     ensure!(!rustix::process::geteuid().is_root(), AS_ROOT);
     let exe = std::env::current_exe().context("locating sshunnel's own executable")?;
     let exe_root_only = root_only(&exe)?;
-    ensure!(
-        exe_root_only || root_only(Path::new(INSTALL_DIR))?,
-        "{INSTALL_DIR} can be written by users other than root, so a sudoers line can't safely name a binary in it; \
-         install sshunnel in a directory only root can write, and run `sshunnel sudoers` from that copy"
-    );
+    if !exe_root_only && !root_only(Path::new(INSTALL_DIR))? {
+        bail!(unsafe_install_dir(&exe, elsewhere_writable()?.as_deref()));
+    }
     let answers = ask(&exe, exe_root_only, installed_root_only()?.as_deref(), helper::probe_sudo_for).await?;
     script(&user_name()?, &exe, exe_root_only, answers)
 }
@@ -102,6 +104,33 @@ pub(crate) fn installed_path() -> String {
 fn installed_root_only() -> Res<Option<PathBuf>> {
     let installed = PathBuf::from(installed_path());
     Ok((installed.exists() && root_only(&installed)?).then_some(installed))
+}
+
+/// Why `sudoers` refuses when neither this binary nor [`INSTALL_DIR`] is [`root_only`], and the way
+/// forward: a root-owned copy at [`ELSEWHERE`], whose own `sudoers` then names it. When `writable`,
+/// a directory on the way there that others can write, rules that out, it says so instead; and it
+/// prints the command only for an `exe` the shell reads as written ([`plain`]).
+fn unsafe_install_dir(exe: &Path, writable: Option<&Path>) -> String {
+    let refused = format!("{INSTALL_DIR} can be written by users other than root, so a sudoers line can't safely name a binary in it");
+    match (writable, exe.to_str().and_then(|exe| plain("the path", exe).ok())) {
+        (Some(dir), _) => format!(
+            "{refused}; {} can be too, so install sshunnel in another directory only root can write, and run `sshunnel sudoers` from that copy",
+            dir.display()
+        ),
+        (None, Some(exe)) => format!(
+            "{refused}; install a root-owned copy where only root can write, as `sudo install -D -o root -g root -m 0755 {exe} {ELSEWHERE}` does, \
+             then run `{ELSEWHERE} sudoers`, which names that copy"
+        ),
+        (None, None) => format!("{refused}; install sshunnel in a directory only root can write, and run `sshunnel sudoers` from that copy"),
+    }
+}
+
+/// The first directory over [`ELSEWHERE`] that others can write, of those there already: the
+/// nearest one, resolved, and those above it.
+fn elsewhere_writable() -> Res<Option<PathBuf>> {
+    let nearest = Path::new(ELSEWHERE).ancestors().skip(1).find(|dir| dir.exists()).unwrap_or(Path::new("/"));
+    let nearest = nearest.canonicalize().with_context(|| format!("resolving {}", nearest.display()))?;
+    Ok(first_writable(&nearest)?.map(Path::to_path_buf))
 }
 
 /// Whether root alone can write `path`: it and every directory above it are owned by root and have
@@ -415,6 +444,39 @@ rm -f "$f"
         // No answer for this binary is no answer at all.
         let (found, asked) = asking(false, Some(INSTALLED), &[installed_allowed]).await;
         assert_eq!((found.unwrap_err().to_string(), asked), ("sudo didn't answer".to_owned(), paths(&[EXE])));
+    }
+
+    const REFUSED: &str = "/usr/local/bin can be written by users other than root, so a sudoers line can't safely name a binary in it";
+
+    #[test]
+    fn sudoers_refusal_shows_a_root_only_way_forward() {
+        assert_eq!(
+            unsafe_install_dir(Path::new(EXE), None),
+            format!(
+                "{REFUSED}; install a root-owned copy where only root can write, as \
+                 `sudo install -D -o root -g root -m 0755 /home/me/.cargo/bin/sshunnel /opt/sshunnel/bin/sshunnel` does, \
+                 then run `/opt/sshunnel/bin/sshunnel sudoers`, which names that copy"
+            )
+        );
+    }
+
+    #[test]
+    fn sudoers_refusal_prints_no_command_for_a_path_the_shell_could_misread() {
+        for exe in ["/home/me/my tools/sshunnel", "/home/me/$(id)/sshunnel", "/home/me/it's/sshunnel"] {
+            assert_eq!(
+                unsafe_install_dir(Path::new(exe), None),
+                format!("{REFUSED}; install sshunnel in a directory only root can write, and run `sshunnel sudoers` from that copy"),
+                "{exe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sudoers_refusal_says_when_opt_is_no_better() {
+        assert_eq!(
+            unsafe_install_dir(Path::new(EXE), Some(Path::new("/opt"))),
+            format!("{REFUSED}; /opt can be too, so install sshunnel in another directory only root can write, and run `sshunnel sudoers` from that copy")
+        );
     }
 
     #[test]

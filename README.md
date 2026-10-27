@@ -285,6 +285,7 @@ Examples:
     ssh      ok: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
     ping     ok: the remote allows unprivileged ping over IPv4 and IPv6
     sshunnel: route can start
+  --check exits 1 if a check fails, 0 otherwise. A sudo warn means route will ask for a password.
 
 Privileges:
   ssh runs as you. route then starts a root helper through sudo, which creates sshunnel0 with its
@@ -318,8 +319,8 @@ Troubleshooting:
       It resolves names itself (DNS over HTTPS, say). CIDR targets still catch its traffic.
 ```
 
-`route --check` exits 1 when any check fails and 0 when `route` can start, warnings or not, so a
-script can gate `route` on it.
+A script can gate `route` on `route --check`'s exit status only when its `sudo` line is `ok`: with
+a `sudo` warn the check still exits 0, and `route` then asks for a password the script can't type.
 
 Excludes never cross: a CIDR exclude carves only CIDR targets, and a name exclude only patterns, so
 a pattern routes a name whatever address it has on the remote.
