@@ -210,6 +210,7 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
             }
         }
     }
+    let mut stop = StopSignal::new()?;
     eprintln!("{}", ready_line(std::process::id()));
     tokio::select! {
         closed = session.closed() => {
@@ -217,25 +218,48 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
             bail!("the ssh session ended")
         }
         Some(failed) = serving.join_next() => failed.context("a listener task panicked")?,
-        () = stop_signal() => Ok(()),
+        () = stop.recv() => Ok(()),
     }
 }
 
-/// Resolves on Ctrl-C or, on unix, SIGTERM. If a handler can't be installed, it never resolves,
-/// and the signal keeps its default effect.
-async fn stop_signal() {
-    #[cfg(unix)]
-    {
+/// Ctrl-C and, on unix, SIGTERM. Registered when built, not when first awaited, so building it
+/// before the ready line means a signal sent on seeing that line is already caught.
+#[cfg(unix)]
+struct StopSignal {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl StopSignal {
+    fn new() -> Res<Self> {
         use tokio::signal::unix::{SignalKind, signal};
 
-        let Ok(mut term) = signal(SignalKind::terminate()) else {
-            return std::future::pending().await;
-        };
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("registering the SIGINT handler")?,
+            terminate: signal(SignalKind::terminate()).context("registering the SIGTERM handler")?,
+        })
+    }
+
+    async fn recv(&mut self) {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
         }
     }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(not(unix))]
+struct StopSignal;
+
+#[cfg(not(unix))]
+impl StopSignal {
+    #[expect(clippy::unnecessary_wraps, reason = "the unix constructor registers handlers and can fail")]
+    fn new() -> Res<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
