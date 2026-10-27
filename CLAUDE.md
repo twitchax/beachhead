@@ -35,7 +35,7 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   sudo), `thread` (the netstack's own thread: `device`, `stack` and `dns` on a runtime of their
   own), `lifecycle`, which runs them in the spec's order and, on every exit path, joins the
   netstack's thread and then stops the helper, and `check` (the dry run, `route --check`: the
-  lifecycle's preflight, the device, a `sudo -n` probe of the helper, ssh and ping, changing
+  lifecycle's preflight, the device, a `sudo -n -k` probe of the helper, ssh and ping, changing
   nothing).
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.

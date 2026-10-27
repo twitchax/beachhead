@@ -1,9 +1,9 @@
 //! `sshunnel route` as a user runs it: not root, through the real sudo, on a terminal. What neither
 //! the namespace suite nor the root tests can show: sudo starting the helper for another uid, the
 //! device's fd crossing to an unprivileged client, a Ctrl-C typed at the terminal, and the
-//! `route --check` probe telling a passwordless sudo apart. The remote is this machine with an `/etc/hosts` of its own (`FakeRemote::with_hosts`). `#[ignore]`d: CI's
-//! route-sudo step runs them as the runner's own user, which has passwordless sudo; anywhere else
-//! they skip.
+//! `route --check` probe telling a passwordless sudo apart. The remote is this machine with an
+//! `/etc/hosts` of its own (`FakeRemote::with_hosts`). `#[ignore]`d: CI's route-sudo step runs them
+//! as the runner's own user, which has passwordless sudo; anywhere else they skip.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]

@@ -1,5 +1,5 @@
 //! `sshunnel route --check`: whether `route` can start, changing nothing. It runs every check
-//! `route` makes before it changes anything ([`preflight`]), then the ones `route` only meets on the
+//! `route` makes before it changes anything (`preflight`), then the ones `route` only meets on the
 //! way: whether [`DEVICE`] is free, whether sudo starts the root helper without asking (the
 //! [`helper::probe_sudo`] probe, which hangs up before the helper changes anything), ssh and the
 //! relay, and whether the relay may ping. Every check runs whatever the others found, and each

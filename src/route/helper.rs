@@ -204,9 +204,11 @@ pub enum Sudo {
 pub(crate) const PROBE_WITHIN: Duration = Duration::from_secs(10);
 
 /// Whether `route` would start the helper without asking, found by asking sudo itself: it starts
-/// the helper as `route` does but through `sudo -n`, and hangs up as soon as the helper connects,
-/// before the helper has changed anything. Listing the rules instead (`sudo -n -l`) succeeds for a
-/// password rule beside an unrelated `NOPASSWD` one.
+/// the helper as `route` does but through `sudo -n -k`, and hangs up as soon as the helper
+/// connects, before the helper has changed anything. Listing the rules instead (`sudo -n -l`)
+/// succeeds for a password rule beside an unrelated `NOPASSWD` one. `-k` ignores a cached sudo
+/// timestamp for this one call (without clearing it): the question is whether sudo asks once that
+/// has expired, not whether it happens to be fresh now.
 ///
 /// # Errors
 ///
@@ -240,6 +242,8 @@ pub(crate) async fn probe_with(base: &Path, command_line: impl FnOnce(&Path) -> 
         }
     })
     .await;
+    // On a timeout sudo is left to finish, as `start_with` leaves it: the socket dir goes with this
+    // return, so a helper that starts late can't connect and exits.
     let Some(conn) = answer.map_err(|_| anyhow!("{} didn't answer within {} s", program.display(), within.as_secs_f64()))?? else {
         return Ok(Sudo::Prompts);
     };
@@ -254,10 +258,10 @@ pub(crate) async fn probe_with(base: &Path, command_line: impl FnOnce(&Path) -> 
     root.map(|()| Sudo::NoPrompt)
 }
 
-/// The command line that probes sudo with the helper on `socket`: [`command`]'s, through `sudo -n`,
-/// which fails rather than ask for a password.
+/// The command line that probes sudo with the helper on `socket`: [`command`]'s, through
+/// `sudo -n -k`, which fails rather than ask for a password, and ignores a cached sudo timestamp.
 pub(crate) fn probe_command(exe: &Path, socket: &Path) -> Vec<OsString> {
-    ["sudo", "-n", "--"].map(OsStr::new).into_iter().chain(helper_args(exe, socket)).map(OsStr::to_owned).collect()
+    ["sudo", "-n", "-k", "--"].map(OsStr::new).into_iter().chain(helper_args(exe, socket)).map(OsStr::to_owned).collect()
 }
 
 /// The process that becomes the helper. It never inherits `SUDO_UID`: sudo sets its own, and a
@@ -979,7 +983,7 @@ mod tests {
 
         assert_eq!(
             probe_command(exe, socket),
-            ["sudo", "-n", "--", "/usr/local/bin/sshunnel", "helper", "--socket", "/run/user/1000/sshunnel-7-0/helper.sock"].map(OsString::from)
+            ["sudo", "-n", "-k", "--", "/usr/local/bin/sshunnel", "helper", "--socket", "/run/user/1000/sshunnel-7-0/helper.sock"].map(OsString::from)
         );
     }
 
@@ -1022,6 +1026,10 @@ mod tests {
 
     #[tokio::test]
     async fn sudo_probe_refuses_a_helper_that_is_not_root() {
+        if getuid().is_root() {
+            eprintln!("skipping: as root, the test's own connection is a root helper's");
+            return;
+        }
         let root = TempDir::new().unwrap();
         let runtime = runtime_in(&root);
         // Stands in for a helper still starting: it gives up once the socket is gone.

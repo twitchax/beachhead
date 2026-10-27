@@ -124,7 +124,7 @@ sshunnel: ready (pid 4242); Ctrl-C or SIGTERM stops it
 `route --check` runs every check `route` makes before it changes anything, plus ssh and the relay,
 ping, sudo and whether `sshunnel0` is free. It reports them all at once, changes nothing on this
 machine, and exits 1 on any problem. Whether sudo asks for a password comes from sudo itself: the
-check starts the root helper through `sudo -n` and hangs up before the helper does anything.
+check starts the root helper through `sudo -n -k` and hangs up before the helper does anything.
 
 ```text
 $ sshunnel route --check jump.corp.example 10.99.0.0/16 '*.corp.example' -x 10.99.7.0/24
