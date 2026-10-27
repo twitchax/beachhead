@@ -3,8 +3,9 @@
 //!
 //! sudo runs whatever is at the path a `NOPASSWD` line names, so whoever can write that file, or
 //! any directory above it, is root. The script therefore names only a binary root alone can write
-//! ([`root_only`]), installing this one in [`INSTALL_DIR`] first when it isn't, and refuses a name
-//! or path sudoers or the shell could read as more than itself.
+//! ([`root_only`]), installing this one in [`INSTALL_DIR`] first when it isn't. It refuses a user
+//! name or path with a character sudoers or the shell could misread, and a user name sudoers reads
+//! as something other than that user: `ALL`, a `+netgroup` or a `User_Alias`.
 
 use std::{fmt::Write as _, os::unix::fs::MetadataExt as _, path::Path, process::Stdio};
 
@@ -92,8 +93,9 @@ pub fn user_name() -> Res<String> {
 /// # Errors
 ///
 /// Fails for [`Sudo::AlreadyRoot`] (the line names the user who runs `route`, never root), for a
-/// relative `exe`, and for a `user` or `exe` with anything but `[A-Za-z0-9._/+-]`, all of which
-/// mean only themselves to sudoers and to the shell.
+/// relative `exe`, for a `user` or `exe` with anything but `[A-Za-z0-9._/+-]`, all of which mean
+/// only themselves to sudoers and to the shell, and for a `user` sudoers reads as someone else:
+/// `ALL`, a `+netgroup` or a `User_Alias`.
 pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Sudo) -> Res<String> {
     let now = match sudo {
         Sudo::AlreadyRoot => bail!(AS_ROOT),
@@ -101,6 +103,9 @@ pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Sudo) -> Res<St
         Sudo::Prompts => "sudo asks for a password to start the helper",
     };
     let user = plain("the user name", user)?;
+    if let Some(read_as) = misread_as(user) {
+        bail!("the user name {user:?} isn't safe in a sudoers line: sudoers would read it as {read_as}, not this user");
+    }
     ensure!(exe.is_absolute(), "sudoers needs a full path, and {} is relative", exe.display());
     let exe = plain("the path", exe.to_str().with_context(|| format!("{} isn't UTF-8", exe.display()))?)?;
     let installed = format!("{INSTALL_DIR}/sshunnel");
@@ -127,6 +132,23 @@ pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Sudo) -> Res<St
     }
     let _ = write!(out, "\n# Right now, {now}.\n");
     Ok(out)
+}
+
+/// What sudoers reads `user` as in a line's first field, when that isn't the user of that name:
+/// the reserved `ALL`, a `+netgroup`, or an alias (`[A-Z][A-Z0-9_]*`), which matches nobody when
+/// undefined.
+fn misread_as(user: &str) -> Option<&'static str> {
+    let mut chars = user.chars();
+    let alias = chars.next().is_some_and(|c| c.is_ascii_uppercase()) && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if user == "ALL" {
+        Some("every user")
+    } else if user.starts_with('+') {
+        Some("a netgroup")
+    } else if alias {
+        Some("a User_Alias")
+    } else {
+        None
+    }
 }
 
 /// `text`, refused when empty or holding anything but `[A-Za-z0-9._/+-]`.
@@ -193,6 +215,15 @@ rm -f "$f"
         for user in ["a b", "", "me,root", "%sudo", "me\nroot", "me'", "me#"] {
             let error = script(user, exe, false, Sudo::Prompts).unwrap_err().to_string();
             assert!(error.contains("user name"), "{user:?}: {error}");
+        }
+        // Plain characters, but sudoers reads them as every user, a netgroup and a User_Alias.
+        for (user, read_as) in [("ALL", "every user"), ("+admins", "a netgroup"), ("ADMINS", "a User_Alias"), ("OPS_2", "a User_Alias")] {
+            let error = script(user, exe, false, Sudo::Prompts).unwrap_err().to_string();
+            assert!(error.contains("user name") && error.contains(read_as), "{user:?}: {error}");
+        }
+        // Each rule's edge: only a whole name of that shape is something else.
+        for user in ["All", "me+x", "Admins", "A1b", "_ALL"] {
+            assert!(script(user, exe, false, Sudo::Prompts).is_ok(), "{user:?}");
         }
         for path in ["/opt/my tools/sshunnel", "/opt/*/sshunnel", "/opt/it's/sshunnel", "/opt/a,b/sshunnel", "/opt/a\\b/sshunnel"] {
             for root_only in [false, true] {
