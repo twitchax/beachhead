@@ -54,7 +54,7 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:tracing-subscriber"]
+cli = ["dep:clap", "dep:clap_complete", "dep:tracing-subscriber"]
 # The fixture factory the repo's own tests share; integration tests link the normal library build, where `cfg(test)` is off.
 testing = []
 
@@ -72,6 +72,7 @@ tracing.workspace = true
 
 # cli
 clap = { version = "4", features = ["derive", "env"], optional = true }
+clap_complete = { version = "4", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 
 # The root helper (`route::helper`, `route::system`) is Linux only: the TUN ioctl, SO_PEERCRED and

@@ -335,6 +335,8 @@ cargo install sshunnel --locked
 This builds on stable Rust, with the dependency versions the crate was published with, and fetches
 nothing beyond the crates: the relays come inside the crate, built when it was published, so their
 hashes can differ from the GitHub release's. `sshunnel relays` shows what this client pushes.
+`sshunnel completions <shell>` prints a completion script, and `sshunnel help completions` shows
+where each shell loads it from.
 
 ```bash
 cargo binstall sshunnel

@@ -9,7 +9,7 @@
 use std::{io::IsTerminal as _, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{Context as _, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use tokio::{
     net::{TcpListener, UdpSocket},
     task::JoinSet,
@@ -27,7 +27,7 @@ use sshunnel::{
 
 /// A userspace VPN over plain SSH: push-exec a static musl relay, cache it by hash, route through it.
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version, about, arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -67,6 +67,13 @@ enum Command {
         /// What to route: CIDRs (`10.99.0.0/16`, `fd99::/64`) and domain patterns (`*.corp.example`, `host.corp.example`).
         #[arg(value_name = "TARGET", required = true)]
         targets: Vec<String>,
+    },
+    /// Print a shell completion script.
+    #[command(after_long_help = include_str!("help/completions.txt"))]
+    Completions {
+        /// The shell to complete for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// Print the one-time setup that lets route start without a sudo password (Linux).
     #[cfg(target_os = "linux")]
@@ -125,6 +132,15 @@ fn main() -> ExitCode {
     }
 }
 
+/// The command line as a completion script should see it: `clap_complete` lists hidden subcommands
+/// too, and `Command` can't drop one, so the visible ones go into a fresh root. The root has no
+/// arguments of its own beyond the `--help` and `--version` clap adds.
+fn completable() -> clap::Command {
+    let cli = Cli::command();
+    let visible: Vec<clap::Command> = cli.get_subcommands().filter(|sub| !sub.is_hide_set()).cloned().collect();
+    clap::Command::new("sshunnel").version(env!("CARGO_PKG_VERSION")).subcommands(visible)
+}
+
 fn run(cli: Cli) -> Void {
     match cli.command {
         Command::Relays { relays } => {
@@ -152,6 +168,10 @@ fn run(cli: Cli) -> Void {
                 return check_route(&options, &ssh, &destination, &relays);
             }
             runtime()?.block_on(route::run(&options, &ssh, &destination, &relays))
+        }
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut completable(), "sshunnel", &mut std::io::stdout());
+            Ok(())
         }
         #[cfg(target_os = "linux")]
         Command::Sudoers => {

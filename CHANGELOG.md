@@ -19,10 +19,12 @@ why the version moved the way it did.
 - `sshunnel sudoers` (Linux) prints the one-time setup that lets `route` start without a sudo
   password, for this user and binary, and whether sudo prompts right now. It never names a binary
   anyone but root can write.
+- `sshunnel completions <shell>`: completion scripts for bash, elvish, fish, PowerShell and zsh.
 - `sshunnel`: `route::check`, `route::sudoers` and `route::helper::{probe_sudo, Sudo}`.
 
 ### Changed
 
+- Bare `sshunnel` prints the short help instead of a usage error.
 - `forward` exits 0 on SIGINT or SIGTERM, as `route` does, instead of dying by the signal.
 - When sudo exits before the root helper starts, `route`'s error points at `sshunnel sudoers`.
 

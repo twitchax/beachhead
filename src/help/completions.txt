@@ -1,0 +1,4 @@
+Examples:
+  sshunnel completions bash > ~/.local/share/bash-completion/completions/sshunnel
+  sshunnel completions zsh > ~/.zfunc/_sshunnel    # with fpath+=(~/.zfunc) before compinit
+  sshunnel completions fish > ~/.config/fish/completions/sshunnel.fish
