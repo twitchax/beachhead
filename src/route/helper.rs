@@ -291,7 +291,13 @@ async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, s
         accepted = listener.accept() => accepted.context("accepting the helper's connection")?.0,
         status = child.wait() => {
             let status = status.with_context(|| format!("waiting for {}", program.display()))?;
-            bail!("{} exited before the root helper started ({status})", program.display());
+            // sudo's own prompt may have gone unanswered: no terminal, or an agent running route.
+            let hint = if program.file_name() == Some(OsStr::new("sudo")) {
+                "; if it asked for a password nobody could type, `sshunnel sudoers` prints the setup that skips it"
+            } else {
+                ""
+            };
+            bail!("{} exited before the root helper started ({status}){hint}", program.display());
         }
     };
 
@@ -1075,6 +1081,36 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("sudo") && error.contains("exit status: 1"), "{error}");
         assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0, "the socket dir is left behind");
+    }
+
+    #[tokio::test]
+    async fn a_declined_sudo_points_at_sudoers() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        let sudo = shim_dir(root.path(), &[("sudo", "echo 'sudo: a password is required' >&2\nexit 1")]).unwrap().join("sudo");
+
+        let Err(error) = Helper::start_with(&setup(), &runtime, |socket| command_with(sudo.as_os_str(), Path::new("sshunnel"), socket, 1000)).await else {
+            panic!("a declined sudo started the helper");
+        };
+
+        let error = format!("{error:#}");
+        assert!(error.contains("`sshunnel sudoers` prints the setup that skips it"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_helper_started_as_root_never_points_at_sudoers() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        // Already root, `route` starts the helper itself, and no sudoers line would change a thing.
+        let helper = shim_dir(root.path(), &[("sshunnel", "exit 1")]).unwrap().join("sshunnel");
+
+        let Err(error) = Helper::start_with(&setup(), &runtime, |socket| command_with(OsStr::new("sudo"), &helper, socket, 0)).await else {
+            panic!("a helper that exits started");
+        };
+
+        let error = format!("{error:#}");
+        assert!(error.contains("exited before the root helper started"), "{error}");
+        assert!(!error.contains("sudoers"), "{error}");
     }
 
     #[tokio::test]

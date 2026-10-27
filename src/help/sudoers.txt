@@ -1,0 +1,11 @@
+The output is a short shell script for a person to read and then run: sshunnel itself changes
+nothing. It installs sshunnel where only root can write (a step it skips when this binary already
+is), then adds a sudoers line that lets you start route's root helper, and nothing else, without
+a password. Its last line says whether sudo asks for that password right now.
+
+Whoever can write the binary a NOPASSWD line names is root, so sshunnel never prints a line for a
+binary anyone but root can write. The line lets anything running as you start the helper, so it
+grants exactly what route can do: route any range but the default route through sshunnel0, keep
+addresses inside those ranges on their current route, and send the patterns' DNS queries to
+sshunnel while the device exists. That applies to every user's traffic and lookups on this
+machine, and the traffic goes to a process running as you.

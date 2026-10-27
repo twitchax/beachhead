@@ -68,6 +68,10 @@ enum Command {
         #[arg(value_name = "TARGET", required = true)]
         targets: Vec<String>,
     },
+    /// Print the one-time setup that lets route start without a sudo password (Linux).
+    #[cfg(target_os = "linux")]
+    #[command(after_long_help = include_str!("help/sudoers.txt"))]
+    Sudoers,
     /// The root helper `route` starts through sudo: it sets up sshunnel0 for the client listening on PATH.
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
@@ -148,6 +152,11 @@ fn run(cli: Cli) -> Void {
                 return check_route(&options, &ssh, &destination, &relays);
             }
             runtime()?.block_on(route::run(&options, &ssh, &destination, &relays))
+        }
+        #[cfg(target_os = "linux")]
+        Command::Sudoers => {
+            print!("{}", runtime()?.block_on(route::sudoers::run())?);
+            Ok(())
         }
         #[cfg(target_os = "linux")]
         Command::Helper { socket } => {

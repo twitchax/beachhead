@@ -16,11 +16,15 @@ why the version moved the way it did.
   reported at once, without changing anything, with exit 1 on any problem. Whether sudo prompts
   comes from running the root helper through `sudo -n -k`, which exits as soon as the check hangs
   up.
-- `sshunnel`: `route::check` and `route::helper::{probe_sudo, Sudo}`.
+- `sshunnel sudoers` (Linux) prints the one-time setup that lets `route` start without a sudo
+  password, for this user and binary, and whether sudo prompts right now. It never names a binary
+  anyone but root can write.
+- `sshunnel`: `route::check`, `route::sudoers` and `route::helper::{probe_sudo, Sudo}`.
 
 ### Changed
 
 - `forward` exits 0 on SIGINT or SIGTERM, as `route` does, instead of dying by the signal.
+- When sudo exits before the root helper starts, `route`'s error points at `sshunnel sudoers`.
 
 ## [0.2.1] - 2026-10-25
 

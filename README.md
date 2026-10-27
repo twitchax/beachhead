@@ -214,17 +214,25 @@ Options:
 `sudo` (or directly, when already root) that creates `sshunnel0`, adds its addresses and routes, and
 configures systemd-resolved for it, then hands the device back and waits for `route` to exit. The
 helper trusts nothing it is sent: it re-checks every target as root and does a fixed set of things
-to its own device. To skip the password prompt, install sshunnel where only root can write, check
-that, and allow the helper alone:
-
-```bash
-sudo install -o root -g root -m 0755 "$(command -v sshunnel)" /usr/local/bin/sshunnel
-namei -l /usr/local/bin/sshunnel          # every line root-owned and writable by root alone
-sudo visudo -f /etc/sudoers.d/sshunnel    # add the line below, with your user name
-```
+to its own device. To skip the password prompt, run `sshunnel sudoers` and follow what it prints:
 
 ```text
-me ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *
+$ sshunnel sudoers
+# route starts a root helper through sudo. Run this once, as yourself, to let it start without a
+# password. Read it first: sudo runs whatever is at the path the sudoers line names.
+
+# 1. Install sshunnel where only root can write.
+sudo install -o root -g root -m 0755 /home/me/.cargo/bin/sshunnel /usr/local/bin/sshunnel
+
+# 2. Allow the helper, and nothing else, without a password. visudo checks the line first.
+f=$(mktemp) &&
+  printf '%s\n' 'me ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *' > "$f" &&
+  sudo visudo -cf "$f" && sudo install -o root -g root -m 0440 "$f" /etc/sudoers.d/sshunnel
+rm -f "$f"
+
+# 3. Run route as /usr/local/bin/sshunnel: a copy earlier on PATH (~/.cargo/bin, say) still prompts.
+
+# Right now, sudo asks for a password to start the helper.
 ```
 
 `route` asks sudo for the helper by its own real path (symlinks resolved), so that is the path the
