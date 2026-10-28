@@ -71,7 +71,8 @@ name), re-parses the targets and re-runs every refusal as root against its own r
 honors only pins inside a route and works out their gateways itself, decides whether fake v6 is on
 (it tries the device's v6 address) and reports it in `Ready`, runs iproute2 and
 resolvectl from a fixed `PATH`, and at teardown deletes the device itself while its fd still holds
-it (any fd's holder can make the device persistent, so the last fd closing proves nothing). It and
+it (any fd's holder can make the device persistent, so the last fd closing proves nothing). It
+exits `FAILED` (3) on any error, so a probe can tell it from sudo's own 1. It and
 `route::system` (the system calls behind it) are Linux only. In product code, the two TUN ioctls
 (`route::system`: creating the device, clearing its persist flag), registering the device's fd with
 tokio (`route::device`; tokio offers no safe way) and the relay's `getaddrinfo` and `setrlimit` are

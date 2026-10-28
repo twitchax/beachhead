@@ -123,7 +123,18 @@ fn main() -> ExitCode {
         .with_ansi(std::io::stderr().is_terminal())
         .init();
 
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    // The helper's own status tells the client that it, and not sudo, failed.
+    #[cfg(target_os = "linux")]
+    let failure = if matches!(cli.command, Command::Helper { .. }) {
+        ExitCode::from(route::helper::FAILED)
+    } else {
+        ExitCode::FAILURE
+    };
+    #[cfg(not(target_os = "linux"))]
+    let failure = ExitCode::FAILURE;
+
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         // `{:#}` prints the whole context chain on one line.
         Err(e) => {
@@ -131,10 +142,10 @@ fn main() -> ExitCode {
             // error the helper sent it.
             #[cfg(target_os = "linux")]
             if e.is::<sshunnel::route::helper::Reported>() {
-                return ExitCode::FAILURE;
+                return failure;
             }
             eprintln!("error: {e:#}");
-            ExitCode::FAILURE
+            failure
         }
     }
 }

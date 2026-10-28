@@ -7,6 +7,12 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Fixed
+
+- `route --check` and `sshunnel sudoers` no longer report a root helper that failed, or a sudo
+  that exited for another reason, as sudo asking for a password; the helper exits with status 3
+  on any error.
+
 ### Changed
 
 - `sshunnel sudoers` writes its line for your uid (`#1000`), with your name in a comment above it,

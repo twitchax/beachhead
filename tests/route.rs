@@ -761,3 +761,19 @@ async fn e2e_route_warns_when_another_rule_wins() {
     assert!(stderr.contains(&format!("10.99.0.0/16 goes through {}, not sshunnel0", RemoteNs::LINK)), "{stderr}");
     stop(route).await;
 }
+
+#[test]
+fn e2e_helper_failed_exits_with_its_own_status() {
+    let dir = TempDir::new().unwrap();
+
+    let status = StdCommand::new(env!("CARGO_BIN_EXE_sshunnel"))
+        .args(["helper", "--socket"])
+        .arg(dir.path().join("missing.sock"))
+        .env_remove("SUDO_UID")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+
+    assert_eq!(status.code(), Some(i32::from(sshunnel::route::helper::FAILED)));
+}

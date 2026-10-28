@@ -24,7 +24,7 @@ use std::{
         unix::fs::DirBuilderExt as _,
     },
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -102,16 +102,9 @@ impl Helper {
 
     /// [`Self::start`] with the socket's parent dir and the command line chosen by the caller.
     pub(crate) async fn start_with(setup: &Setup, base: &Path, command_line: impl FnOnce(&Path) -> Vec<OsString>) -> Res<Self> {
-        let dir = SocketDir::create(base)?;
-        let socket = dir.0.join("helper.sock");
-        let listener = UnixListener::bind(&socket).with_context(|| format!("listening on {}", socket.display()))?;
+        let Launched { dir, listener, program, mut child } = launch(base, command_line, Stdio::inherit())?;
 
-        let line = command_line(&socket);
-        let (program, args) = line.split_first().context("the helper command is empty")?;
-        let program = Path::new(program);
-        let mut child = helper_process(program, args).spawn().with_context(|| format!("starting {}", program.display()))?;
-
-        let handshake = handshake(&listener, &mut child, program, setup).await;
+        let handshake = handshake(&listener, &mut child, &program, setup).await;
         // The path is done with either way: the helper connected, or now can't.
         drop((listener, dir));
         match handshake {
@@ -196,7 +189,8 @@ pub enum Sudo {
     AlreadyRoot,
     /// sudo starts the helper without asking.
     NoPrompt,
-    /// sudo wouldn't start the helper without asking: for a password, or by refusing.
+    /// sudo itself wouldn't start the helper without asking (it exited 1): for a password, or by
+    /// refusing.
     Prompts,
 }
 
@@ -212,7 +206,8 @@ pub(crate) const PROBE_WITHIN: Duration = Duration::from_secs(10);
 ///
 /// # Errors
 ///
-/// Fails when sudo can't be started or doesn't answer within 10 s, or when what connects isn't
+/// Fails when sudo can't be started or doesn't answer within 10 s, when it or the helper exits
+/// any way but sudo's own 1 (the helper's failures exit [`FAILED`]), or when what connects isn't
 /// root.
 pub async fn probe_sudo() -> Res<Sudo> {
     let exe = std::env::current_exe().context("locating sshunnel's own executable")?;
@@ -229,28 +224,29 @@ pub(crate) async fn probe_sudo_for(exe: &Path) -> Res<Sudo> {
 
 /// [`probe_sudo`] with the socket's parent dir, the command line and the wait chosen by the caller.
 pub(crate) async fn probe_with(base: &Path, command_line: impl FnOnce(&Path) -> Vec<OsString>, within: Duration) -> Res<Sudo> {
-    let dir = SocketDir::create(base)?;
-    let socket = dir.0.join("helper.sock");
-    let listener = UnixListener::bind(&socket).with_context(|| format!("listening on {}", socket.display()))?;
-
-    let line = command_line(&socket);
-    let (program, args) = line.split_first().context("the probe's command is empty")?;
-    let program = Path::new(program);
     // Nothing of sudo's reaches the terminal: a refusal is the answer, not an error to show.
-    let mut child = helper_process(program, args).stderr(Stdio::null()).spawn().with_context(|| format!("starting {}", program.display()))?;
+    let Launched { dir, listener, program, mut child } = launch(base, command_line, Stdio::null())?;
+    let program = program.as_path();
 
     let answer = timeout(within, async {
         tokio::select! {
             biased;
-            accepted = listener.accept() => Ok(Some(accepted.context("accepting the helper's connection")?.0)),
-            status = child.wait() => status.map(|_| None).with_context(|| format!("waiting for {}", program.display())),
+            accepted = listener.accept() => Ok(Answer::Connected(accepted.context("accepting the helper's connection")?.0)),
+            status = child.wait() => status.map(Answer::Exited).with_context(|| format!("waiting for {}", program.display())),
         }
     })
     .await;
     // On a timeout sudo is left to finish, as `start_with` leaves it: the socket dir goes with this
     // return, so a helper that starts late can't connect and exits.
-    let Some(conn) = answer.map_err(|_| anyhow!("{} didn't answer within {} s", program.display(), within.as_secs_f64()))?? else {
-        return Ok(Sudo::Prompts);
+    let answer = answer.map_err(|_| anyhow!("{} didn't answer within {} s", program.display(), within.as_secs_f64()))??;
+    let conn = match answer {
+        Answer::Connected(conn) => conn,
+        // Only sudo's own 1 is a prompt or a refusal: the helper's failures exit `FAILED`.
+        Answer::Exited(status) => match status.code() {
+            Some(1) => return Ok(Sudo::Prompts),
+            Some(code) if code == i32::from(FAILED) => bail!("the root helper failed before it connected ({status})"),
+            _ => bail!("{} exited with {status} before the root helper connected", program.display()),
+        },
     };
 
     let root = root_peer(&conn);
@@ -261,6 +257,12 @@ pub(crate) async fn probe_with(base: &Path, command_line: impl FnOnce(&Path) -> 
         tracing::warn!("{} is still running {} s after the probe hung up on the root helper", program.display(), within.as_secs_f64());
     }
     root.map(|()| Sudo::NoPrompt)
+}
+
+/// How the probe's wait ended.
+enum Answer {
+    Connected(UnixStream),
+    Exited(ExitStatus),
 }
 
 /// The command line that probes sudo with the helper on `socket`: [`command`]'s, through
@@ -283,6 +285,32 @@ fn helper_process(program: &Path, args: &[OsString]) -> Command {
     process
 }
 
+/// The status the helper exits with on any error. It is not 1, which is what sudo exits with when
+/// it refuses, or would ask for a password under `-n`, so the client can tell the two apart.
+pub const FAILED: u8 = 3;
+
+/// A helper process on its way to connecting to the socket in `dir`.
+struct Launched {
+    dir: SocketDir,
+    listener: UnixListener,
+    program: PathBuf,
+    child: Child,
+}
+
+/// Binds `helper.sock` in a fresh dir under `base` and spawns the command line that connects to it,
+/// with `stderr` as the process's.
+fn launch(base: &Path, command_line: impl FnOnce(&Path) -> Vec<OsString>, stderr: Stdio) -> Res<Launched> {
+    let dir = SocketDir::create(base)?;
+    let socket = dir.0.join("helper.sock");
+    let listener = UnixListener::bind(&socket).with_context(|| format!("listening on {}", socket.display()))?;
+
+    let line = command_line(&socket);
+    let (program, args) = line.split_first().context("the helper command is empty")?;
+    let program = PathBuf::from(program);
+    let child = helper_process(&program, args).stderr(stderr).spawn().with_context(|| format!("starting {}", program.display()))?;
+    Ok(Launched { dir, listener, program, child })
+}
+
 /// What a `Ready` reply carries besides the fd.
 struct Ready {
     warnings: Vec<String>,
@@ -296,8 +324,9 @@ async fn handshake(listener: &UnixListener, child: &mut Child, program: &Path, s
         accepted = listener.accept() => accepted.context("accepting the helper's connection")?.0,
         status = child.wait() => {
             let status = status.with_context(|| format!("waiting for {}", program.display()))?;
+            ensure!(status.code() != Some(i32::from(FAILED)), "the root helper failed before it connected ({status})");
             // sudo's own prompt may have gone unanswered: no terminal, or an agent running route.
-            let hint = if program.file_name() == Some(OsStr::new("sudo")) {
+            let hint = if program.file_name() == Some(OsStr::new("sudo")) && status.code() == Some(1) {
                 "; if it asked for a password nobody could type, `sshunnel sudoers` prints the setup that skips it"
             } else {
                 ""
@@ -1011,6 +1040,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sudo_probe_reports_a_helper_that_failed_before_connecting() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        let sudo = shim_dir(root.path(), &[("sudo", "exit 3")]).unwrap().join("sudo");
+
+        let error = probe_with(&runtime, probing(&sudo), PROBE_WITHIN).await.unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("the root helper failed before it connected"), "{error}");
+        assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0, "the socket dir is left behind");
+    }
+
+    #[tokio::test]
+    async fn sudo_probe_reports_another_sudo_exit_status() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        for code in [7, 137] {
+            let sudo = shim_dir(root.path(), &[("sudo", &format!("exit {code}"))]).unwrap().join("sudo");
+
+            let error = probe_with(&runtime, probing(&sudo), PROBE_WITHIN).await.unwrap_err();
+
+            let error = format!("{error:#}");
+            assert!(error.contains(&format!("exit status: {code}")) && error.contains("before the root helper connected"), "{error}");
+        }
+    }
+
+    #[tokio::test]
     async fn sudo_probe_fails_on_a_missing_sudo() {
         let root = TempDir::new().unwrap();
         let runtime = runtime_in(&root);
@@ -1115,6 +1171,21 @@ mod tests {
 
         let error = format!("{error:#}");
         assert!(error.contains("exited before the root helper started"), "{error}");
+        assert!(!error.contains("sudoers"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn route_start_reports_helper_failed_before_connecting() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        let sudo = shim_dir(root.path(), &[("sudo", "exit 3")]).unwrap().join("sudo");
+
+        let Err(error) = Helper::start_with(&setup(), &runtime, |socket| command_with(sudo.as_os_str(), Path::new("sshunnel"), socket, 1000)).await else {
+            panic!("a helper that failed started");
+        };
+
+        let error = format!("{error:#}");
+        assert!(error.contains("the root helper failed before it connected"), "{error}");
         assert!(!error.contains("sudoers"), "{error}");
     }
 
