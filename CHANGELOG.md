@@ -7,6 +7,12 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-28
+
+The follow-ups 0.2.2's reviews deferred, and a `sudoers` line keyed on the uid. A patch rather than
+a minor version because the public API only gains items, so code built against 0.2.2 builds
+unchanged.
+
 ### Added
 
 - `sshunnel::route::helper::FAILED`, the status the root helper exits with on any error, and
