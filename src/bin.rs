@@ -151,12 +151,16 @@ fn main() -> ExitCode {
 }
 
 /// The command line as a completion script should see it: `clap_complete` lists hidden subcommands
-/// too, and `Command` can't drop one, so the visible ones go into a fresh root. The root has no
-/// arguments of its own beyond the `--help` and `--version` clap adds.
+/// too, and `Command` can't drop one, so a fresh root takes the real one's name, version and
+/// arguments, and only its visible subcommands.
 fn completable() -> clap::Command {
     let cli = Cli::command();
     let visible: Vec<clap::Command> = cli.get_subcommands().filter(|sub| !sub.is_hide_set()).cloned().collect();
-    clap::Command::new("sshunnel").version(env!("CARGO_PKG_VERSION")).subcommands(visible)
+    let mut root = clap::Command::new(cli.get_name().to_owned()).args(cli.get_arguments().cloned()).subcommands(visible);
+    if let Some(version) = cli.get_version() {
+        root = root.version(version.to_owned());
+    }
+    root
 }
 
 fn run(cli: Cli) -> Void {
@@ -279,7 +283,7 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
         }
     }
     let mut stop = StopSignal::new()?;
-    eprintln!("{}", ready_line(std::process::id()));
+    stop.ready();
     tokio::select! {
         closed = session.closed() => {
             closed?;
@@ -290,15 +294,13 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
     }
 }
 
-/// Ctrl-C and, on unix, SIGTERM. Registered when built, not when first awaited, so building it
-/// before the ready line means a signal sent on seeing that line is already caught.
-#[cfg(unix)]
+/// SIGINT and SIGTERM. Registered when built, not when first awaited, and holding one is the only
+/// way to print the ready line, so a signal sent on seeing that line is already caught.
 struct StopSignal {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
 }
 
-#[cfg(unix)]
 impl StopSignal {
     fn new() -> Res<Self> {
         use tokio::signal::unix::{SignalKind, signal};
@@ -309,6 +311,12 @@ impl StopSignal {
         })
     }
 
+    fn ready(&self) {
+        // Taking `self` is the point: the line can't print before the handlers are registered.
+        let Self { .. } = self;
+        eprintln!("{}", ready_line(std::process::id()));
+    }
+
     async fn recv(&mut self) {
         tokio::select! {
             _ = self.interrupt.recv() => {}
@@ -317,17 +325,25 @@ impl StopSignal {
     }
 }
 
-#[cfg(not(unix))]
-struct StopSignal;
+#[cfg(test)]
+mod tests {
+    use clap::Arg;
 
-#[cfg(not(unix))]
-impl StopSignal {
-    #[expect(clippy::unnecessary_wraps, reason = "the unix constructor registers handlers and can fail")]
-    fn new() -> Res<Self> {
-        Ok(Self)
-    }
+    use super::*;
 
-    async fn recv(&mut self) {
-        let _ = tokio::signal::ctrl_c().await;
+    /// A drift guard: the completable root carries what the real one does, so a root argument
+    /// added to `Cli` reaches the completion scripts.
+    #[test]
+    fn completable_carries_the_clis_name_version_and_arguments() {
+        let cli = Cli::command();
+        let root = completable();
+
+        assert_eq!(root.get_name(), cli.get_name());
+        assert_eq!(root.get_version(), cli.get_version());
+        assert!(root.get_arguments().map(Arg::get_id).eq(cli.get_arguments().map(Arg::get_id)));
+        let visible: Vec<&str> = cli.get_subcommands().filter(|sub| !sub.is_hide_set()).map(clap::Command::get_name).collect();
+        let offered: Vec<&str> = root.get_subcommands().map(clap::Command::get_name).collect();
+        assert_eq!(offered, visible);
+        assert!(!offered.contains(&"helper"));
     }
 }

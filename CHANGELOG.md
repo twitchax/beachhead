@@ -16,11 +16,14 @@ why the version moved the way it did.
 - `route --check` warns, rather than fails, when its binary was replaced while it ran.
 - Multi-line details stay under their check.
 - `route --check`'s help gives its exit status on a signal.
+- On macOS, the guide no longer points at `route` and `sudoers`.
+- The resolver refusal names `resolve` on the `hosts:` line, as the check reads it.
 
 ### Changed
 
 - `sshunnel sudoers` writes its line for your uid (`#1000`), with your name in a comment above it,
   so it no longer refuses a login like `ALL`, a `+netgroup` or an all-caps name.
+- Building on Windows fails with a message that sshunnel builds for Linux and macOS.
 
 ## [0.2.2] - 2026-10-27
 

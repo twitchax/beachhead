@@ -127,7 +127,7 @@ fn checked(targets: &Targets, snapshot: &Snapshot, ipv6: bool, resolved_usable: 
     if targets.has_names() && !resolved_usable()? {
         found.refusals.push(
             "domain patterns need systemd-resolved, and the system resolver doesn't go through it here \
-             (/etc/resolv.conf points elsewhere and nss-resolve isn't in /etc/nsswitch.conf, or resolved isn't running); \
+             (/etc/resolv.conf points elsewhere and `resolve` isn't on the hosts: line of /etc/nsswitch.conf, or resolved isn't running); \
              route CIDRs only, or switch the resolver to systemd-resolved"
                 .to_owned(),
         );
@@ -372,6 +372,17 @@ mod tests {
 
         assert!(error.contains("'10.99.7.0/24' is inside the connected subnet 10.99.0.0/16"), "{error}");
         assert!(error.contains("systemd-resolved"), "{error}");
+    }
+
+    #[test]
+    fn resolver_refusal_names_resolve_on_the_hosts_line() {
+        let error = checked(&targets(&["*.corp.example"], &[]), &Snapshot::default(), true, || Ok(false)).unwrap_err().to_string();
+
+        assert!(
+            error.contains("(/etc/resolv.conf points elsewhere and `resolve` isn't on the hosts: line of /etc/nsswitch.conf, or resolved isn't running)"),
+            "{error}"
+        );
+        assert!(!error.contains("nss-resolve"), "{error}");
     }
 
     #[test]

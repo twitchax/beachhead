@@ -423,7 +423,7 @@ fn upstreams(resolv_conf: &str) -> Vec<IpAddr> {
 }
 
 /// Whether the system resolver goes through resolved: resolv.conf points at its stub, or
-/// `nss-resolve` is on the `hosts:` line.
+/// `resolve` is on the `hosts:` line.
 fn resolver_wired(resolv_conf: &str, nsswitch: &str) -> bool {
     let stub = nameservers(resolv_conf).any(|server| server == RESOLVED_STUB);
     let nss = nsswitch

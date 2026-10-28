@@ -41,5 +41,5 @@ Files and environment:
   SSHUNNEL_RELAY_DIR             relays to push instead of the built-in ones, as --relay-dir does
   RUST_LOG                       what to log to stderr (default: warn)
 
-More: `sshunnel help <command>` for route, forward, sudoers and completions, and the README at
-https://github.com/twitchax/sshunnel
+More: `sshunnel help <command>` for forward and completions, and on Linux for route and sudoers;
+and the README at https://github.com/twitchax/sshunnel

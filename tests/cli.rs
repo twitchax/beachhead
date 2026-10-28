@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -39,20 +39,42 @@ fn subcommands() -> Vec<&'static str> {
     commands
 }
 
+/// How a shell's completion script offers the command `name`, as `clap_complete` writes it.
+fn candidate(shell: &str, name: &str) -> String {
+    match shell {
+        "bash" => format!("sshunnel,{name})"),
+        "elvish" => format!("cand {name} "),
+        "fish" => format!("-a \"{name}\""),
+        "powershell" => format!("CompletionResult]::new('{name}'"),
+        "zsh" => format!("'{name}:"),
+        other => panic!("no candidate syntax for {other}"),
+    }
+}
+
 #[test]
-fn e2e_completions_cover_route_and_forward_not_helper() {
-    for shell in ["bash", "zsh", "fish"] {
+fn e2e_completions_offer_every_visible_command_and_never_helper() {
+    for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
         let out = run(&["completions", shell]);
         assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
         let script = String::from_utf8(out.stdout).unwrap();
-        for name in ["forward", "relays"] {
-            assert!(script.contains(name), "{shell} completes {name}");
-        }
+        let mut names = vec!["forward", "relays", "completions"];
         if cfg!(target_os = "linux") {
-            assert!(script.contains("route"), "{shell} completes route");
+            names.extend(["route", "sudoers"]);
         }
-        assert!(!script.contains("helper"), "{shell} must not complete the hidden helper");
+        for name in names {
+            let want = candidate(shell, name);
+            assert!(script.contains(&want), "{shell} offers {name} as {want:?}:\n{script}");
+        }
+        let hidden = candidate(shell, "helper");
+        assert!(!script.contains(&hidden), "{shell} must not offer the hidden helper as {hidden:?}");
     }
+}
+
+#[test]
+fn e2e_help_guide_names_route_and_sudoers_as_linux_only() {
+    let guide = stdout(&["help"]);
+    let more = "More: `sshunnel help <command>` for forward and completions, and on Linux for route and sudoers;";
+    assert!(guide.contains(more), "the guide's More line:\n{guide}");
 }
 
 #[test]
@@ -165,23 +187,31 @@ fn help_troubleshooting_quotes_messages_the_code_prints() {
     assert!(!quoted.is_empty(), "Troubleshooting quotes no messages");
 
     let mut sources = Vec::new();
-    rust_sources(&src, &src.join("help"), &mut sources);
+    rust_sources(&src, &[src.join("help"), src.join("tests")], &mut sources);
     for message in quoted {
         assert!(sources.iter().any(|source| source.contains(message)), "no file under src/ prints {message:?}");
     }
 }
 
-/// Every `.rs` file under `dir`, read, except those under `skip`.
-fn rust_sources(dir: &Path, skip: &Path, out: &mut Vec<String>) {
+/// The product code of every `.rs` file under `dir`, except those under any of `skip`: each file up to its
+/// first `#[cfg(test)]`, without comment lines, so a message only a test or a comment mentions
+/// doesn't count as printed.
+fn rust_sources(dir: &Path, skip: &[PathBuf], out: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
-        if path.starts_with(skip) {
+        if skip.iter().any(|skipped| path.starts_with(skipped)) {
             continue;
         }
         if path.is_dir() {
             rust_sources(&path, skip, out);
         } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(std::fs::read_to_string(&path).unwrap());
+            let source = std::fs::read_to_string(&path).unwrap();
+            let product: Vec<&str> = source
+                .lines()
+                .take_while(|line| line.trim() != "#[cfg(test)]")
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect();
+            out.push(product.join("\n"));
         }
     }
 }

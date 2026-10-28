@@ -5,6 +5,9 @@
 //! one session. [`tunnel::Tunnel`] is the seam between that transport and its users; [`forward`]
 //! turns local TCP listeners into streams through it.
 
+#[cfg(not(unix))]
+compile_error!("sshunnel builds for Linux and macOS");
+
 pub mod arch;
 pub mod base;
 pub mod bootstrap;
