@@ -279,6 +279,8 @@ async fn e2e_sudoers_stops_on_a_signal_and_removes_its_socket_dir() {
     let mut stderr = String::new();
     tokio::io::AsyncReadExt::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).await.unwrap();
     assert_eq!(early.code(), Some(1), "{stderr}");
+    let refuses_before_probing = geteuid().is_root() || !root_only(Path::new(INSTALL_DIR)).unwrap();
+    assert!(refuses_before_probing, "sudoers exited before probing sudo on a host where it should have probed: {stderr}");
     let refusal = if geteuid().is_root() {
         "error: run `sshunnel sudoers` as the user who will run route"
     } else {

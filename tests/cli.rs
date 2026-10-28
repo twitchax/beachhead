@@ -104,10 +104,16 @@ fn e2e_help_route_covers_targets_privileges_and_troubleshooting() {
 #[test]
 fn e2e_help_route_states_the_check_exit_status() {
     let help = stdout(&["help", "route"]);
-    let after_sample = help.lines().skip_while(|line| *line != "    sshunnel: route can start").nth(1);
+    // The paragraph after the sample, unwrapped.
+    let after_sample: Vec<&str> = help
+        .lines()
+        .skip_while(|line| *line != "    sshunnel: route can start")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .collect();
     assert_eq!(
-        after_sample,
-        Some("  --check exits 1 if a check fails or a signal stops it, 0 otherwise. A sudo warn means route will"),
+        after_sample.join(" ").split_whitespace().collect::<Vec<_>>().join(" "),
+        "--check exits 1 if a check fails or a signal stops it, 0 otherwise. A sudo warn means route will ask for a password.",
         "{help}"
     );
 }
