@@ -19,7 +19,7 @@ env:
 
 jobs:
   ci:
-    # Literally the local gate: `cargo make ci` (fmt-check, clippy -D warnings, nextest).
+    # Literally the local gate: `cargo make ci` (fmt-check, clippy -D warnings, rustdoc -D warnings, nextest).
     name: CI gate
     runs-on: ubuntu-latest
     steps:

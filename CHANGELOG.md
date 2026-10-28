@@ -7,6 +7,12 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Added
+
+- `sshunnel::route::helper::FAILED`, the status the root helper exits with on any error, and
+  `sshunnel::route::sudoers::Replaced`, the error `sshunnel sudoers` fails with when its binary was
+  replaced or removed while it ran.
+
 ### Fixed
 
 - `route --check` and `sshunnel sudoers` no longer report a root helper that failed, or a sudo

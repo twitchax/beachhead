@@ -39,9 +39,9 @@ A workspace of three product crates plus `xtask`. The design and its reasons liv
   lifecycle's preflight, the device, a `sudo -n -k` probe of the helper, ssh and ping, changing
   nothing), and `sudoers` (`sshunnel sudoers`: the `NOPASSWD` setup as a script for a person to
   run, its line for the user's uid and naming only a binary that it and every directory above it
-  leave to root alone). When
-  sudo prompts for this binary, both also probe the root-only copy in `/usr/local/bin`
-  (`sudoers::ask`), so neither sends someone back to a setup that's already done for that copy.
+  leave to root alone). When sudo prompts for this binary, both also probe the root-only copy in
+  `/usr/local/bin` (`sudoers::ask`), so neither sends someone back to a setup that's already done
+  for that copy.
 - `crates/sshunnel-mux`: the wire protocol and multiplexer both ends share. Its `base` holds the
   error aliases every crate re-exports.
 - `crates/sshunnel-relay`: the remote binary, pushed over SSH as a static musl build. Every
@@ -69,11 +69,11 @@ and with a `NOPASSWD` sudoers line anything running as the user can too, so it t
 client sends: it connects only to a socket that user owns (checked through an `O_PATH` fd, never by
 name), re-parses the targets and re-runs every refusal as root against its own route snapshot,
 honors only pins inside a route and works out their gateways itself, decides whether fake v6 is on
-(it tries the device's v6 address) and reports it in `Ready`, runs iproute2 and
-resolvectl from a fixed `PATH`, and at teardown deletes the device itself while its fd still holds
-it (any fd's holder can make the device persistent, so the last fd closing proves nothing). It
-exits `FAILED` (3) on any error, so a probe can tell it from sudo's own 1. It and
-`route::system` (the system calls behind it) are Linux only. In product code, the two TUN ioctls
+(it tries the device's v6 address) and reports it in `Ready`, runs iproute2 and resolvectl from a
+fixed `PATH`, and at teardown deletes the device itself while its fd still holds it (any fd's
+holder can make the device persistent, so the last fd closing proves nothing). It exits `FAILED`
+(3) on any error, so a probe can tell it from sudo's own 1. It and `route::system` (the system
+calls behind it) are Linux only. In product code, the two TUN ioctls
 (`route::system`: creating the device, clearing its persist flag), registering the device's fd with
 tokio (`route::device`; tokio offers no safe way) and the relay's `getaddrinfo` and `setrlimit` are
 the only `unsafe`, each block with a `// SAFETY:` comment.

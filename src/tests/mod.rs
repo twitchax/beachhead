@@ -53,7 +53,7 @@ pub use tunnel::{FakeConn, FakeFlow, FakeTunnel, Gate, NoFlow};
 /// A stand-in for a remote machine: a fake `ssh` that ignores its options and destination and runs
 /// the remote command here, through a chosen login shell, with `HOME` and every cache candidate
 /// except `/dev/shm` inside `root`. That covers push, exec and cache with no sshd. The builders give
-/// the remote side namespaces of its own: a network ([`Self::in_netns`]) or an `/etc/hosts`
+/// the remote side namespaces of its own: a network (`Self::in_netns`) or an `/etc/hosts`
 /// ([`Self::with_hosts`]) or `/etc/resolv.conf` ([`Self::with_resolv_conf`]). Not `Clone`: each
 /// builder rewrites the one fake `ssh` in `root`.
 #[derive(Debug)]

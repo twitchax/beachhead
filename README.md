@@ -304,6 +304,8 @@ Troubleshooting:
       The system's lookups don't go through systemd-resolved. Route CIDRs only, or switch to it.
   "exited before the root helper started"
       sudo asked for a password nobody could type, or refused. See `sshunnel sudoers`.
+  "the root helper failed before it connected"
+      The helper itself hit an error, and its own message is above. Fix what it names and run again.
   "ssh exited before the relay started"
       ssh itself failed, and its own message is above. Try `ssh DESTINATION` on its own.
   "a more specific route or another tool's policy routing wins it"
@@ -565,7 +567,7 @@ Examples:
 ## Development
 
 ```bash
-cargo make ci        # fmt-check + clippy (-D warnings) + nextest: the gate CI runs
+cargo make ci        # fmt-check + clippy (-D warnings) + rustdoc (-D warnings) + nextest: the gate CI runs
 cargo make uat       # ci + the #[ignore]d slow suites
 cargo make codecov   # coverage.lcov
 cargo xtask package  # trimmed relays into relays/, package the workspace, build the packaged client on stable
