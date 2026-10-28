@@ -282,8 +282,7 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
             }
         }
     }
-    let mut stop = StopSignal::new()?;
-    stop.ready();
+    let mut stop = StopSignal::new()?.ready();
     tokio::select! {
         closed = session.closed() => {
             closed?;
@@ -294,8 +293,7 @@ async fn forward(forwards: &[Forward], ssh: &SshCommand, destination: &str, rela
     }
 }
 
-/// SIGINT and SIGTERM. Registered when built, not when first awaited, and holding one is the only
-/// way to print the ready line, so a signal sent on seeing that line is already caught.
+/// SIGINT and SIGTERM. Registered when built, not when first awaited.
 struct StopSignal {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
@@ -311,10 +309,11 @@ impl StopSignal {
         })
     }
 
-    fn ready(&self) {
-        // Taking `self` is the point: the line can't print before the handlers are registered.
-        let Self { .. } = self;
+    /// Prints the ready line, handing the signal back: `forward` prints it only through a
+    /// registered `StopSignal`, so a signal sent on seeing it is already caught.
+    fn ready(self) -> Self {
         eprintln!("{}", ready_line(std::process::id()));
+        self
     }
 
     async fn recv(&mut self) {
