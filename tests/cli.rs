@@ -193,9 +193,9 @@ fn help_troubleshooting_quotes_messages_the_code_prints() {
     }
 }
 
-/// The product code of every `.rs` file under `dir`, except those under any of `skip`: each file up to its
-/// first `#[cfg(test)]`, without comment lines, so a message only a test or a comment mentions
-/// doesn't count as printed.
+/// The product code of every `.rs` file under `dir`, except those under any of `skip`: each file up
+/// to its first `#[cfg(test)]`, without comment lines, so a message only a test or a comment
+/// mentions doesn't count as printed.
 fn rust_sources(dir: &Path, skip: &[PathBuf], out: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();

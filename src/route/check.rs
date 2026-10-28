@@ -59,7 +59,8 @@ impl Display for Finding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { check, status, detail } = self;
         write!(f, "{check:<8} {status}: ")?;
-        // A later line sits under the first one's detail: the check's column, a space, the status, ": ".
+        // A later line sits under the first one's detail: the check's column, a space, the status,
+        // ": ".
         let indent = 8 + 1 + status.to_string().len() + 2;
         let mut lines = detail.split('\n');
         f.write_str(lines.next().unwrap_or_default())?;

@@ -1191,6 +1191,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sudo_that_exits_otherwise_never_points_at_sudoers() {
+        let root = TempDir::new().unwrap();
+        let runtime = runtime_in(&root);
+        // Only sudo's own 1 is a prompt nobody answered; another status isn't the sudoers line's to fix.
+        for code in [2, 7, 137] {
+            let sudo = shim_dir(root.path(), &[("sudo", &format!("exit {code}"))]).unwrap().join("sudo");
+
+            let Err(error) = Helper::start_with(&setup(), &runtime, |socket| command_with(sudo.as_os_str(), Path::new("sshunnel"), socket, 1000)).await else {
+                panic!("a sudo that exits {code} started the helper");
+            };
+
+            let error = format!("{error:#}");
+            assert!(error.contains(&format!("exited before the root helper started (exit status: {code})")), "{error}");
+            assert!(!error.contains("sudoers"), "{error}");
+        }
+    }
+
+    #[tokio::test]
     async fn route_start_reports_helper_failed_before_connecting() {
         let root = TempDir::new().unwrap();
         let runtime = runtime_in(&root);

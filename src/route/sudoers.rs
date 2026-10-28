@@ -4,8 +4,9 @@
 //! sudo runs whatever is at the path a `NOPASSWD` line names, so whoever can write that file, or
 //! any directory above it, is root. The script therefore names only a binary root alone can write
 //! ([`root_only`]), installing this one in [`INSTALL_DIR`] first when it isn't. It refuses a path
-//! with a character sudoers or the shell could misread. The line names the user's uid (`#1000`), which
-//! sudoers can't read as `ALL`, a `+netgroup` or a `User_Alias`, with the login name only as a comment.
+//! with a character sudoers or the shell could misread. The line names the user's uid (`#1000`),
+//! which sudoers can't read as `ALL`, a `+netgroup` or a `User_Alias`, with the login name only as a
+//! comment.
 
 use std::{
     borrow::Cow,
@@ -49,11 +50,16 @@ pub struct Answers {
 /// The setup for the user running this, and for this binary: [`script`] with what it finds, and
 /// sudo's answers from `ask`.
 ///
+/// For its duration it handles SIGINT, SIGTERM and SIGHUP (unless ignored at startup), so a Ctrl-C
+/// stops it rather than the process. The handlers stay installed after it returns.
+///
 /// # Errors
 ///
 /// Fails as root, when neither this binary nor [`INSTALL_DIR`] is [`root_only`] (no line could
-/// safely name either), and when the user's name, this binary's path or sudo's answer can't be had,
-/// or [`script`] refuses them.
+/// safely name either), and when this binary's path or sudo's answer can't be had, or [`script`]
+/// refuses them. A user name it can't get doesn't fail it: the line just goes unlabeled. It fails
+/// with `stopped by a signal` when a signal stops it, and with [`Replaced`] when this binary was
+/// replaced or removed while it ran.
 pub async fn run() -> Res<String> {
     // So a Ctrl-C while sudo is asked drops the probe's socket dir with it.
     helper::stoppable(setup()).await
@@ -67,7 +73,7 @@ async fn setup() -> Res<String> {
         bail!(unsafe_install_dir(&exe, elsewhere_writable()?.as_deref()));
     }
     let answers = ask(&exe, exe_root_only, installed_root_only()?.as_deref(), helper::probe_sudo_for).await?;
-    script(&label_name(), &exe, exe_root_only, answers)
+    script(&label(user_name()), &exe, exe_root_only, answers)
 }
 
 /// [`ask`] about this binary, with the copy in [`INSTALL_DIR`] as this machine has it.
@@ -202,23 +208,21 @@ pub fn user_name() -> Res<String> {
     Ok(String::from_utf8(id.stdout).context("reading id -un's output")?.trim().to_owned())
 }
 
-/// The name that labels the sudoers line, or none when `id -un` fails: the line stands without it.
-fn label_name() -> String {
-    user_name()
-        .inspect_err(|e| tracing::warn!("labeling the sudoers line without the user name: {e:#}"))
-        .unwrap_or_default()
+/// The name that labels the sudoers line, or none when `id -un` failed: the line stands without it.
+fn label(name: Res<String>) -> String {
+    name.inspect_err(|e| tracing::warn!("labeling the sudoers line without the user name: {e:#}")).unwrap_or_default()
 }
 
 /// The setup script for the user running this (labeled `user`) and the binary at `exe`: install it
-/// in [`INSTALL_DIR`] unless `exe_root_only`, allow its helper in a sudoers file, and say what `sudo`
-/// does right now.
+/// in [`INSTALL_DIR`] unless `exe_root_only`, allow its helper in a sudoers file, and say what
+/// `sudo` does right now.
 ///
 /// # Errors
 ///
 /// Fails for [`Sudo::AlreadyRoot`] (the line names the user who runs `route`, never root), for a
-/// relative `exe`, and for an `exe` with anything but `[A-Za-z0-9._/+-]`, which means only itself to
-/// sudoers and to the shell. The line names the user's uid (`#1000`), so no `user` is refused: one
-/// that is empty or has other characters just goes unlabeled.
+/// relative `exe`, and for an `exe` with anything but `[A-Za-z0-9._/+-]`, which means only itself
+/// to sudoers and to the shell. The line names the user's uid (`#1000`), so no `user` is refused:
+/// one that is empty or has other characters just goes unlabeled.
 pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Answers) -> Res<String> {
     let installed = installed_path();
     let now: Cow<str> = match sudo {
@@ -230,8 +234,9 @@ pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Answers) -> Res
         } => format!("sudo starts {installed}'s helper without a password: run route as it").into(),
         Answers { this: Sudo::Prompts, .. } => "sudo asks for a password to start the helper".into(),
     };
-    // The rule names the uid, which sudoers can't read as anything else, so no login name is refused;
-    // the name is only a comment above it, and only when it can't end that comment's line early.
+    // The rule names the uid, which sudoers can't read as anything else, so no login name is
+    // refused; the name is only a comment above it, and only when it can't end that comment's line
+    // early.
     let uid = rustix::process::getuid().as_raw();
     let label = plain("the user name", user).ok().map(|user| format!("'# {user}' ")).unwrap_or_default();
     ensure!(exe.is_absolute(), "sudoers needs a full path, and {} is relative", exe.display());
@@ -351,6 +356,17 @@ mod tests {
     }
 
     #[test]
+    fn sudoers_a_failed_name_lookup_leaves_the_line_unlabeled() {
+        let name = label(Err(anyhow!("id -un failed")));
+        assert_eq!(name, "");
+
+        let script = script(&name, Path::new("/usr/bin/sshunnel"), true, only_this(Sudo::Prompts)).unwrap();
+        assert!(script.contains(&format!("printf '%s\\n' '#{} ALL=(root)", uid())), "{script}");
+        assert!(!script.contains("'# "), "{script}");
+        assert_eq!(label(Ok("me".into())), "me");
+    }
+
+    #[test]
     fn sudoers_visudo_accepts_the_printed_lines() {
         let dir = TempDir::new().unwrap();
         let visudo = |text: &str| {
@@ -358,9 +374,10 @@ mod tests {
             std::fs::write(&file, text).unwrap();
             std::process::Command::new("visudo").arg("-cf").arg(&file).stdin(Stdio::null()).output()
         };
-        let good = visudo(&format!("#{} ALL=(root) NOPASSWD: /usr/bin/true\n", uid()));
+        // Keyed by name, not uid: a visudo that rejects `#uid` must fail this test, not skip it.
+        let good = visudo("root ALL=(ALL) ALL\n");
         if !good.is_ok_and(|out| out.status.success()) {
-            eprintln!("skipped: visudo is missing or rejects a known-good file here");
+            eprintln!("skipped: visudo is missing or can't check a file as this user");
             return;
         }
 
