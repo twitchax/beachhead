@@ -416,7 +416,7 @@ sudo install -o root -g root -m 0755 /home/me/.cargo/bin/sshunnel /usr/local/bin
 
 # 2. Allow the helper, and nothing else, without a password. visudo checks the line first.
 f=$(mktemp) &&
-  printf '%s\n' 'me ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *' > "$f" &&
+  printf '%s\n' '# me' '#1000 ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *' > "$f" &&
   sudo visudo -cf "$f" && sudo install -o root -g root -m 0440 "$f" /etc/sudoers.d/sshunnel
 rm -f "$f"
 

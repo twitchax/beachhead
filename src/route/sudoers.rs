@@ -3,9 +3,9 @@
 //!
 //! sudo runs whatever is at the path a `NOPASSWD` line names, so whoever can write that file, or
 //! any directory above it, is root. The script therefore names only a binary root alone can write
-//! ([`root_only`]), installing this one in [`INSTALL_DIR`] first when it isn't. It refuses a user
-//! name or path with a character sudoers or the shell could misread, and a user name sudoers reads
-//! as something other than that user: `ALL`, a `+netgroup` or a `User_Alias`.
+//! ([`root_only`]), installing this one in [`INSTALL_DIR`] first when it isn't. It refuses a path
+//! with a character sudoers or the shell could misread. The line names the user's uid (`#1000`), which
+//! sudoers can't read as `ALL`, a `+netgroup` or a `User_Alias`, with the login name only as a comment.
 
 use std::{
     borrow::Cow,
@@ -62,7 +62,7 @@ pub async fn run() -> Res<String> {
         bail!(unsafe_install_dir(&exe, elsewhere_writable()?.as_deref()));
     }
     let answers = ask(&exe, exe_root_only, installed_root_only()?.as_deref(), helper::probe_sudo_for).await?;
-    script(&user_name()?, &exe, exe_root_only, answers)
+    script(&label_name(), &exe, exe_root_only, answers)
 }
 
 /// [`ask`] about this binary, with the copy in [`INSTALL_DIR`] as this machine has it.
@@ -174,15 +174,23 @@ pub fn user_name() -> Res<String> {
     Ok(String::from_utf8(id.stdout).context("reading id -un's output")?.trim().to_owned())
 }
 
-/// The setup script for `user` and the binary at `exe`: install it in [`INSTALL_DIR`] unless
-/// `exe_root_only`, allow its helper in a sudoers file, and say what `sudo` does right now.
+/// The name that labels the sudoers line, or none when `id -un` fails: the line stands without it.
+fn label_name() -> String {
+    user_name()
+        .inspect_err(|e| tracing::warn!("labeling the sudoers line without the user name: {e:#}"))
+        .unwrap_or_default()
+}
+
+/// The setup script for the user running this (labeled `user`) and the binary at `exe`: install it
+/// in [`INSTALL_DIR`] unless `exe_root_only`, allow its helper in a sudoers file, and say what `sudo`
+/// does right now.
 ///
 /// # Errors
 ///
 /// Fails for [`Sudo::AlreadyRoot`] (the line names the user who runs `route`, never root), for a
-/// relative `exe`, for a `user` or `exe` with anything but `[A-Za-z0-9._/+-]`, all of which mean
-/// only themselves to sudoers and to the shell, and for a `user` sudoers reads as someone else:
-/// `ALL`, a `+netgroup` or a `User_Alias`.
+/// relative `exe`, and for an `exe` with anything but `[A-Za-z0-9._/+-]`, which means only itself to
+/// sudoers and to the shell. The line names the user's uid (`#1000`), so no `user` is refused: one
+/// that is empty or has other characters just goes unlabeled.
 pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Answers) -> Res<String> {
     let installed = installed_path();
     let now: Cow<str> = match sudo {
@@ -194,10 +202,10 @@ pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Answers) -> Res
         } => format!("sudo starts {installed}'s helper without a password: run route as it").into(),
         Answers { this: Sudo::Prompts, .. } => "sudo asks for a password to start the helper".into(),
     };
-    let user = plain("the user name", user)?;
-    if let Some(read_as) = misread_as(user) {
-        bail!("the user name {user:?} isn't safe in a sudoers line: sudoers would read it as {read_as}, not this user");
-    }
+    // The rule names the uid, which sudoers can't read as anything else, so no login name is refused;
+    // the name is only a comment above it, and only when it can't end that comment's line early.
+    let uid = rustix::process::getuid().as_raw();
+    let label = plain("the user name", user).ok().map(|user| format!("'# {user}' ")).unwrap_or_default();
     ensure!(exe.is_absolute(), "sudoers needs a full path, and {} is relative", exe.display());
     let exe = plain("the path", exe.to_str().with_context(|| format!("{} isn't UTF-8", exe.display()))?)?;
     let named = if exe_root_only { exe } else { &installed };
@@ -209,7 +217,7 @@ pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Answers) -> Res
     steps.push(format!(
         "Allow the helper, and nothing else, without a password. visudo checks the line first.\n\
          f=$(mktemp) &&\n  \
-         printf '%s\\n' '{user} ALL=(root) NOPASSWD: {named} helper --socket *' > \"$f\" &&\n  \
+         printf '%s\\n' {label}'#{uid} ALL=(root) NOPASSWD: {named} helper --socket *' > \"$f\" &&\n  \
          sudo visudo -cf \"$f\" && sudo install -o root -g root -m 0440 \"$f\" /etc/sudoers.d/sshunnel\n\
          rm -f \"$f\""
     ));
@@ -223,23 +231,6 @@ pub fn script(user: &str, exe: &Path, exe_root_only: bool, sudo: Answers) -> Res
     }
     let _ = write!(out, "\n# Right now, {now}.\n");
     Ok(out)
-}
-
-/// What sudoers reads `user` as in a line's first field, when that isn't the user of that name:
-/// the reserved `ALL`, a `+netgroup`, or an alias (`[A-Z][A-Z0-9_]*`), which matches nobody when
-/// undefined.
-fn misread_as(user: &str) -> Option<&'static str> {
-    let mut chars = user.chars();
-    let alias = chars.next().is_some_and(|c| c.is_ascii_uppercase()) && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if user == "ALL" {
-        Some("every user")
-    } else if user.starts_with('+') {
-        Some("a netgroup")
-    } else if alias {
-        Some("a User_Alias")
-    } else {
-        None
-    }
 }
 
 /// `text`, refused when empty or holding anything but `[A-Za-z0-9._/+-]`.
@@ -297,6 +288,56 @@ mod tests {
         script.lines().last().unwrap().to_owned()
     }
 
+    fn uid() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    #[test]
+    fn sudoers_script_names_the_uid_and_labels_it_with_the_name() {
+        let script = script("me", Path::new("/usr/bin/sshunnel"), true, only_this(Sudo::Prompts)).unwrap();
+
+        let line = format!("printf '%s\\n' '# me' '#{} ALL=(root) NOPASSWD: /usr/bin/sshunnel helper --socket *' > \"$f\"", uid());
+        assert!(script.contains(&line), "{script}");
+    }
+
+    #[test]
+    fn sudoers_script_takes_any_login_name() {
+        let uid = uid();
+        for name in ["ALL", "+admins", "ADMIN", "WHEEL_2"] {
+            let script = script(name, Path::new("/usr/bin/sshunnel"), true, only_this(Sudo::Prompts)).unwrap();
+            assert!(script.contains(&format!("'# {name}' '#{uid} ALL=(root)")), "{script}");
+        }
+        for name in ["", "o'brien", "a b"] {
+            let script = script(name, Path::new("/usr/bin/sshunnel"), true, only_this(Sudo::Prompts)).unwrap();
+            assert!(script.contains(&format!("printf '%s\\n' '#{uid} ALL=(root)")), "no label for {name:?}: {script}");
+            assert!(!script.contains("'# "), "{script}");
+        }
+    }
+
+    #[test]
+    fn sudoers_visudo_accepts_the_printed_lines() {
+        let dir = TempDir::new().unwrap();
+        let visudo = |text: &str| {
+            let file = dir.path().join("sudoers");
+            std::fs::write(&file, text).unwrap();
+            std::process::Command::new("visudo").arg("-cf").arg(&file).stdin(Stdio::null()).output()
+        };
+        let good = visudo(&format!("#{} ALL=(root) NOPASSWD: /usr/bin/true\n", uid()));
+        if !good.is_ok_and(|out| out.status.success()) {
+            eprintln!("skipped: visudo is missing or rejects a known-good file here");
+            return;
+        }
+
+        let script = script("me", Path::new("/usr/bin/sshunnel"), true, only_this(Sudo::Prompts)).unwrap();
+        let printf = script.lines().find(|line| line.trim_start().starts_with("printf ")).unwrap();
+        let args = printf.split_once("' ").map(|(_, args)| args).unwrap().split(" > ").next().unwrap();
+        let lines: Vec<&str> = args.split("' '").map(|arg| arg.trim_matches('\'')).collect();
+        assert_eq!(lines.len(), 2, "{printf}");
+
+        let out = visudo(&format!("{}\n", lines.join("\n"))).unwrap();
+        assert!(out.status.success(), "{lines:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
     #[test]
     fn sudoers_script_installs_a_binary_others_can_write() {
         let script = script("me", Path::new("/home/me/.cargo/bin/sshunnel"), false, only_this(Sudo::Prompts)).unwrap();
@@ -311,7 +352,7 @@ sudo install -o root -g root -m 0755 /home/me/.cargo/bin/sshunnel /usr/local/bin
 
 # 2. Allow the helper, and nothing else, without a password. visudo checks the line first.
 f=$(mktemp) &&
-  printf '%s\n' 'me ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *' > "$f" &&
+  printf '%s\n' '# me' '#{uid} ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *' > "$f" &&
   sudo visudo -cf "$f" && sudo install -o root -g root -m 0440 "$f" /etc/sudoers.d/sshunnel
 rm -f "$f"
 
@@ -319,6 +360,7 @@ rm -f "$f"
 
 # Right now, sudo asks for a password to start the helper.
 "#
+            .replace("{uid}", &uid().to_string())
         );
     }
 
@@ -328,27 +370,13 @@ rm -f "$f"
 
         assert!(!script.contains("install -o root -g root -m 0755"), "{script}");
         assert!(script.contains("\n# 1. Allow the helper"), "the steps renumber: {script}");
-        assert!(script.contains("'me ALL=(root) NOPASSWD: /usr/bin/sshunnel helper --socket *'"), "{script}");
+        assert!(script.contains(&format!("'#{} ALL=(root) NOPASSWD: /usr/bin/sshunnel helper --socket *'", uid())), "{script}");
         assert!(!script.contains("Run route as"), "{script}");
         assert_eq!(script.lines().last(), Some("# Right now, sudo starts the helper without a password: this is already set up."));
     }
 
     #[test]
-    fn sudoers_script_refuses_characters_sudoers_would_misread() {
-        let exe = Path::new("/home/me/.cargo/bin/sshunnel");
-        for user in ["a b", "", "me,root", "%sudo", "me\nroot", "me'", "me#"] {
-            let error = script(user, exe, false, only_this(Sudo::Prompts)).unwrap_err().to_string();
-            assert!(error.contains("user name"), "{user:?}: {error}");
-        }
-        // Plain characters, but sudoers reads them as every user, a netgroup and a User_Alias.
-        for (user, read_as) in [("ALL", "every user"), ("+admins", "a netgroup"), ("ADMINS", "a User_Alias"), ("OPS_2", "a User_Alias")] {
-            let error = script(user, exe, false, only_this(Sudo::Prompts)).unwrap_err().to_string();
-            assert!(error.contains("user name") && error.contains(read_as), "{user:?}: {error}");
-        }
-        // Each rule's edge: only a whole name of that shape is something else.
-        for user in ["All", "me+x", "Admins", "A1b", "_ALL"] {
-            assert!(script(user, exe, false, only_this(Sudo::Prompts)).is_ok(), "{user:?}");
-        }
+    fn sudoers_script_refuses_a_path_the_shell_or_sudoers_would_misread() {
         for path in ["/opt/my tools/sshunnel", "/opt/*/sshunnel", "/opt/it's/sshunnel", "/opt/a,b/sshunnel", "/opt/a\\b/sshunnel"] {
             for root_only in [false, true] {
                 let error = script("me", Path::new(path), root_only, only_this(Sudo::Prompts)).unwrap_err().to_string();

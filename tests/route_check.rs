@@ -209,7 +209,9 @@ async fn e2e_sudoers_prints_the_setup() {
         assert!(stdout.contains(&install), "{output}");
         let user = std::process::Command::new("id").arg("-un").output().unwrap();
         let user = String::from_utf8(user.stdout).unwrap();
-        let allowed = format!("'{} ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *'", user.trim());
+        let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+        let uid = String::from_utf8(uid.stdout).unwrap();
+        let allowed = format!("'# {}' '#{} ALL=(root) NOPASSWD: /usr/local/bin/sshunnel helper --socket *'", user.trim(), uid.trim());
         assert!(stdout.lines().any(|line| line.contains(&allowed)), "{output}");
         assert_eq!(stdout.lines().last(), Some("# Right now, sudo asks for a password to start the helper."), "{output}");
         assert_eq!(world.socket_dirs(), 0, "the probe's socket dir is left behind");

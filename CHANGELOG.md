@@ -7,6 +7,11 @@ why the version moved the way it did.
 
 ## [Unreleased]
 
+### Changed
+
+- `sshunnel sudoers` writes its line for your uid (`#1000`), with your name in a comment above it,
+  so it no longer refuses a login like `ALL`, a `+netgroup` or an all-caps name.
+
 ## [0.2.2] - 2026-10-27
 
 Docs and usability: `sshunnel help` is a guide a person or an agent can connect from, with
