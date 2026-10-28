@@ -28,7 +28,8 @@ Examples:
     ssh      ok: relay x86_64 61bf6514b25c cached in /home/me/.cache/sshunnel
     ping     ok: the remote allows unprivileged ping over IPv4 and IPv6
     sshunnel: route can start
-  --check exits 1 if a check fails, 0 otherwise. A sudo warn means route will ask for a password.
+  --check exits 1 if a check fails or a signal stops it, 0 otherwise. A sudo warn means route will
+  ask for a password.
 
 Privileges:
   ssh runs as you. route then starts a root helper through sudo, which creates sshunnel0 with its

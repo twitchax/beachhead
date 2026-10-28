@@ -13,7 +13,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use sshunnel_mux::frame::Capabilities;
 
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
     relays::Relays,
     route::{
         DEVICE, PING_WARNING,
-        helper::{Signals, Sudo},
+        helper::{Sudo, stoppable},
         lifecycle::{Options, preflight, routed},
         sudoers::{self, Answers},
         targets::Targets,
@@ -58,7 +58,19 @@ pub struct Finding {
 impl Display for Finding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { check, status, detail } = self;
-        write!(f, "{check:<8} {status}: {detail}")
+        write!(f, "{check:<8} {status}: ")?;
+        // A later line sits under the first one's detail: the check's column, a space, the status, ": ".
+        let indent = 8 + 1 + status.to_string().len() + 2;
+        let mut lines = detail.split('\n');
+        f.write_str(lines.next().unwrap_or_default())?;
+        for line in lines {
+            if line.is_empty() {
+                f.write_str("\n")?;
+            } else {
+                write!(f, "\n{:indent$}{line}", "")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -104,13 +116,8 @@ pub async fn run(options: &Options, ssh: &SshCommand, destination: &str, relays:
 
 /// [`run`] with sudo's answers chosen by the caller.
 pub(crate) async fn run_with(options: &Options, ssh: &SshCommand, destination: &str, relays: &Relays, sudo: impl Future<Output = Res<Answers>>, out: &mut impl Write) -> Res<Report> {
-    // First, so a Ctrl-C at any point drops the checks, the probe's socket dir and ssh with them.
-    let mut signals = Signals::respecting_nohup()?;
-    tokio::select! {
-        biased;
-        () = signals.recv() => bail!("stopped by a signal"),
-        report = checks(options, ssh, destination, relays, sudo, out) => report,
-    }
+    // So a Ctrl-C at any point drops the checks, the probe's socket dir and ssh with them.
+    stoppable(checks(options, ssh, destination, relays, sudo, out)).await
 }
 
 /// The checks in order: the local ones first, then ssh.
@@ -159,6 +166,8 @@ fn sudo_finding(sudo: Res<Answers>) -> Finding {
             format!("sudo asks for a password for this copy, but not for {}: run route as that one", sudoers::installed_path()),
         ),
         Ok(Answers { this: Sudo::Prompts, .. }) => finding("sudo", Status::Warn, "sudo asks for a password; `sshunnel sudoers` prints the setup that skips it"),
+        // The check ran from a binary that is gone, so what it found says nothing about sudo.
+        Err(e) if e.is::<sudoers::Replaced>() => finding("sudo", Status::Warn, e.to_string()),
         Err(e) => finding("sudo", Status::Fail, format!("{e:#}")),
     }
 }
@@ -253,6 +262,38 @@ mod tests {
             only(targets_findings(refused)),
             finding("targets", Status::Fail, "refused: '10.99.7.0/24' is inside the connected subnet 10.99.0.0/16")
         );
+    }
+
+    #[test]
+    fn route_check_sudo_warns_when_this_binary_was_replaced() {
+        assert_eq!(
+            sudo_finding(Err(sudoers::Replaced.into())),
+            finding("sudo", Status::Warn, "this sshunnel was replaced or removed while it ran; run it again")
+        );
+    }
+
+    #[test]
+    fn route_check_indents_a_multi_line_detail_under_itself() {
+        let finding = |status, detail: &str| {
+            Finding {
+                check: "targets",
+                status,
+                detail: detail.into(),
+            }
+            .to_string()
+        };
+
+        assert_eq!(finding(Status::Fail, "a\nb\nc"), format!("targets  fail: a\n{}b\n{}c", " ".repeat(15), " ".repeat(15)));
+        assert_eq!(
+            Finding {
+                check: "sudo",
+                status: Status::Ok,
+                detail: "x\n".into()
+            }
+            .to_string(),
+            "sudo     ok: x\n"
+        );
+        assert_eq!(finding(Status::Ok, "one line"), "targets  ok: one line");
     }
 
     #[test]

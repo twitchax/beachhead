@@ -42,10 +42,15 @@ struct World {
 
 impl World {
     fn new() -> Self {
+        Self::with_sudo("exit 1")
+    }
+
+    /// As [`Self::new`], with `script` as the shim sudo's body.
+    fn with_sudo(script: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let remote = FakeRemote::new(dir.path(), "sh", &[]).unwrap();
         let relays = relay_dir(dir.path()).unwrap();
-        let shims = shim_dir(dir.path(), &[("sudo", "exit 1")]).unwrap();
+        let shims = shim_dir(dir.path(), &[("sudo", script)]).unwrap();
         let path = std::env::var_os("PATH").unwrap_or_default();
         let path = std::env::join_paths(std::iter::once(shims).chain(std::env::split_paths(&path))).unwrap();
         Self { dir, remote, relays, path }
@@ -64,9 +69,8 @@ impl World {
         (out.status.code(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
     }
 
-    /// Runs `sshunnel sudoers` to the end, with the shim sudo first on `PATH` and its probe's
-    /// socket dir here; returns its exit code, stdout and stderr.
-    async fn sudoers(&self) -> (Option<i32>, String, String) {
+    /// `sshunnel sudoers`, with the shim sudo first on `PATH` and its probe's socket dir here.
+    fn sudoers_command(&self) -> Command {
         let mut sudoers = Command::new(env!("CARGO_BIN_EXE_sshunnel"));
         sudoers
             .arg("sudoers")
@@ -75,7 +79,12 @@ impl World {
             .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        let out = timeout(WITHIN, sudoers.output()).await.expect("sshunnel sudoers hung").unwrap();
+        sudoers
+    }
+
+    /// Runs `sshunnel sudoers` to the end; returns its exit code, stdout and stderr.
+    async fn sudoers(&self) -> (Option<i32>, String, String) {
+        let out = timeout(WITHIN, self.sudoers_command().output()).await.expect("sshunnel sudoers hung").unwrap();
         (out.status.code(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
     }
 
@@ -236,4 +245,45 @@ async fn e2e_sudoers_prints_the_setup() {
         }
         assert!(stdout.is_empty(), "{output}");
     }
+}
+
+#[tokio::test]
+async fn e2e_sudoers_stops_on_a_signal_and_removes_its_socket_dir() {
+    // Outside the world's scratch dir, which only the probe's socket dir may appear in.
+    let flag = TempDir::new().unwrap();
+    let marker = flag.path().join("started");
+    let world = World::with_sudo(&format!(": > '{}'\nexec sleep 30", marker.display()));
+
+    let mut child = world.sudoers_command().stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let waiting = async {
+        while !marker.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    };
+    let Some(early) = timeout(WITHIN, waiting).await.expect("sudo never ran, and sshunnel sudoers never exited") else {
+        let pid = Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap()).unwrap();
+        kill_process(pid, Signal::TERM).unwrap();
+        let out = timeout(WITHIN, child.wait_with_output()).await.expect("sshunnel sudoers ignored SIGTERM").unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert_eq!(stderr.lines().last(), Some("error: stopped by a signal"), "{stderr}");
+        assert_eq!(world.socket_dirs(), 0, "the probe's socket dir is left behind");
+        return;
+    };
+
+    // Exited before probing sudo: only a host whose /usr/local/bin others can write, or root, does.
+    let mut stderr = String::new();
+    tokio::io::AsyncReadExt::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).await.unwrap();
+    assert_eq!(early.code(), Some(1), "{stderr}");
+    let refusal = if geteuid().is_root() {
+        "error: run `sshunnel sudoers` as the user who will run route"
+    } else {
+        "error: /usr/local/bin can be written by users other than root"
+    };
+    assert!(stderr.lines().last().unwrap_or_default().starts_with(refusal), "sudoers exited early for another reason: {stderr}");
+    eprintln!("skipped: this host's /usr/local/bin isn't root's alone, so sudoers refuses before it probes");
 }

@@ -516,6 +516,22 @@ impl Signals {
     }
 }
 
+/// Drives `work`, dropping it when a signal arrives (as [`Signals::respecting_nohup`] has it) so
+/// what it holds, a probe's socket dir and the process behind it, goes with it. The handlers are in
+/// place before `work` is first polled.
+///
+/// # Errors
+///
+/// Fails when `work` does, or with `stopped by a signal`.
+pub(crate) async fn stoppable<T>(work: impl Future<Output = Res<T>>) -> Res<T> {
+    let mut signals = Signals::respecting_nohup()?;
+    tokio::select! {
+        biased;
+        () = signals.recv() => bail!("stopped by a signal"),
+        done = work => done,
+    }
+}
+
 /// What the helper holds while the client runs: the device, and the pins it added, undone by `run`.
 /// Dropped without [`Self::teardown`], by an early return or a panic, it still undoes them, and never
 /// twice.

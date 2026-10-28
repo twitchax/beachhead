@@ -9,7 +9,7 @@
 
 use std::{
     borrow::Cow,
-    fmt::Write as _,
+    fmt::{self, Write as _},
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     process::Stdio,
@@ -55,8 +55,13 @@ pub struct Answers {
 /// safely name either), and when the user's name, this binary's path or sudo's answer can't be had,
 /// or [`script`] refuses them.
 pub async fn run() -> Res<String> {
+    // So a Ctrl-C while sudo is asked drops the probe's socket dir with it.
+    helper::stoppable(setup()).await
+}
+
+async fn setup() -> Res<String> {
     ensure!(!rustix::process::geteuid().is_root(), AS_ROOT);
-    let exe = std::env::current_exe().context("locating sshunnel's own executable")?;
+    let exe = own_exe()?;
     let exe_root_only = root_only(&exe)?;
     if !exe_root_only && !root_only(Path::new(INSTALL_DIR))? {
         bail!(unsafe_install_dir(&exe, elsewhere_writable()?.as_deref()));
@@ -71,8 +76,31 @@ pub async fn run() -> Res<String> {
 ///
 /// Fails as [`ask`] does, and when this binary or that copy can't be located or read.
 pub(crate) async fn ask_sudo() -> Res<Answers> {
-    let exe = std::env::current_exe().context("locating sshunnel's own executable")?;
+    let exe = own_exe()?;
     ask(&exe, root_only(&exe)?, installed_root_only()?.as_deref(), helper::probe_sudo_for).await
+}
+
+/// This binary was replaced or removed while it ran: Linux names its path `... (deleted)`, which
+/// no sudoers line or probe can use.
+#[derive(Debug)]
+pub struct Replaced;
+
+impl fmt::Display for Replaced {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("this sshunnel was replaced or removed while it ran; run it again")
+    }
+}
+
+impl std::error::Error for Replaced {}
+
+/// This binary's path, or [`Replaced`] when it is no longer there.
+fn own_exe() -> Res<PathBuf> {
+    exe_or_replaced(std::env::current_exe().context("locating sshunnel's own executable")?)
+}
+
+fn exe_or_replaced(exe: PathBuf) -> Res<PathBuf> {
+    ensure!(!exe.file_name().is_some_and(|name| name.as_encoded_bytes().ends_with(b" (deleted)")), Replaced);
+    Ok(exe)
 }
 
 /// Asks sudo, through `probe`, about the helper as the binary at `exe` starts it. When sudo asks
@@ -290,6 +318,14 @@ mod tests {
 
     fn uid() -> u32 {
         rustix::process::getuid().as_raw()
+    }
+
+    #[test]
+    fn sudoers_a_replaced_binary_is_its_own_error() {
+        let error = exe_or_replaced("/usr/bin/sshunnel (deleted)".into()).unwrap_err();
+        assert!(error.is::<Replaced>(), "{error:#}");
+
+        assert_eq!(exe_or_replaced("/usr/bin/sshunnel".into()).unwrap(), PathBuf::from("/usr/bin/sshunnel"));
     }
 
     #[test]

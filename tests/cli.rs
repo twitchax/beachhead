@@ -96,6 +96,7 @@ fn e2e_help_route_covers_targets_privileges_and_troubleshooting() {
     for part in ["Targets:", "Privileges:", "Troubleshooting:"] {
         assert!(help.contains(part), "route's help lacks {part:?}:\n{help}");
     }
+    assert!(help.contains("--check exits 1 if a check fails or a signal stops it, 0 otherwise."), "{help}");
 }
 
 /// A script gates route on `--check`'s exit status, so the help states it beside the sample.
@@ -106,7 +107,7 @@ fn e2e_help_route_states_the_check_exit_status() {
     let after_sample = help.lines().skip_while(|line| *line != "    sshunnel: route can start").nth(1);
     assert_eq!(
         after_sample,
-        Some("  --check exits 1 if a check fails, 0 otherwise. A sudo warn means route will ask for a password."),
+        Some("  --check exits 1 if a check fails or a signal stops it, 0 otherwise. A sudo warn means route will"),
         "{help}"
     );
 }

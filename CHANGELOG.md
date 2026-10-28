@@ -12,6 +12,10 @@ why the version moved the way it did.
 - `route --check` and `sshunnel sudoers` no longer report a root helper that failed, or a sudo
   that exited for another reason, as sudo asking for a password; the helper exits with status 3
   on any error.
+- A Ctrl-C while `sshunnel sudoers` asks sudo no longer leaves a socket dir behind.
+- `route --check` warns, rather than fails, when its binary was replaced while it ran.
+- Multi-line details stay under their check.
+- `route --check`'s help gives its exit status on a signal.
 
 ### Changed
 
