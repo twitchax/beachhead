@@ -234,9 +234,17 @@ async fn e2e_sudoers_prints_the_setup() {
         let opt = Path::new("/opt/sshunnel/bin").ancestors().find(|dir| dir.exists()).unwrap().canonicalize().unwrap();
         if root_only(&opt).unwrap() {
             let exe = Path::new(env!("CARGO_BIN_EXE_sshunnel")).canonicalize().unwrap();
-            let install = format!("`sudo install -D -o root -g root -m 0755 {} /opt/sshunnel/bin/sshunnel`", exe.display());
-            assert!(last.contains(&install), "{output}");
-            assert!(last.ends_with("then run both sudoers and route as that copy: `/opt/sshunnel/bin/sshunnel sudoers`"), "{output}");
+            // The command is printed only for a path the shell reads as written.
+            if exe.to_str().is_some_and(|exe| exe.chars().all(|c| c.is_ascii_alphanumeric() || "._/+-".contains(c))) {
+                let install = format!("`sudo install -D -o root -g root -m 0755 {} /opt/sshunnel/bin/sshunnel`", exe.display());
+                assert!(last.contains(&install), "{output}");
+                assert!(last.ends_with("then run both sudoers and route as that copy: `/opt/sshunnel/bin/sshunnel sudoers`"), "{output}");
+            } else {
+                assert!(
+                    last.ends_with("install sshunnel in a directory only root can write, and run both sudoers and route as that copy"),
+                    "{output}"
+                );
+            }
         } else {
             assert!(
                 last.ends_with(" can be too, so install sshunnel in another directory only root can write, and run both sudoers and route as that copy"),

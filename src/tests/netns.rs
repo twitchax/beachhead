@@ -363,7 +363,7 @@ impl RemoteNs {
     /// Makes the namespace and wires both ends, leaving its `ping_group_range` at a new namespace's
     /// "1 0": a remote whose relay may not ping, as in many containers and on Alpine. Closing the
     /// range of a namespace [`Self::new`] opened is no substitute, since the harness can't write
-    /// "1 0" (see [`PING_ROOT`]).
+    /// "1 0" (see `PING_ROOT`).
     ///
     /// # Errors
     ///

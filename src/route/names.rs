@@ -3,7 +3,7 @@
 //!
 //! An address starts at the name's hash slot and probes past collisions. The assignment is
 //! persisted, and the persisted entry wins over the hash, so a collided name keeps its probed
-//! address across restarts. Entries unused for [`PRUNE_AFTER_DAYS`] are dropped on load.
+//! address across restarts. Entries unused for `PRUNE_AFTER_DAYS` are dropped on load.
 //!
 //! A name's v6 fake ([`fake_v6`]) derives from its v4 one, so it needs no state of its own and the
 //! two always pair.

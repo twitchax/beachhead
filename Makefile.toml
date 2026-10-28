@@ -1,7 +1,7 @@
 # sshunnel: cargo-make tasks. cargo-make is the one entry point for dev commands, and CI runs
 # the same tasks, so "green locally" and "green in CI" mean the same thing.
 #
-#   cargo make ci        fmt-check + clippy (-D warnings) + nextest: the gate
+#   cargo make ci        fmt-check + clippy (-D warnings) + rustdoc (-D warnings) + nextest: the gate
 #   cargo make uat       ci + the #[ignore]d slow suites
 #   cargo make codecov   coverage.lcov via llvm-cov
 #   cargo xtask <task>   repo tooling (see xtask/)
@@ -63,6 +63,12 @@ args = ["fmt", "--all", "--check"]
 command = "cargo"
 args = ["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
 
+[tasks.doc-check]
+# Rustdoc warnings (a private intra-doc link, say) are errors here, so they can't pile up.
+env = { RUSTDOCFLAGS = "-D warnings" }
+command = "cargo"
+args = ["doc", "--workspace", "--no-deps", "--all-features"]
+
 # ── Test ─────────────────────────────────────────────────────────────────────
 
 [tasks.test]
@@ -87,7 +93,7 @@ args = ["llvm-cov", "nextest", "--workspace", "--exclude", "xtask", "--lcov", "-
 
 [tasks.ci]
 # The gate, run verbatim by CI.
-dependencies = ["fmt-check", "clippy", "test"]
+dependencies = ["fmt-check", "clippy", "doc-check", "test"]
 
 [tasks.uat]
 # The acceptance gate PRD UATs point at: ci plus everything too slow for every push.

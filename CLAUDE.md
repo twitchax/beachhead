@@ -81,7 +81,7 @@ the only `unsafe`, each block with a `// SAFETY:` comment.
 ## Commands
 
 ```bash
-cargo make ci        # fmt-check + clippy (-D warnings) + nextest: the gate, run verbatim in CI
+cargo make ci        # fmt-check + clippy (-D warnings) + rustdoc (-D warnings) + nextest: the gate, run verbatim in CI
 cargo make test      # nextest
 cargo make uat       # ci + the #[ignore]d slow suites: what PRD UATs point at
 cargo make codecov   # coverage.lcov

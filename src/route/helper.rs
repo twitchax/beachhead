@@ -10,7 +10,7 @@
 //! running as the user can start it, so it takes targets, never routes or domains: it parses them
 //! again, re-runs every refusal against its own route snapshot, honors only pins inside a route,
 //! and works out their gateways itself. Whether matched names get fake v6 addresses is its call too
-//! ([`decide_fake_v6`]), reported in [`Reply::Ready`]. What it runs is a closed set ([`plan`]).
+//! (`decide_fake_v6`), reported in [`Reply::Ready`]. What it runs is a closed set (`plan`).
 
 use std::{
     ffi::{OsStr, OsString},

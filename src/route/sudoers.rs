@@ -580,6 +580,11 @@ rm -f "$f"
             eprintln!("skipped: no /usr/bin/env");
             return;
         };
+        // The Nix store is group-writable, so a binary in it is correctly not root-only.
+        if env.starts_with("/nix/store") {
+            eprintln!("skipped: /usr/bin/env is in the Nix store, which is group-writable");
+            return;
+        }
 
         assert!(root_only(&env).unwrap(), "{}", env.display());
     }

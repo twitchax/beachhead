@@ -23,6 +23,7 @@ why the version moved the way it did.
 
 - `sshunnel sudoers` writes its line for your uid (`#1000`), with your name in a comment above it,
   so it no longer refuses a login like `ALL`, a `+netgroup` or an all-caps name.
+- `cargo make ci` builds the docs with warnings denied.
 - Building on Windows fails with a message that sshunnel builds for Linux and macOS.
 
 ## [0.2.2] - 2026-10-27
